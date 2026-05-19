@@ -20,12 +20,14 @@ All artifacts live under `.omx/ultragoal/`:
 
 - `brief.md` — original project/conversation brief.
 - `goals.json` — ordered durable plan with status, attempts, evidence, and the active goal id.
-- `ledger.jsonl` — append-only checkpoint events (`plan_created`, `goal_started`, `goal_resumed`, `goal_completed`, `goal_blocked`, `goal_failed`, `goal_retried`, `goal_added`, `final_review_failed`, `goal_review_blocked`).
+- `ledger.jsonl` — append-only checkpoint and steering events (`plan_created`, `goal_started`, `goal_resumed`, `goal_completed`, `goal_blocked`, `goal_failed`, `goal_retried`, `aggregate_objective_migrated`, `goal_added`, `steering_accepted`, `steering_rejected`, `final_review_failed`, `goal_review_blocked`).
 
 In aggregate mode, `goals.json` also stores:
 
 - `codexGoalMode: "aggregate"`
-- `codexObjective` — the exact deterministic objective sent to `create_goal`, capped to Codex's objective limit and referencing `.omx/ultragoal/goals.json`.
+- `codexObjective` — the exact deterministic pointer objective sent to `create_goal`: complete the durable plan in `.omx/ultragoal/goals.json`, including later accepted/appended stories, under the original brief constraints, using `.omx/ultragoal/ledger.jsonl` as the audit trail. It deliberately does not enumerate initial `G###` ids, so explicit steering can add or split pending stories without weakening the immutable end goal.
+
+Existing aggregate plans with the legacy enumerated objective are migrated to this pointer objective when read; the migration is persisted to `goals.json`, the previous objective is retained in `codexObjectiveAliases` so an already-active hidden Codex goal can still reconcile, and the change is audited with an `aggregate_objective_migrated` ledger entry.
 
 ## Commands
 
@@ -76,6 +78,36 @@ omx ultragoal status
 omx ultragoal status --codex-goal-json ./get-goal.json
 omx ultragoal status --json
 ```
+
+## Dynamic steering
+
+`omx ultragoal steer` lets an agent revise the OMX story decomposition when real findings or blockers prove the current sub-goals are no longer the best route to the unchanged aggregate objective. Steering is explicit-only and evidence-backed; broad natural-language requests such as “make the goal easier” are rejected instead of guessed.
+
+Allowed mutation kinds are:
+
+- `add_subgoal`
+- `split_subgoal`
+- `reorder_pending`
+- `revise_pending_wording`
+- `annotate_ledger`
+- `mark_blocked_superseded`
+
+Examples:
+
+```sh
+omx ultragoal steer --kind add_subgoal --title "Investigate blocker" --objective "Validate the new blocker and report evidence." --evidence "log/test output" --rationale "The blocker changes the safe execution order." --json
+omx ultragoal steer --directive-json ./steering.json --json
+```
+
+Steering invariants:
+
+- The aggregate Codex objective, original brief constraints, quality gates, and completion status are immutable.
+- Steering cannot hard-delete goals, auto-complete work, weaken tests/reviews/verification, or silently mutate state.
+- Accepted and rejected attempts append structured audit evidence to `.omx/ultragoal/ledger.jsonl`.
+- Superseded goals stay in `goals.json` with steering metadata; they are skipped for scheduling but remain audit-visible.
+- A blocked goal without replacements is skipped for scheduling but still blocks final completion until a later explicit steering mutation replaces or supersedes it.
+
+UserPromptSubmit integration uses the same core steering API. Only explicit structured directives such as `OMX_ULTRAGOAL_STEER: { ... }` / `omx.ultragoal.steer: { ... }` / `omx ultragoal steer: { ... }` are parsed. Normal prose is ignored for mutation, and repeated prompt-submit directives dedupe by prompt signature/idempotency key.
 
 ## Use Ultragoal and Team together
 

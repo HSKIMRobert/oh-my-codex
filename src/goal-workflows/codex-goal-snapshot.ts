@@ -22,6 +22,7 @@ export interface CodexGoalReconciliation {
 
 export interface ReconcileCodexGoalOptions {
   expectedObjective: string;
+  acceptedObjectives?: readonly string[];
   allowedStatuses?: readonly CodexGoalSnapshotStatus[];
   requireSnapshot?: boolean;
   requireComplete?: boolean;
@@ -121,10 +122,14 @@ export function reconcileCodexGoalSnapshot(
   }
 
   const expected = normalizeObjective(options.expectedObjective);
+  const accepted = new Set([
+    expected,
+    ...(options.acceptedObjectives ?? []).map((objective) => normalizeObjective(objective)),
+  ].filter(Boolean));
   const actual = normalizeObjective(effectiveSnapshot.objective ?? '');
   if (!actual) {
     errors.push('Codex goal snapshot is missing objective text.');
-  } else if (actual !== expected) {
+  } else if (!accepted.has(actual)) {
     errors.push(`Codex goal objective mismatch: expected "${expected}", got "${actual}".`);
   }
 

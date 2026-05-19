@@ -14,6 +14,98 @@ export const ULTRAGOAL_LEDGER = 'ledger.jsonl';
 
 export type UltragoalStatus = 'pending' | 'in_progress' | 'complete' | 'failed' | 'review_blocked';
 export type UltragoalCodexGoalMode = 'aggregate' | 'per_story';
+export type UltragoalSteeringStatus = 'superseded' | 'blocked';
+export type UltragoalSteeringMutationKind =
+  | 'add_subgoal'
+  | 'split_subgoal'
+  | 'reorder_pending'
+  | 'revise_pending_wording'
+  | 'annotate_ledger'
+  | 'mark_blocked_superseded';
+export type UltragoalSteeringSource = 'user_prompt_submit' | 'finding' | 'cli';
+
+export const ULTRAGOAL_STEERING_MUTATION_KINDS: readonly UltragoalSteeringMutationKind[] = [
+  'add_subgoal',
+  'split_subgoal',
+  'reorder_pending',
+  'revise_pending_wording',
+  'annotate_ledger',
+  'mark_blocked_superseded',
+];
+
+export const ULTRAGOAL_STEERING_SOURCES: readonly UltragoalSteeringSource[] = [
+  'user_prompt_submit',
+  'finding',
+  'cli',
+];
+
+export interface UltragoalSteeringInvariantResult {
+  accepted: boolean;
+  structuralInvariantAccepted: boolean;
+  evidenceBackedNecessity: boolean;
+  noEasierCompletion: boolean;
+  rejectedReasons: string[];
+  reasons?: string[];
+}
+
+export interface UltragoalSteeringChildGoal {
+  title: string;
+  objective: string;
+  tokenBudget?: number;
+}
+
+export interface UltragoalSteeringAfterPayload {
+  title?: string;
+  objective?: string;
+  pendingGoalIds?: string[];
+  children?: UltragoalSteeringChildGoal[];
+}
+
+export interface UltragoalSteeringProposal {
+  kind: UltragoalSteeringMutationKind;
+  source: UltragoalSteeringSource;
+  targetGoalId?: string;
+  targetGoalIds?: string[];
+  evidence: string;
+  rationale: string;
+  title?: string;
+  objective?: string;
+  childGoals?: UltragoalSteeringChildGoal[];
+  revisedTitle?: string;
+  revisedObjective?: string;
+  pendingOrder?: string[];
+  blockedReason?: string;
+  after?: UltragoalSteeringAfterPayload;
+  directiveText?: string;
+  promptSignature?: string;
+  idempotencyKey?: string;
+  now?: Date;
+}
+
+export interface UltragoalSteeringAudit {
+  kind: UltragoalSteeringMutationKind;
+  source: UltragoalSteeringSource;
+  targetGoalIds: string[];
+  before?: unknown;
+  after?: unknown;
+  evidence: string;
+  rationale: string;
+  invariant: UltragoalSteeringInvariantResult;
+  directiveText?: string;
+  promptSignature?: string;
+  idempotencyKey?: string;
+  deduped?: boolean;
+}
+
+export interface SteerUltragoalResult {
+  plan: UltragoalPlan;
+  accepted: boolean;
+  audit: UltragoalSteeringAudit;
+  rejectedReasons: string[];
+  deduped: boolean;
+}
+
+
 
 export interface UltragoalItem {
   id: string;
@@ -30,6 +122,12 @@ export interface UltragoalItem {
   reviewBlockedAt?: string;
   evidence?: string;
   failureReason?: string;
+  steeringStatus?: UltragoalSteeringStatus;
+  supersededBy?: string[];
+  supersedes?: string[];
+  blockedReason?: string;
+  steeringEvidence?: string;
+  steeringRationale?: string;
 }
 
 export interface UltragoalAggregateCompletion {
@@ -48,6 +146,7 @@ export interface UltragoalPlan {
   ledgerPath: string;
   codexGoalMode?: UltragoalCodexGoalMode;
   codexObjective?: string;
+  codexObjectiveAliases?: string[];
   aggregateCompletion?: UltragoalAggregateCompletion;
   activeGoalId?: string;
   goals: UltragoalItem[];
@@ -64,7 +163,10 @@ export interface UltragoalLedgerEntry {
     | 'goal_failed'
     | 'goal_retried'
     | 'aggregate_completed'
+    | 'aggregate_objective_migrated'
     | 'goal_added'
+    | 'steering_accepted'
+    | 'steering_rejected'
     | 'final_review_failed'
     | 'goal_review_blocked';
   goalId?: string;
@@ -73,6 +175,11 @@ export interface UltragoalLedgerEntry {
   codexGoal?: unknown;
   evidence?: string;
   qualityGate?: UltragoalQualityGate;
+  steering?: UltragoalSteeringAudit;
+  before?: unknown;
+  after?: unknown;
+  mutationKind?: UltragoalSteeringMutationKind;
+  idempotencyKey?: string;
 }
 
 export interface CreateUltragoalOptions {
@@ -227,14 +334,29 @@ function isResolvedStatus(status: UltragoalStatus): boolean {
   return status === 'complete' || status === 'review_blocked';
 }
 
-function aggregateCodexObjective(goals: readonly UltragoalItem[]): string {
-  const prefix = `Complete all ultragoal stories in ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}: `;
-  const suffix = goals.map((goal) => `${goal.id} ${goal.title}`).join('; ');
-  const full = `${prefix}${suffix}`;
-  if (full.length <= 4000) return full;
-  const fallback = `Complete all ultragoal stories listed in ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}. Use ${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER} as the durable audit trail.`;
-  if (fallback.length <= 4000) return fallback;
+function isScheduleEligibleGoal(goal: UltragoalItem): boolean {
+  return goal.steeringStatus !== 'superseded' && goal.steeringStatus !== 'blocked';
+}
+
+export const ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE =
+  `Complete the durable ultragoal plan in ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}, including later accepted/appended stories, under the original brief constraints; use ${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER} as the audit trail.`;
+
+function aggregateCodexObjective(_goals: readonly UltragoalItem[]): string {
+  if (ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE.length <= 4000) return ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
   throw new UltragoalError('Generated aggregate Codex objective exceeds the 4,000 character goal limit.');
+}
+
+function isLegacyEnumeratedAggregateObjective(objective: string | undefined): boolean {
+  if (!objective) return false;
+  return (
+    objective.startsWith(`Complete all ultragoal stories in ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}: `)
+    || objective === `Complete all ultragoal stories listed in ${ULTRAGOAL_DIR}/${ULTRAGOAL_GOALS}. Use ${ULTRAGOAL_DIR}/${ULTRAGOAL_LEDGER} as the durable audit trail.`
+  );
+}
+
+function compatibleCodexObjectives(plan: UltragoalPlan): string[] {
+  return (plan.codexObjectiveAliases ?? [])
+    .filter((objective) => isLegacyEnumeratedAggregateObjective(objective));
 }
 
 function expectedCodexObjective(plan: UltragoalPlan, goal: UltragoalItem): string {
@@ -243,16 +365,49 @@ function expectedCodexObjective(plan: UltragoalPlan, goal: UltragoalItem): strin
     : goal.objective;
 }
 
+function isSupersededResolved(goal: UltragoalItem, plan: UltragoalPlan): boolean {
+  if (goal.steeringStatus !== 'superseded') return false;
+  const replacements = goal.supersededBy ?? [];
+  if (replacements.length === 0) return false;
+  return replacements.every((id) => {
+    const replacement = plan.goals.find((candidate) => candidate.id === id);
+    return replacement !== undefined && isResolvedStatus(replacement.status);
+  });
+}
+
+function isCompletionBlocking(goal: UltragoalItem, plan: UltragoalPlan): boolean {
+  if (goal.steeringStatus === 'superseded') return !isSupersededResolved(goal, plan);
+  if (goal.steeringStatus === 'blocked') return true;
+  return !isResolvedStatus(goal.status);
+}
+
+function isCompletionBlockingForFinalCandidate(candidate: UltragoalItem, finalCandidate: UltragoalItem, plan: UltragoalPlan): boolean {
+  if (candidate.id === finalCandidate.id) return false;
+  if (candidate.steeringStatus === 'superseded') {
+    const replacements = candidate.supersededBy ?? [];
+    if (replacements.length === 0) return true;
+    return !replacements.every((id) => {
+      if (id === finalCandidate.id) return true;
+      const replacement = plan.goals.find((goal) => goal.id === id);
+      return replacement !== undefined && isResolvedStatus(replacement.status);
+    });
+  }
+  return isCompletionBlocking(candidate, plan);
+}
+
+function isScheduleEligible(goal: UltragoalItem): boolean {
+  return goal.steeringStatus !== 'superseded' && goal.steeringStatus !== 'blocked';
+}
+
 export function isFinalRunCompletionCandidate(plan: UltragoalPlan, goal: UltragoalItem): boolean {
-  return plan.goals.every((candidate) => candidate.id === goal.id || isResolvedStatus(candidate.status));
+  return plan.goals.every((candidate) => !isCompletionBlockingForFinalCandidate(candidate, goal, plan));
 }
 
 export function isUltragoalDone(plan: UltragoalPlan): boolean {
   if (plan.aggregateCompletion?.status === 'complete') return true;
   if (plan.goals.length === 0) return true;
-  if (plan.goals.some((goal) => goal.status === 'pending' || goal.status === 'in_progress' || goal.status === 'failed')) return false;
-  if (!plan.goals.every((goal) => isResolvedStatus(goal.status))) return false;
-  const latestNonReviewBlocked = [...plan.goals].reverse().find((goal) => goal.status !== 'review_blocked');
+  if (plan.goals.some((goal) => isCompletionBlocking(goal, plan))) return false;
+  const latestNonReviewBlocked = [...plan.goals].reverse().find((goal) => goal.status !== 'review_blocked' && goal.steeringStatus !== 'superseded');
   return latestNonReviewBlocked?.status === 'complete';
 }
 
@@ -314,6 +469,21 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   if (parsed.version !== 1 || !Array.isArray(parsed.goals)) {
     throw new UltragoalError(`Invalid ultragoal plan at ${repoRelative(cwd, path)}.`);
   }
+  if (codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective)) {
+    const previousObjective = parsed.codexObjective;
+    const now = iso();
+    parsed.codexObjective = aggregateCodexObjective(parsed.goals);
+    parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
+    parsed.updatedAt = now;
+    await writePlan(cwd, parsed);
+    await appendLedger(cwd, {
+      ts: now,
+      event: 'aggregate_objective_migrated',
+      message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
+      before: { codexObjective: previousObjective },
+      after: { codexObjective: parsed.codexObjective },
+    });
+  }
   return parsed;
 }
 
@@ -362,7 +532,7 @@ export async function createUltragoalPlan(cwd: string, options: CreateUltragoalO
   return plan;
 }
 
-export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; aggregateComplete: boolean; activeGoalId?: string } {
+export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pending: number; inProgress: number; complete: number; failed: number; reviewBlocked: number; superseded: number; steeringBlocked: number; aggregateComplete: boolean; activeGoalId?: string } {
   return {
     total: plan.goals.length,
     pending: plan.goals.filter((goal) => goal.status === 'pending').length,
@@ -370,6 +540,8 @@ export function summarizeUltragoalPlan(plan: UltragoalPlan): { total: number; pe
     complete: plan.goals.filter((goal) => goal.status === 'complete').length,
     failed: plan.goals.filter((goal) => goal.status === 'failed').length,
     reviewBlocked: plan.goals.filter((goal) => goal.status === 'review_blocked').length,
+    superseded: plan.goals.filter((goal) => goal.steeringStatus === 'superseded').length,
+    steeringBlocked: plan.goals.filter((goal) => goal.steeringStatus === 'blocked').length,
     aggregateComplete: plan.aggregateCompletion?.status === 'complete',
     activeGoalId: plan.activeGoalId,
   };
@@ -381,7 +553,27 @@ function assertNonEmpty(value: string | undefined, label: string): string {
   return trimmed;
 }
 
-function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions, now: string): UltragoalItem {
+export function parseUltragoalSteeringDirective(raw: string): UltragoalSteeringProposal | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length < 5) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as UltragoalSteeringProposal;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed.kind || typeof parsed.kind !== 'string') return null;
+    if (!parsed.source || typeof parsed.source !== 'string') return null;
+    if (!parsed.evidence || typeof parsed.evidence !== 'string') return null;
+    if (!parsed.rationale || typeof parsed.rationale !== 'string') return null;
+    if (!ULTRAGOAL_STEERING_MUTATION_KINDS.includes(parsed.kind as UltragoalSteeringMutationKind)) return null;
+    if (!ULTRAGOAL_STEERING_SOURCES.includes(parsed.source as UltragoalSteeringSource)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+
+function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions, nowOverride?: string): UltragoalItem {
+  const now = nowOverride ?? iso(options.now);
   const title = assertNonEmpty(options.title, '--title');
   const objective = assertNonEmpty(options.objective, '--objective');
   const goal: UltragoalItem = {
@@ -402,7 +594,7 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions,
 export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOptions): Promise<{ plan: UltragoalPlan; goal: UltragoalItem }> {
   const plan = await readUltragoalPlan(cwd);
   const now = iso(options.now);
-  const goal = appendGoalToPlan(plan, options, now);
+  const goal = appendGoalToPlan(plan, options);
   await writePlan(cwd, plan);
   await appendLedger(cwd, {
     ts: now,
@@ -413,6 +605,329 @@ export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOpt
     message: goal.title,
   });
   return { plan, goal };
+}
+
+
+function proposalTargetIds(proposal: UltragoalSteeringProposal): string[] {
+  return proposal.targetGoalIds?.length ? proposal.targetGoalIds : (proposal.targetGoalId ? [proposal.targetGoalId] : []);
+}
+
+function steeringTargets(plan: UltragoalPlan, proposal: UltragoalSteeringProposal): UltragoalItem[] {
+  return proposalTargetIds(proposal).map((id) => {
+    const goal = plan.goals.find((candidate) => candidate.id === id);
+    if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${id}`);
+    return goal;
+  });
+}
+
+function mentionsWeakenedCompletion(...values: Array<string | undefined>): boolean {
+  const normalized = values.filter(Boolean).join(' ').toLowerCase();
+  return /\b(skip|bypass|weaken|remove|omit|auto[-\s]?complete|mark complete|complete faster)\b/.test(normalized)
+    && /\b(test|tests|verification|review|quality gate|complete|completion)\b/.test(normalized);
+}
+
+function hasProtectedSteeringPayload(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const protectedKeys = new Set([
+    'aggregateCompletion',
+    'brief',
+    'briefPath',
+    'codexObjective',
+    'constraints',
+    'completedAt',
+    'qualityGate',
+    'status',
+  ]);
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== 'object') continue;
+    for (const [key, child] of Object.entries(current)) {
+      if (protectedKeys.has(key)) return true;
+      if (key.toLowerCase().includes('complete')) return true;
+      if (child && typeof child === 'object') stack.push(child);
+    }
+  }
+  return false;
+}
+
+function protectedIntentText(proposal: UltragoalSteeringProposal): string {
+  const after = proposal.after as UltragoalSteeringAfterPayload | undefined;
+  const childTexts = rawChildGoalsFromProposal(proposal).flatMap((child) => {
+    if (!child || typeof child !== 'object' || Array.isArray(child)) return [];
+    const candidate = child as { title?: unknown; objective?: unknown };
+    return [candidate.title, candidate.objective];
+  });
+  return [
+    proposal.title,
+    proposal.objective,
+    proposal.revisedTitle,
+    proposal.revisedObjective,
+    after?.title,
+    after?.objective,
+    proposal.rationale,
+    proposal.directiveText,
+    ...childTexts,
+  ]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n')
+    .toLowerCase();
+}
+
+function rawChildGoalsFromProposal(proposal: UltragoalSteeringProposal): unknown[] {
+  if (Array.isArray(proposal.childGoals) && proposal.childGoals.length > 0) return proposal.childGoals;
+  const after = proposal.after as { children?: unknown[] } | undefined;
+  return Array.isArray(after?.children) ? after.children : [];
+}
+
+function isValidSteeringChildGoal(value: unknown): value is UltragoalSteeringChildGoal {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as { title?: unknown; objective?: unknown };
+  return typeof candidate.title === 'string'
+    && candidate.title.trim().length > 0
+    && typeof candidate.objective === 'string'
+    && candidate.objective.trim().length > 0;
+}
+
+function childGoalsFromProposal(proposal: UltragoalSteeringProposal): UltragoalSteeringChildGoal[] {
+  return rawChildGoalsFromProposal(proposal).filter(isValidSteeringChildGoal);
+}
+
+function pendingOrderFromProposal(proposal: UltragoalSteeringProposal): string[] {
+  if (proposal.pendingOrder?.length) return proposal.pendingOrder;
+  const after = proposal.after as { pendingGoalIds?: string[] } | undefined;
+  return Array.isArray(after?.pendingGoalIds) ? after.pendingGoalIds : [];
+}
+
+function revisedTitleFromProposal(proposal: UltragoalSteeringProposal): string | undefined {
+  if (proposal.revisedTitle?.trim()) return proposal.revisedTitle;
+  const after = proposal.after as { title?: string } | undefined;
+  return after?.title ?? proposal.title;
+}
+
+function revisedObjectiveFromProposal(proposal: UltragoalSteeringProposal): string | undefined {
+  if (proposal.revisedObjective?.trim()) return proposal.revisedObjective;
+  const after = proposal.after as { objective?: string } | undefined;
+  return after?.objective ?? proposal.objective;
+}
+
+export function validateUltragoalSteeringProposal(plan: UltragoalPlan, proposal: UltragoalSteeringProposal): UltragoalSteeringInvariantResult {
+  const rejectedReasons: string[] = [];
+  const evidenceBackedNecessity = Boolean(proposal.evidence?.trim()) && Boolean(proposal.rationale?.trim());
+  if (!ULTRAGOAL_STEERING_MUTATION_KINDS.includes(proposal.kind)) rejectedReasons.push(`Invalid steering mutation kind: ${String(proposal.kind)}.`);
+  if (!ULTRAGOAL_STEERING_SOURCES.includes(proposal.source)) rejectedReasons.push(`Invalid steering source: ${String(proposal.source)}.`);
+  if (!evidenceBackedNecessity) rejectedReasons.push('Steering requires non-empty evidence and rationale.');
+  if (hasProtectedSteeringPayload(proposal.after)) rejectedReasons.push('Steering payload must not edit protected objective, constraint, quality gate, or completion fields.');
+  if (/\b(?:skip|bypass|weaken|remove)\b.*\b(?:test|tests|review|verification|quality gate|complete|completion)\b|\bauto[- ]?complete\b/.test(protectedIntentText(proposal))) {
+    rejectedReasons.push('Steering must not weaken completion, quality gates, tests, reviews, or auto-complete work.');
+  }
+  if (plan.aggregateCompletion?.status === 'complete') rejectedReasons.push('Cannot steer an already completed aggregate ultragoal plan.');
+
+  let targets: UltragoalItem[] = [];
+  try {
+    targets = steeringTargets(plan, proposal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    rejectedReasons.push(message.replace(/^Unknown ultragoal id:/, 'unknown ultragoal id:'));
+  }
+  const target = targets[0];
+  if ((proposal.kind === 'split_subgoal' || proposal.kind === 'revise_pending_wording' || proposal.kind === 'mark_blocked_superseded') && !target) {
+    rejectedReasons.push(`${proposal.kind} requires a target goal id.`);
+  }
+  if ((proposal.kind === 'split_subgoal' || proposal.kind === 'revise_pending_wording') && target?.status !== 'pending') {
+    rejectedReasons.push(`${proposal.kind} can only target a pending goal.`);
+  }
+
+  if (proposal.kind === 'add_subgoal') {
+    if (!proposal.title?.trim() || !proposal.objective?.trim()) rejectedReasons.push('add_subgoal requires title and objective.');
+  }
+  if (proposal.kind === 'split_subgoal') {
+    const rawChildren = rawChildGoalsFromProposal(proposal);
+    if (rawChildren.length === 0) rejectedReasons.push('split_subgoal requires replacement child goals.');
+    if (rawChildren.some((child) => !isValidSteeringChildGoal(child))) rejectedReasons.push('split_subgoal children require title and objective.');
+  }
+  if (proposal.kind === 'mark_blocked_superseded') {
+    const rawChildren = rawChildGoalsFromProposal(proposal);
+    if (rawChildren.some((child) => !isValidSteeringChildGoal(child))) rejectedReasons.push('mark_blocked_superseded replacement children require title and objective.');
+  }
+  if (proposal.kind === 'reorder_pending') {
+    const requested = pendingOrderFromProposal(proposal);
+    const pending = plan.goals.filter((goal) => goal.status === 'pending' && isScheduleEligible(goal)).map((goal) => goal.id);
+    if (requested.length === 0) rejectedReasons.push('reorder_pending requires at least one pending goal id.');
+    if (new Set(requested).size !== requested.length) rejectedReasons.push('duplicate goal id in pendingOrder.');
+    if (requested.some((id) => !pending.includes(id))) rejectedReasons.push('pendingOrder contains non-pending or unknown goal.');
+  }
+  if (proposal.kind === 'revise_pending_wording') {
+    if (!revisedTitleFromProposal(proposal)?.trim() && !revisedObjectiveFromProposal(proposal)?.trim()) rejectedReasons.push('revise_pending_wording requires title or objective.');
+  }
+  if (proposal.kind === 'annotate_ledger' && !proposal.evidence?.trim()) rejectedReasons.push('annotate_ledger requires evidence.');
+
+  const accepted = rejectedReasons.length === 0;
+  const noEasierCompletion = !mentionsWeakenedCompletion(protectedIntentText(proposal));
+  return {
+    structuralInvariantAccepted: accepted,
+    evidenceBackedNecessity,
+    noEasierCompletion,
+    accepted,
+    rejectedReasons,
+    reasons: rejectedReasons,
+  };
+}
+
+export const validateSteeringProposal = validateUltragoalSteeringProposal;
+
+async function readSteeringLedgerEntries(cwd: string): Promise<UltragoalLedgerEntry[]> {
+  try {
+    const raw = await readFile(ultragoalLedgerPath(cwd), 'utf-8');
+    return raw.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as UltragoalLedgerEntry);
+  } catch {
+    return [];
+  }
+}
+
+function cloneForAudit<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function moveGoalsAfterTarget(plan: UltragoalPlan, targetId: string, movedIds: string[]): void {
+  const moved = movedIds.map((id) => plan.goals.find((goal) => goal.id === id)).filter((goal): goal is UltragoalItem => Boolean(goal));
+  if (moved.length === 0) return;
+  plan.goals = plan.goals.filter((goal) => !movedIds.includes(goal.id));
+  const targetIndex = plan.goals.findIndex((goal) => goal.id === targetId);
+  plan.goals.splice(targetIndex >= 0 ? targetIndex + 1 : plan.goals.length, 0, ...moved);
+}
+
+function applySteeringMutation(plan: UltragoalPlan, proposal: UltragoalSteeringProposal, now: string): { before?: unknown; after?: unknown } {
+  const targets = steeringTargets(plan, proposal);
+  const target = targets[0];
+  if (proposal.kind === 'add_subgoal') {
+    const goal = appendGoalToPlan(plan, { title: proposal.title ?? '', objective: proposal.objective ?? '', evidence: proposal.evidence, now: new Date(now) });
+    return { before: undefined, after: cloneForAudit(goal) };
+  }
+  if (proposal.kind === 'split_subgoal') {
+    const before = cloneForAudit(target);
+    const children = childGoalsFromProposal(proposal).map((child) => appendGoalToPlan(plan, { ...child, evidence: proposal.evidence, now: new Date(now) }));
+    target.steeringStatus = 'superseded';
+    target.supersededBy = children.map((child) => child.id);
+    moveGoalsAfterTarget(plan, target.id, children.map((child) => child.id));
+    target.steeringEvidence = proposal.evidence;
+    target.steeringRationale = proposal.rationale;
+    target.updatedAt = now;
+    for (const child of children) child.supersedes = [target.id];
+    if (plan.activeGoalId === target.id) plan.activeGoalId = undefined;
+    plan.updatedAt = now;
+    return { before, after: { target: cloneForAudit(target), children: cloneForAudit(children) } };
+  }
+  if (proposal.kind === 'reorder_pending') {
+    const before = plan.goals.map((goal) => goal.id);
+    const requested = pendingOrderFromProposal(proposal);
+    const requestedSet = new Set(requested);
+    const requestedGoals = requested.map((id) => plan.goals.find((goal) => goal.id === id)).filter((goal): goal is UltragoalItem => Boolean(goal));
+    const remaining = plan.goals.filter((goal) => !requestedSet.has(goal.id));
+    plan.goals = [...requestedGoals, ...remaining];
+    plan.updatedAt = now;
+    return { before, after: plan.goals.map((goal) => goal.id) };
+  }
+  if (proposal.kind === 'revise_pending_wording') {
+    const before = cloneForAudit(target);
+    const revisedTitle = revisedTitleFromProposal(proposal);
+    const revisedObjective = revisedObjectiveFromProposal(proposal);
+    if (revisedTitle?.trim()) target.title = revisedTitle.trim();
+    if (revisedObjective?.trim()) target.objective = revisedObjective.trim();
+    target.steeringEvidence = proposal.evidence;
+    target.steeringRationale = proposal.rationale;
+    target.updatedAt = now;
+    plan.updatedAt = now;
+    return { before, after: cloneForAudit(target) };
+  }
+  if (proposal.kind === 'annotate_ledger') {
+    return { before: undefined, after: { evidence: proposal.evidence, rationale: proposal.rationale } };
+  }
+  if (proposal.kind === 'mark_blocked_superseded') {
+    const before = cloneForAudit(target);
+    const children = childGoalsFromProposal(proposal);
+    if (children.length > 0) {
+      const replacements = children.map((child) => appendGoalToPlan(plan, { ...child, evidence: proposal.evidence, now: new Date(now) }));
+      target.steeringStatus = 'superseded';
+      target.supersededBy = replacements.map((child) => child.id);
+      moveGoalsAfterTarget(plan, target.id, replacements.map((child) => child.id));
+      target.steeringEvidence = proposal.evidence;
+      target.steeringRationale = proposal.rationale;
+      target.updatedAt = now;
+      for (const replacement of replacements) replacement.supersedes = [target.id];
+      if (plan.activeGoalId === target.id) plan.activeGoalId = undefined;
+      plan.updatedAt = now;
+      return { before, after: { target: cloneForAudit(target), children: cloneForAudit(replacements) } };
+    }
+    if (plan.activeGoalId === target.id) delete plan.activeGoalId;
+    target.steeringStatus = 'blocked';
+    target.blockedReason = proposal.blockedReason ?? proposal.rationale;
+    target.steeringEvidence = proposal.evidence;
+    target.steeringRationale = proposal.rationale;
+    target.updatedAt = now;
+    if (plan.activeGoalId === target.id) plan.activeGoalId = undefined;
+    plan.updatedAt = now;
+    return { before, after: cloneForAudit(target) };
+  }
+  return {};
+}
+
+export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringProposal, options: { now?: Date; directiveText?: string } = {}): Promise<SteerUltragoalResult> {
+  const plan = await readUltragoalPlan(cwd);
+  const existing = proposal.idempotencyKey
+    ? (await readSteeringLedgerEntries(cwd)).find((entry) => entry.event === 'steering_accepted' && (entry.idempotencyKey === proposal.idempotencyKey || entry.steering?.idempotencyKey === proposal.idempotencyKey) && entry.steering)
+    : undefined;
+  if (existing?.steering) {
+    return { plan, accepted: true, audit: { ...existing.steering, deduped: true }, rejectedReasons: [], deduped: true };
+  }
+
+  let invariant = validateUltragoalSteeringProposal(plan, proposal);
+  const now = iso(options.now ?? proposal.now);
+  const beforePlan = cloneForAudit(plan);
+  let mutation: { before?: unknown; after?: unknown } = {};
+  if (invariant.accepted) {
+    try {
+      mutation = applySteeringMutation(plan, proposal, now);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const rejectedReasons = [...invariant.rejectedReasons, `Steering mutation failed: ${message}`];
+      invariant = {
+        ...invariant,
+        accepted: false,
+        structuralInvariantAccepted: false,
+        rejectedReasons,
+        reasons: rejectedReasons,
+      };
+    }
+  }
+  const audit: UltragoalSteeringAudit = {
+    kind: proposal.kind,
+    source: proposal.source,
+    targetGoalIds: proposalTargetIds(proposal),
+    before: mutation.before ?? beforePlan,
+    after: mutation.after,
+    evidence: proposal.evidence,
+    rationale: proposal.rationale,
+    invariant,
+    directiveText: options.directiveText ?? proposal.directiveText,
+    promptSignature: proposal.promptSignature,
+    idempotencyKey: proposal.idempotencyKey,
+  };
+
+  if (invariant.accepted) await writePlan(cwd, plan);
+  await appendLedger(cwd, {
+    ts: now,
+    event: invariant.accepted ? 'steering_accepted' : 'steering_rejected',
+    goalId: proposalTargetIds(proposal)[0],
+    evidence: proposal.evidence,
+    message: proposal.rationale,
+    steering: audit,
+    mutationKind: proposal.kind,
+    before: audit.before,
+    after: audit.after,
+  });
+
+  return { plan, accepted: invariant.accepted, audit, rejectedReasons: invariant.rejectedReasons, deduped: false };
 }
 
 function validateQualityGate(value: unknown): UltragoalQualityGate {
@@ -449,15 +964,15 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
   const plan = await readUltragoalPlan(cwd);
   const now = iso(options.now);
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
-  const existing = plan.goals.find((goal) => goal.status === 'in_progress');
+  const existing = plan.goals.find((goal) => goal.status === 'in_progress' && isScheduleEligibleGoal(goal));
   if (existing) {
     await appendLedger(cwd, { ts: now, event: 'goal_resumed', goalId: existing.id, status: existing.status, message: 'Resuming active ultragoal' });
     return { plan, goal: existing, resumed: true, done: false };
   }
 
-  let next = plan.goals.find((goal) => goal.status === 'pending');
+  let next = plan.goals.find((goal) => goal.status === 'pending' && isScheduleEligible(goal));
   if (!next && options.retryFailed) {
-    next = plan.goals.find((goal) => goal.status === 'failed');
+    next = plan.goals.find((goal) => goal.status === 'failed' && isScheduleEligible(goal));
     if (next) await appendLedger(cwd, { ts: now, event: 'goal_retried', goalId: next.id, status: 'pending', message: next.failureReason });
   }
   if (!next) return { plan, goal: null, resumed: false, done: isUltragoalDone(plan) };
@@ -521,6 +1036,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       snapshot,
       {
         expectedObjective,
+        acceptedObjectives: aggregateMode ? compatibleCodexObjectives(plan) : undefined,
         allowedStatuses: aggregateMode
           ? (finalRunCheckpoint && !options.allowActiveFinalCodexGoal ? ['complete'] : ['active'])
           : ['complete'],
@@ -622,6 +1138,7 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
     options.codexGoal === undefined ? null : parseCodexGoalSnapshot(options.codexGoal),
     {
       expectedObjective,
+      acceptedObjectives: aggregateMode ? compatibleCodexObjectives(plan) : undefined,
       allowedStatuses: ['active'],
       requireSnapshot: true,
       requireComplete: false,
@@ -631,7 +1148,7 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
     throw new UltragoalError(formatCodexGoalReconciliation(reconciliation));
   }
 
-  const addedGoal = appendGoalToPlan(plan, options, now);
+  const addedGoal = appendGoalToPlan(plan, { ...options, now: options.now });
   goal.status = 'review_blocked';
   goal.reviewBlockedAt = now;
   goal.updatedAt = now;

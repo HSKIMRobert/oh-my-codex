@@ -20,6 +20,8 @@ export {
 export const PACKED_INSTALL_SMOKE_CORE_COMMANDS = [
   ['--help'],
   ['version'],
+  ['api', '--help'],
+  ['sparkshell', '--help'],
 ] as const;
 
 function usage(): string {

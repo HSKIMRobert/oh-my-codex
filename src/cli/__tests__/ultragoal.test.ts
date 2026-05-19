@@ -74,7 +74,9 @@ describe('cli/ultragoal', () => {
       const goals = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as { activeGoalId?: string; codexGoalMode?: string; codexObjective?: string };
       assert.equal(goals.activeGoalId, 'G001-first-milestone');
       assert.equal(goals.codexGoalMode, 'aggregate');
-      assert.match(goals.codexObjective ?? '', /Complete all ultragoal stories/);
+      assert.match(goals.codexObjective ?? '', /Complete the durable ultragoal plan/);
+      assert.match(goals.codexObjective ?? '', /including later accepted\/appended stories/);
+      assert.doesNotMatch(goals.codexObjective ?? '', /G001-first-milestone/);
     });
   });
 
@@ -121,6 +123,149 @@ describe('cli/ultragoal', () => {
     });
   });
 
+  it('steers ultragoal plans through structured CLI fields with audit output', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
+      const steered = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'add_subgoal',
+        '--title', 'Prompt submit bridge',
+        '--objective', 'Implement bounded prompt-submit bridge behavior.',
+        '--evidence', '.omx/ultragoal G002-cli-and-prompt-submit-bridge needs a structured CLI bridge before hook wiring.',
+        '--rationale', 'A structured CLI mutation keeps steering explicit and audited without broad natural-language mutation.',
+        '--idempotency-key', 'g002-cli-add-subgoal',
+        '--json',
+      ]));
+
+      assert.equal(steered.exitCode, undefined);
+      const parsed = JSON.parse(steered.stdout.join('\n')) as {
+        accepted: boolean;
+        deduped: boolean;
+        audit: { kind: string; source: string; idempotencyKey: string };
+        summary: { pending: number };
+      };
+      assert.equal(parsed.accepted, true);
+      assert.equal(parsed.deduped, false);
+      assert.equal(parsed.audit.kind, 'add_subgoal');
+      assert.equal(parsed.audit.source, 'cli');
+      assert.equal(parsed.audit.idempotencyKey, 'g002-cli-add-subgoal');
+      assert.equal(parsed.summary.pending, 2);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"steering_accepted"/);
+      assert.match(ledger, /g002-cli-add-subgoal/);
+    });
+  });
+
+  it('dedupes structured CLI steering by idempotency key', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
+      const args = [
+        'steer',
+        '--kind', 'add_subgoal',
+        '--title', 'Prompt submit bridge',
+        '--objective', 'Implement bounded prompt-submit bridge behavior.',
+        '--evidence', '.omx/ultragoal G002-cli-and-prompt-submit-bridge evidence.',
+        '--rationale', 'Explicit structured steering should be idempotent.',
+        '--idempotency-key', 'same-cli-steer',
+        '--json',
+      ];
+
+      await capture(() => ultragoalCommand(args));
+      const second = await capture(() => ultragoalCommand(args));
+      const parsed = JSON.parse(second.stdout.join('\n')) as { accepted: boolean; deduped: boolean; summary: { pending: number } };
+      assert.equal(parsed.accepted, true);
+      assert.equal(parsed.deduped, true);
+      assert.equal(parsed.summary.pending, 2);
+    });
+  });
+
+  it('rejects broad natural-language steering instead of guessing mutations', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
+      const rejected = await capture(() => ultragoalCommand(['steer', 'please rewrite goals however seems best']));
+
+      assert.equal(rejected.exitCode, 1);
+      assert.match(rejected.stderr.join('\n'), /rejects broad natural-language mutation requests/);
+    });
+  });
+
+  it('rejects legacy proposal json with an invalid steering kind', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
+      const rejected = await capture(() => ultragoalCommand([
+        'steer',
+        '--proposal',
+        JSON.stringify({
+          kind: 'make_goal_easier',
+          source: 'cli',
+          evidence: 'The proposal came from a stale integration path.',
+          rationale: 'Invalid mutation kinds must not bypass the structured allowlist.',
+        }),
+        '--json',
+      ]));
+
+      assert.equal(rejected.exitCode, 1);
+      assert.match(rejected.stderr.join('\n'), /Invalid --kind: make_goal_easier/);
+    });
+  });
+
+  it('rejects invalid steering source and reports the accepted audit source', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
+      const invalid = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'annotate_ledger',
+        '--source', 'forged',
+        '--evidence', '.omx/ultragoal G002 invalid source evidence.',
+        '--rationale', 'Invalid sources must not enter the steering audit.',
+        '--json',
+      ]));
+
+      assert.equal(invalid.exitCode, 1);
+      assert.match(invalid.stderr.join('\n'), /Invalid --source: forged/);
+
+      const accepted = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'annotate_ledger',
+        '--source', 'finding',
+        '--evidence', '.omx/ultragoal G002 reviewer finding evidence.',
+        '--rationale', 'The CLI should report the actual accepted audit source.',
+        '--json',
+      ]));
+      assert.equal(accepted.exitCode, undefined);
+      const parsed = JSON.parse(accepted.stdout.join('\n')) as { audit: { source: string } };
+      assert.equal(parsed.audit.source, 'finding');
+    });
+  });
+
+  it('surfaces rejected structured steering audit results', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- CLI bridge']));
+      const rejected = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'revise_pending_wording',
+        '--target-goal-id', 'G999-missing',
+        '--evidence', '.omx/ultragoal G002-cli-and-prompt-submit-bridge invalid target evidence.',
+        '--rationale', 'This intentionally uses a missing goal to prove rejection audit output.',
+        '--title', 'New title',
+        '--json',
+      ]));
+
+      assert.equal(rejected.exitCode, 1);
+      const parsed = JSON.parse(rejected.stdout.join('\n')) as {
+        accepted: boolean;
+        rejectedReasons: string[];
+        audit: { kind: string; source: string; targetGoalId: string };
+      };
+      assert.equal(parsed.accepted, false);
+      assert.equal(parsed.audit.kind, 'revise_pending_wording');
+      assert.equal(parsed.audit.source, 'cli');
+      assert.equal(parsed.audit.targetGoalId, 'G999-missing');
+      assert.match(parsed.rejectedReasons.join(' | '), /unknown/);
+    });
+  });
+
   it('adds goals through the command surface', async () => {
     await withCwd(async () => {
       await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
@@ -137,6 +282,56 @@ describe('cli/ultragoal', () => {
       assert.equal(parsed.addedGoal.id, 'G002-resolve-final-code-review-blockers');
       assert.equal(parsed.addedGoal.status, 'pending');
       assert.equal(parsed.summary.pending, 2);
+    });
+  });
+
+  it('steers an ultragoal mutation through structured flags', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- Add and steer goal']));
+      const result = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'add_subgoal',
+        '--title', 'Add steering telemetry',
+        '--objective', 'Add explicit steering bridge telemetry evidence to ultragoal.',
+        '--evidence', 'structured steer test',
+        '--rationale', 'Test should exercise bounded CLI steering path.',
+        '--idempotency-key', 'cli-steer-e2e',
+        '--json',
+      ]));
+
+      assert.equal(result.exitCode, undefined);
+      const parsed = JSON.parse(result.stdout.join('\n')) as { accepted: boolean; deduped: boolean; planSummary: { pending: number } };
+      assert.equal(parsed.accepted, true);
+      assert.equal(parsed.deduped, false);
+      assert.equal(parsed.planSummary.pending, 2);
+
+      const replay = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'add_subgoal',
+        '--title', 'Add steering telemetry',
+        '--objective', 'Add explicit steering bridge telemetry evidence to ultragoal.',
+        '--evidence', 'structured steer test',
+        '--rationale', 'Test should exercise bounded CLI steering path.',
+        '--idempotency-key', 'cli-steer-e2e',
+        '--json',
+      ]));
+      const deduped = JSON.parse(replay.stdout.join('\n')) as { deduped: boolean; planSummary: { pending: number } };
+      assert.equal(deduped.deduped, true);
+      assert.equal(deduped.planSummary.pending, 2);
+    });
+  });
+
+  it('errors when missing required steering evidence or rationale', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- Add and steer goal']));
+      const result = await capture(() => ultragoalCommand([
+        'steer',
+        '--kind', 'add_subgoal',
+        '--title', 'No evidence',
+        '--objective', 'Missing evidence and rationale should fail.',
+      ]));
+      assert.equal(result.exitCode, 1);
+      assert.match(result.stderr.join('\n'), /Missing --evidence/);
     });
   });
 

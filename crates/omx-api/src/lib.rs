@@ -14,7 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub type Result<T> = std::result::Result<T, OmxApiError>;
 
 pub const DEFAULT_API_PORT: u16 = 14510;
+pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+pub const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_RESPONSES_PATH: &str = "/responses";
+const CODEX_IMAGES_GENERATIONS_PATH: &str = "/images/generations";
 const CODEX_DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_DEFAULT_BACKEND_BASE_PATH: &str = "/backend-api/codex";
 const CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
@@ -283,7 +286,9 @@ pub fn redact_secrets(input: &str) -> String {
             redact_next = false;
         }
     }
-    redact_json_secret_values(&out)
+    redact_secret_markers(&redact_key_value_secret_fragments(
+        &redact_json_secret_values(&out),
+    ))
 }
 
 fn redact_json_secret_values(input: &str) -> String {
@@ -293,6 +298,121 @@ fn redact_json_secret_values(input: &str) -> String {
     };
     redact_value(&mut value);
     serde_json::to_string(&value).unwrap_or_else(|_| input.to_string())
+}
+
+fn redact_key_value_secret_fragments(input: &str) -> String {
+    let mut output = input.to_string();
+    let secret_keys = [
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth_token",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+    ];
+    let mut search_start = 0;
+    loop {
+        if search_start >= output.len() {
+            break;
+        }
+        let lower = output[search_start..].to_ascii_lowercase();
+        let Some((relative_key_start, key)) = secret_keys
+            .iter()
+            .filter_map(|key| lower.find(key).map(|index| (index, *key)))
+            .min_by_key(|(index, _)| *index)
+        else {
+            break;
+        };
+        let key_start = search_start + relative_key_start;
+        let key_end = key_start + key.len();
+        let after_key = &output[key_end..];
+        let Some(delimiter_offset) = after_key.char_indices().find_map(|(offset, ch)| match ch {
+            '=' | ':' => Some(offset),
+            '"' | '\'' | ' ' | '\t' => None,
+            _ => Some(usize::MAX),
+        }) else {
+            break;
+        };
+        if delimiter_offset == usize::MAX {
+            search_start = key_end;
+            continue;
+        }
+        let delimiter = key_end + delimiter_offset;
+        let mut value_start = delimiter + 1;
+        while output
+            .as_bytes()
+            .get(value_start)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            value_start += 1;
+        }
+        let quote = output
+            .as_bytes()
+            .get(value_start)
+            .copied()
+            .filter(|byte| *byte == b'"' || *byte == b'\'');
+        if quote.is_some() {
+            value_start += 1;
+        }
+        let mut value_end = if let Some(quote) = quote {
+            output
+                .as_bytes()
+                .get(value_start..)
+                .and_then(|tail| tail.iter().position(|byte| *byte == quote))
+                .map(|offset| value_start + offset)
+                .unwrap_or_else(|| find_secret_end(&output, value_start))
+        } else {
+            find_secret_end(&output, value_start)
+        };
+        if value_end <= value_start {
+            search_start = key_end;
+            continue;
+        }
+        if quote.is_none() {
+            value_end = value_end
+                .min(
+                    output[value_start..]
+                        .find(',')
+                        .map(|offset| value_start + offset)
+                        .unwrap_or(output.len()),
+                )
+                .min(
+                    output[value_start..]
+                        .find('}')
+                        .map(|offset| value_start + offset)
+                        .unwrap_or(output.len()),
+                );
+        }
+        output.replace_range(value_start..value_end, "[REDACTED]");
+        search_start = value_start + "[REDACTED]".len();
+    }
+    output
+}
+
+fn redact_secret_markers(input: &str) -> String {
+    let mut output = input.to_string();
+    for marker in ["sk-", "ghp_", "xoxb-"] {
+        while let Some(start) = output.find(marker) {
+            let end = find_secret_end(&output, start);
+            output.replace_range(start..end, "[REDACTED]");
+        }
+    }
+    output
+}
+
+fn find_secret_end(text: &str, start: usize) -> usize {
+    text[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            if ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | ']' | '}') {
+                Some(start + offset)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(text.len())
 }
 
 fn redact_value(value: &mut Value) {
@@ -635,16 +755,13 @@ fn text_response_json(
 }
 
 fn image_response(request: &Request, backend: &BackendMode) -> Response {
-    if *backend == BackendMode::RealPrivate {
-        return Response::json(
-            501,
-            json!({"error": {"message": "real-private image generation is not implemented in V1A", "type": "unsupported_request"}}),
-        );
-    }
     let body = match parse_json_body(request) {
         Ok(body) => body,
         Err(response) => return response,
     };
+    if *backend == BackendMode::RealPrivate {
+        return real_private_image_response(&body);
+    }
     let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         let mut stream = sse_event(
@@ -671,6 +788,144 @@ fn image_response(request: &Request, backend: &BackendMode) -> Response {
     )
 }
 
+fn real_private_image_response(body: &Value) -> Response {
+    match real_private_image(body) {
+        Ok(image) => image_response_json(body, "real-private", image),
+        Err((status, kind, message)) => Response::json(
+            status,
+            json!({
+                "error": {
+                    "message": message,
+                    "type": kind
+                }
+            }),
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct GeneratedImage {
+    url: Option<String>,
+    b64_json: Option<String>,
+    revised_prompt: Option<String>,
+}
+
+fn real_private_image(
+    body: &Value,
+) -> std::result::Result<GeneratedImage, (u16, &'static str, String)> {
+    if let Some(b64_json) = env::var("OMX_API_REAL_PRIVATE_IMAGE_B64_JSON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(GeneratedImage {
+            b64_json: Some(b64_json),
+            revised_prompt: body
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(redact_secrets),
+            ..GeneratedImage::default()
+        });
+    }
+    if let Some(url) = env::var("OMX_API_REAL_PRIVATE_IMAGE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(GeneratedImage {
+            url: Some(url),
+            revised_prompt: body
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(redact_secrets),
+            ..GeneratedImage::default()
+        });
+    }
+
+    let Some(auth) = discover_codex_oauth() else {
+        return Err((
+            503,
+            "missing_auth",
+            "missing Codex OAuth token; run Codex login or set OMX_API_REAL_PRIVATE_IMAGE_B64_JSON/OMX_API_REAL_PRIVATE_IMAGE_URL for fixture smoke tests".to_string(),
+        ));
+    };
+
+    if let Some(upstream) = env::var("OMX_API_PRIVATE_IMAGE_BACKEND_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return post_codex_image_to_url(&upstream, body, &auth).map_err(|error| {
+            (
+                502,
+                "private_backend_error",
+                redact_secrets(&error.to_string()),
+            )
+        });
+    }
+
+    if let Some(upstream) = env::var("OMX_API_PRIVATE_BACKEND_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return post_codex_image_via_responses_to_url(&upstream, body, &auth).map_err(|error| {
+            (
+                502,
+                "private_backend_error",
+                redact_secrets(&error.to_string()),
+            )
+        });
+    }
+
+    Err((
+        501,
+        "private_image_backend_unconfigured",
+        "real-private OAuth was found, but neither OMX_API_PRIVATE_IMAGE_BACKEND_URL nor OMX_API_PRIVATE_BACKEND_URL is configured for image generation".to_string(),
+    ))
+}
+
+fn image_response_json(body: &Value, backend: &str, image: GeneratedImage) -> Response {
+    let mut item = serde_json::Map::new();
+    if let Some(url) = image.url {
+        item.insert("url".to_string(), Value::String(url));
+    }
+    if let Some(b64_json) = image.b64_json {
+        item.insert("b64_json".to_string(), Value::String(b64_json));
+    }
+    if let Some(revised_prompt) = image.revised_prompt.or_else(|| {
+        body.get("prompt")
+            .and_then(Value::as_str)
+            .map(redact_secrets)
+    }) {
+        item.insert("revised_prompt".to_string(), Value::String(revised_prompt));
+    }
+    if item.is_empty() {
+        item.insert(
+            "url".to_string(),
+            Value::String("https://localhost.omx.invalid/private-image.png".to_string()),
+        );
+    }
+
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        let mut stream = sse_event(
+            Some("image_generation.partial_image"),
+            &json!({"type": "image_generation.partial_image", "backend": backend, "image": item}),
+        );
+        stream.push_str(&sse_event(
+            Some("image_generation.completed"),
+            &json!({"type": "image_generation.completed", "backend": backend}),
+        ));
+        stream.push_str(&sse_done());
+        return Response::text(200, "text/event-stream", stream.into_bytes());
+    }
+
+    Response::json(
+        200,
+        json!({
+            "created": now_unix(),
+            "backend": backend,
+            "data": [Value::Object(item)]
+        }),
+    )
+}
+
 fn parse_json_body(request: &Request) -> std::result::Result<Value, Response> {
     if request.body.is_empty() {
         return Ok(json!({}));
@@ -693,6 +948,26 @@ fn extract_prompt(body: &Value) -> String {
         if let Some(text) = input.as_str() {
             return text.to_string();
         }
+        if let Some(items) = input.as_array() {
+            let text = items
+                .iter()
+                .filter_map(|item| item.get("content"))
+                .flat_map(|content| match content {
+                    Value::String(text) => vec![text.clone()],
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|part| {
+                            part.get("text").and_then(Value::as_str).map(str::to_string)
+                        })
+                        .collect::<Vec<_>>(),
+                    other => vec![other.to_string()],
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                return text;
+            }
+        }
         return input.to_string();
     }
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
@@ -707,6 +982,9 @@ fn extract_prompt(body: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n");
+    }
+    if let Some(prompt) = body.get("prompt").and_then(Value::as_str) {
+        return prompt.to_string();
     }
     String::new()
 }
@@ -822,6 +1100,11 @@ fn build_codex_native_request(
         .or_else(|| env::var("OMX_API_GENERATE_MODEL").ok())
         .unwrap_or_else(|| "omx-private".to_string());
     let prompt = extract_prompt(body);
+    let tools = body.get("tools").cloned().unwrap_or_else(|| json!([]));
+    let tool_choice = body
+        .get("tool_choice")
+        .cloned()
+        .unwrap_or_else(|| json!("auto"));
     let path = normalize_codex_responses_path(upstream_path);
     let mut request_body = json!({
         "model": model,
@@ -830,8 +1113,8 @@ fn build_codex_native_request(
             "role": "user",
             "content": [{"type": "input_text", "text": prompt}]
         }],
-        "tools": [],
-        "tool_choice": "auto",
+        "tools": tools,
+        "tool_choice": tool_choice,
         "parallel_tool_calls": false,
         "reasoning": body.get("reasoning").cloned().unwrap_or(Value::Null),
         "store": false,
@@ -896,6 +1179,74 @@ fn normalize_codex_responses_path(path: &str) -> String {
     }
 }
 
+fn normalize_codex_images_generations_path(path: &str) -> String {
+    let path = if path == "/" || path.is_empty() {
+        CODEX_DEFAULT_BACKEND_BASE_PATH
+    } else {
+        path.trim_end_matches('/')
+    };
+    if path.ends_with(CODEX_IMAGES_GENERATIONS_PATH) {
+        path.to_string()
+    } else {
+        format!("{path}{CODEX_IMAGES_GENERATIONS_PATH}")
+    }
+}
+
+fn build_codex_image_request(
+    upstream_path: &str,
+    body: &Value,
+    auth: &CodexOAuth,
+) -> CodexNativeRequest {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| env::var("OMX_API_IMAGE_MODEL").ok())
+        .unwrap_or_else(|| "omx-private-image".to_string());
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut request_body = json!({
+        "model": model,
+        "prompt": prompt,
+        "n": body.get("n").cloned().unwrap_or_else(|| json!(1)),
+        "size": body.get("size").cloned().unwrap_or_else(|| json!("1024x1024")),
+    });
+    for key in ["quality", "response_format", "style", "user"] {
+        if let Some(value) = body.get(key).cloned() {
+            request_body[key] = value;
+        }
+    }
+
+    let mut headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        (
+            "Accept".to_string(),
+            "application/json, text/event-stream".to_string(),
+        ),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", auth.token),
+        ),
+        (
+            "originator".to_string(),
+            CODEX_DEFAULT_ORIGINATOR.to_string(),
+        ),
+        ("User-Agent".to_string(), codex_user_agent()),
+    ];
+    if let Some(account_id) = auth.account_id.as_ref() {
+        headers.push(("ChatGPT-Account-ID".to_string(), account_id.clone()));
+    }
+
+    CodexNativeRequest {
+        path: normalize_codex_images_generations_path(upstream_path),
+        headers,
+        body: request_body,
+    }
+}
+
 fn post_codex_responses_to_url(url: &str, body: &Value, auth: &CodexOAuth) -> Result<String> {
     let parsed = parse_http_backend_url(url)?;
     let codex_request = build_codex_native_request(&parsed.path, body, auth);
@@ -919,9 +1270,7 @@ fn post_codex_responses_to_url(url: &str, body: &Value, auth: &CodexOAuth) -> Re
     stream.write_all(&payload)?;
     let mut raw = String::new();
     stream.read_to_string(&mut raw)?;
-    let (head, response_body) = raw.split_once("\r\n\r\n").ok_or_else(|| {
-        OmxApiError::Message("private backend returned malformed HTTP".to_string())
-    })?;
+    let (head, response_body) = split_http_response(&raw)?;
     let status = head
         .lines()
         .next()
@@ -934,7 +1283,220 @@ fn post_codex_responses_to_url(url: &str, body: &Value, auth: &CodexOAuth) -> Re
         )));
     }
 
-    Ok(extract_backend_text_response(response_body))
+    Ok(extract_backend_text_response(&response_body))
+}
+
+fn post_codex_image_to_url(url: &str, body: &Value, auth: &CodexOAuth) -> Result<GeneratedImage> {
+    let parsed = parse_http_backend_url(url)?;
+    let codex_request = build_codex_image_request(&parsed.path, body, auth);
+    let payload = serde_json::to_vec(&codex_request.body)?;
+    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    write!(
+        stream,
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\n",
+        codex_request.path, parsed.host, parsed.port
+    )?;
+    for (name, value) in codex_request.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(
+        stream,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    )?;
+    stream.write_all(&payload)?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    let (head, response_body) = split_http_response(&raw)?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(502);
+    if !(200..300).contains(&status) {
+        return Err(OmxApiError::Message(format!(
+            "private backend returned HTTP {status}: {response_body}"
+        )));
+    }
+
+    Ok(extract_backend_image_response(&response_body))
+}
+
+fn post_codex_image_via_responses_to_url(
+    url: &str,
+    body: &Value,
+    auth: &CodexOAuth,
+) -> Result<GeneratedImage> {
+    let mut request = body.clone();
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    request["input"] = json!([{
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": prompt}]
+    }]);
+    request["tools"] = json!([{"type": "image_generation"}]);
+    request["tool_choice"] = json!({"type": "image_generation"});
+    request["stream"] = json!(true);
+
+    let parsed = parse_http_backend_url(url)?;
+    let codex_request = build_codex_native_request(&parsed.path, &request, auth);
+    let payload = serde_json::to_vec(&codex_request.body)?;
+    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    write!(
+        stream,
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\n",
+        codex_request.path, parsed.host, parsed.port
+    )?;
+    for (name, value) in codex_request.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(
+        stream,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    )?;
+    stream.write_all(&payload)?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    let (head, response_body) = split_http_response(&raw)?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(502);
+    if !(200..300).contains(&status) {
+        return Err(OmxApiError::Message(format!(
+            "private backend returned HTTP {status}: {response_body}"
+        )));
+    }
+
+    Ok(extract_backend_image_response(&response_body))
+}
+
+fn split_http_response(raw: &str) -> Result<(String, String)> {
+    let (head, response_body) = raw.split_once("\r\n\r\n").ok_or_else(|| {
+        OmxApiError::Message("private backend returned malformed HTTP".to_string())
+    })?;
+    let body = if head.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    }) {
+        decode_chunked_body(response_body)?
+    } else {
+        response_body.to_string()
+    };
+    Ok((head.to_string(), body))
+}
+
+fn decode_chunked_body(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    let mut output = Vec::new();
+    loop {
+        let Some(line_end) = find_crlf(bytes, index) else {
+            return Err(OmxApiError::Message(
+                "chunked response missing chunk size".to_string(),
+            ));
+        };
+        let size_line = std::str::from_utf8(&bytes[index..line_end])
+            .map_err(|_| OmxApiError::Message("chunked response size is not UTF-8".to_string()))?;
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| {
+            OmxApiError::Message(format!("invalid chunk size `{}`", redact_secrets(size_hex)))
+        })?;
+        index = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if bytes.len() < index + size + 2 {
+            return Err(OmxApiError::Message(
+                "chunked response ended mid-chunk".to_string(),
+            ));
+        }
+        output.extend_from_slice(&bytes[index..index + size]);
+        index += size;
+        if bytes.get(index..index + 2) != Some(b"\r\n") {
+            return Err(OmxApiError::Message(
+                "chunked response missing chunk terminator".to_string(),
+            ));
+        }
+        index += 2;
+    }
+    String::from_utf8(output)
+        .map_err(|_| OmxApiError::Message("chunked response body is not UTF-8".to_string()))
+}
+
+fn find_crlf(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes
+        .get(start..)?
+        .windows(2)
+        .position(|chunk| chunk == b"\r\n")
+        .map(|offset| start + offset)
+}
+
+fn extract_backend_image_response(response_body: &str) -> GeneratedImage {
+    if response_body
+        .lines()
+        .any(|line| line.starts_with("event:") || line.starts_with("data:"))
+    {
+        for line in response_body.lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" || data.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(data) {
+                let image = image_from_value(&value);
+                if image.url.is_some() || image.b64_json.is_some() {
+                    return image;
+                }
+            }
+        }
+    }
+
+    let value: Value = serde_json::from_str(response_body).unwrap_or_else(|_| json!({}));
+    image_from_value(&value)
+}
+
+fn image_from_value(value: &Value) -> GeneratedImage {
+    let candidate = value
+        .pointer("/data/0")
+        .or_else(|| value.pointer("/image"))
+        .or_else(|| value.pointer("/output/0"))
+        .unwrap_or(value);
+    GeneratedImage {
+        url: candidate
+            .get("url")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/data/0/url").and_then(Value::as_str))
+            .map(str::to_string),
+        b64_json: candidate
+            .get("b64_json")
+            .and_then(Value::as_str)
+            .or_else(|| candidate.get("b64").and_then(Value::as_str))
+            .or_else(|| value.pointer("/data/0/b64_json").and_then(Value::as_str))
+            .or_else(|| {
+                value
+                    .pointer("/partial_image")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.pointer("/b64_json").and_then(Value::as_str))
+            })
+            .map(str::to_string),
+        revised_prompt: candidate
+            .get("revised_prompt")
+            .and_then(Value::as_str)
+            .map(redact_secrets),
+    }
 }
 
 fn extract_backend_text_response(response_body: &str) -> String {
@@ -1090,7 +1652,26 @@ fn handle_connection(
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let request = read_http_request(&mut stream)?;
+    let request = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(OmxApiError::Message(message)) if message.contains("too large") => {
+            write_http_response(
+                &mut stream,
+                Response::json(
+                    413,
+                    json!({
+                        "error": {
+                            "message": message,
+                            "type": "request_too_large"
+                        }
+                    }),
+                ),
+            )?;
+            let _ = stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let response = route_request(
         &request,
         backend,
@@ -1107,6 +1688,12 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Request> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
+    let mut header_bytes = request_line.len();
+    if header_bytes > MAX_HTTP_HEADER_BYTES {
+        return Err(OmxApiError::Message(
+            "HTTP request headers too large".to_string(),
+        ));
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts
@@ -1121,6 +1708,12 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Request> {
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
+        header_bytes += line.len();
+        if header_bytes > MAX_HTTP_HEADER_BYTES {
+            return Err(OmxApiError::Message(
+                "HTTP request headers too large".to_string(),
+            ));
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -1134,6 +1727,11 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<Request> {
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    if length > MAX_HTTP_BODY_BYTES {
+        return Err(OmxApiError::Message(format!(
+            "HTTP request body too large: {length} bytes exceeds {MAX_HTTP_BODY_BYTES}"
+        )));
+    }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
 
@@ -1170,6 +1768,7 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        413 => "Payload Too Large",
         503 => "Service Unavailable",
         _ => "OK",
     }
@@ -1534,6 +2133,11 @@ fn run_smoke<W: Write>(args: &[String], mut stdout: W) -> Result<()> {
             }
             let body = json!({"model": "omx-private", "input": "Say OMX API smoke OK."});
             let response = real_private_text_response(&body, "response", false);
+            if !(200..300).contains(&response.status) {
+                return Err(OmxApiError::Message(
+                    String::from_utf8_lossy(&response.body).trim().to_string(),
+                ));
+            }
             writeln!(stdout, "{}", String::from_utf8_lossy(&response.body).trim())?;
             Ok(())
         }
@@ -1590,6 +2194,9 @@ fn parse_server_config(args: &[String]) -> Result<ServerConfig> {
         index += 1;
     }
     validate_loopback_host(&config.host)?;
+    if config.backend == BackendMode::RealPrivate && config.local_bearer_token.is_none() {
+        config.local_bearer_token = Some(generate_local_bearer_token());
+    }
     Ok(config)
 }
 
@@ -1640,7 +2247,7 @@ fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'
 }
 
 fn help_text() -> &'static str {
-    "omx-api serve [--daemon] [--system --dry-run]|status|stop|generate text|generate image|smoke text"
+    "omx-api serve [--daemon] [--system --dry-run]|status|stop|generate text|generate image|smoke text\nNote: real-private backend mode is experimental and requires local bearer auth."
 }
 
 fn now_unix() -> u64 {
@@ -1742,6 +2349,35 @@ mod tests {
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("def456"));
         assert!(redacted.contains("[REDACTED] [REDACTED]"));
+    }
+
+    #[test]
+    fn redact_secrets_handles_embedded_json_and_key_value_forms() {
+        let raw = r#"error body {"access_token":"tok-1","api_key":"sk-json"} password: hunter2 sk-one sk-two"#;
+        let redacted = redact_secrets(raw);
+        for secret in ["tok-1", "sk-json", "hunter2", "sk-one", "sk-two"] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn read_http_request_rejects_oversized_body_before_allocation() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("accept");
+            read_http_request(&mut server).expect_err("oversized request should fail")
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_BODY_BYTES + 1
+        )
+        .expect("write request");
+        let error = handle.join().expect("reader thread");
+        assert!(error.to_string().contains("body too large"), "{error}");
     }
 
     #[test]
@@ -1966,6 +2602,178 @@ mod tests {
     }
 
     #[test]
+    fn real_private_responses_stream_uses_upstream_sse() {
+        let _guard = env_lock();
+        env::remove_var("OMX_API_REAL_PRIVATE_RESPONSE_TEXT");
+        env::set_var("OMX_API_CODEX_OAUTH_TOKEN", "oauth-token");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind private backend");
+        let addr = listener.local_addr().expect("local addr");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut raw = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert!(read > 0, "request closed before headers");
+                raw.extend_from_slice(&buffer[..read]);
+                if let Some(index) = raw.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content length");
+            while raw.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).expect("read request body");
+                assert!(read > 0, "request closed before body");
+                raw.extend_from_slice(&buffer[..read]);
+            }
+
+            let body = concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+
+        env::set_var(
+            "OMX_API_PRIVATE_BACKEND_URL",
+            format!("http://127.0.0.1:{}/backend-api/codex", addr.port()),
+        );
+
+        let response = route_request(
+            &request("POST", "/v1/responses", json!({"stream": true})),
+            &BackendMode::RealPrivate,
+            &Telemetry::default(),
+            None,
+            None,
+        );
+
+        handle.join().expect("server thread");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/event-stream");
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("response.output_text.delta"));
+        assert!(body.contains("data: [DONE]"));
+
+        env::remove_var("OMX_API_CODEX_OAUTH_TOKEN");
+        env::remove_var("OMX_API_PRIVATE_BACKEND_URL");
+    }
+
+    #[test]
+    fn real_private_image_falls_back_to_responses_image_tool() {
+        let _guard = env_lock();
+        env::remove_var("OMX_API_REAL_PRIVATE_IMAGE_B64_JSON");
+        env::remove_var("OMX_API_REAL_PRIVATE_IMAGE_URL");
+        env::remove_var("OMX_API_PRIVATE_IMAGE_BACKEND_URL");
+        env::set_var("OMX_API_CODEX_OAUTH_TOKEN", "oauth-token");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind private backend");
+        let addr = listener.local_addr().expect("local addr");
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_thread = Arc::clone(&seen);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut raw_bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert!(read > 0, "request closed before headers");
+                raw_bytes.extend_from_slice(&buffer[..read]);
+                if let Some(index) = raw_bytes.windows(4).position(|chunk| chunk == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw_bytes[..header_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content length");
+            while raw_bytes.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).expect("read request body");
+                assert!(read > 0, "request closed before body");
+                raw_bytes.extend_from_slice(&buffer[..read]);
+            }
+            *seen_thread.lock().expect("seen lock") =
+                String::from_utf8_lossy(&raw_bytes).to_string();
+            let body = concat!(
+                "event: response.image_generation_call.partial_image\n",
+                "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image\":\"ZmFrZS1pbWFnZS10b29s\"}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+
+        env::set_var(
+            "OMX_API_PRIVATE_BACKEND_URL",
+            format!("http://127.0.0.1:{}/backend-api/codex", addr.port()),
+        );
+        let response = route_request(
+            &request(
+                "POST",
+                "/v1/images/generations",
+                json!({"prompt": "tool image", "stream": true}),
+            ),
+            &BackendMode::RealPrivate,
+            &Telemetry::default(),
+            None,
+            None,
+        );
+
+        handle.join().expect("server thread");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/event-stream");
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("image_generation.partial_image"));
+        assert!(body.contains("ZmFrZS1pbWFnZS10b29s"));
+        let raw = seen.lock().expect("seen lock").clone();
+        let forwarded_body = raw.split("\r\n\r\n").nth(1).expect("forwarded body");
+        let forwarded_json: Value = serde_json::from_str(forwarded_body).expect("forwarded JSON");
+        assert_eq!(
+            forwarded_json["tools"],
+            json!([{"type": "image_generation"}])
+        );
+        assert_eq!(
+            forwarded_json["tool_choice"],
+            json!({"type": "image_generation"})
+        );
+        assert_eq!(
+            forwarded_json["input"][0]["content"][0]["text"],
+            "tool image"
+        );
+
+        env::remove_var("OMX_API_CODEX_OAUTH_TOKEN");
+        env::remove_var("OMX_API_PRIVATE_BACKEND_URL");
+    }
+
+    #[test]
+    fn redact_secrets_handles_chunk_like_sse_frames() {
+        let chunk = "data: {\"message\":\"Bearer sk-mock-token\"}\n";
+        let redacted = redact_secrets(chunk);
+        assert!(!redacted.contains("sk-mock-token"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
     fn chat_stream_response_uses_chat_chunk_shape() {
         let telemetry = Telemetry::default();
         let response = route_request(
@@ -2007,8 +2815,13 @@ mod tests {
     }
 
     #[test]
-    fn real_private_image_is_unsupported_request() {
-        env::remove_var("OMX_API_REAL_PRIVATE_ALLOW");
+    fn real_private_image_reports_unconfigured_without_image_backend() {
+        let _guard = env_lock();
+        env::set_var("OMX_API_CODEX_OAUTH_TOKEN", "oauth-token");
+        env::remove_var("OMX_API_REAL_PRIVATE_IMAGE_B64_JSON");
+        env::remove_var("OMX_API_REAL_PRIVATE_IMAGE_URL");
+        env::remove_var("OMX_API_PRIVATE_IMAGE_BACKEND_URL");
+        env::remove_var("OMX_API_PRIVATE_BACKEND_URL");
         let telemetry = Telemetry::default();
         let response = route_request(
             &request("POST", "/v1/images/generations", json!({"prompt": "x"})),
@@ -2018,6 +2831,10 @@ mod tests {
             None,
         );
         assert_eq!(response.status, 501);
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("private_image_backend_unconfigured"));
+        env::remove_var("OMX_API_CODEX_OAUTH_TOKEN");
     }
 
     #[test]
@@ -2026,6 +2843,11 @@ mod tests {
         env::remove_var("OMX_API_REAL_PRIVATE_RESPONSE_TEXT");
         env::remove_var("OMX_API_CODEX_OAUTH_TOKEN");
         env::remove_var("OMX_API_PRIVATE_BACKEND_URL");
+        let previous_codex_home = env::var("CODEX_HOME").ok();
+        env::set_var(
+            "CODEX_HOME",
+            env::temp_dir().join("omx-api-test-missing-auth"),
+        );
         let telemetry = Telemetry::default();
         let response = route_request(
             &request(
@@ -2038,10 +2860,53 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(response.status, 503);
-        assert_eq!(response.content_type, "application/json");
+        let status = response.status;
+        let content_type = response.content_type.clone();
         let body = String::from_utf8(response.body).unwrap();
+        if let Some(codex_home) = previous_codex_home {
+            env::set_var("CODEX_HOME", codex_home);
+        } else {
+            env::remove_var("CODEX_HOME");
+        }
+
+        assert_eq!(status, 503);
+        assert_eq!(content_type, "application/json");
         assert!(body.contains("missing_auth"));
+    }
+
+    #[test]
+    fn live_text_smoke_fails_when_private_backend_returns_error() {
+        let _guard = env_lock();
+        env::set_var("OMX_API_LIVE_SMOKE", "1");
+        env::remove_var("OMX_API_REAL_PRIVATE_RESPONSE_TEXT");
+        env::set_var("OMX_API_CODEX_OAUTH_TOKEN", "oauth-token");
+        env::remove_var("OMX_API_PRIVATE_BACKEND_URL");
+
+        let mut stdout = Vec::new();
+        let error = run_cli(["smoke", "text"], &mut stdout, Vec::new())
+            .expect_err("smoke must fail on real-private error JSON");
+
+        assert!(stdout.is_empty(), "error smoke should not write stdout");
+        assert!(error.to_string().contains("private_backend_unconfigured"));
+
+        env::remove_var("OMX_API_LIVE_SMOKE");
+        env::remove_var("OMX_API_CODEX_OAUTH_TOKEN");
+    }
+
+    #[test]
+    fn live_text_smoke_succeeds_when_response_fixture_set() {
+        let _guard = env_lock();
+        let mut stdout = Vec::new();
+        env::set_var("OMX_API_LIVE_SMOKE", "1");
+        env::set_var("OMX_API_REAL_PRIVATE_RESPONSE_TEXT", "ok-fixture-smoke");
+
+        run_cli(["smoke", "text"], &mut stdout, Vec::new()).unwrap();
+
+        env::remove_var("OMX_API_LIVE_SMOKE");
+        env::remove_var("OMX_API_REAL_PRIVATE_RESPONSE_TEXT");
+        assert!(String::from_utf8(stdout)
+            .unwrap()
+            .contains("ok-fixture-smoke"));
     }
 
     #[test]

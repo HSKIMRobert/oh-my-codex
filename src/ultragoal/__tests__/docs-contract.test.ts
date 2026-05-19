@@ -57,6 +57,50 @@ describe('ultragoal docs contract', () => {
     }
   });
 
+  it('documents bounded dynamic steering without easier-completion mutations', () => {
+    const docs = [
+      loadDoc('docs/ultragoal.md'),
+      loadDoc('skills/ultragoal/SKILL.md'),
+      loadDoc('plugins/oh-my-codex/skills/ultragoal/SKILL.md'),
+    ];
+    const nativeHooksDoc = loadDoc('docs/codex-native-hooks.md');
+
+    for (const doc of docs) {
+      assert.match(doc, /Dynamic steering/);
+      assert.match(doc, /omx ultragoal steer/);
+      assert.match(doc, /add_subgoal/);
+      assert.match(doc, /split_subgoal/);
+      assert.match(doc, /reorder_pending/);
+      assert.match(doc, /revise_pending_wording/);
+      assert.match(doc, /annotate_ledger/);
+      assert.match(doc, /mark_blocked_superseded/);
+      assert.match(doc, /aggregate (Codex )?objective|aggregate objective/i);
+      assert.match(doc, /constraints stay fixed|original brief constraints/i);
+      assert.match(doc, /broad natural-language requests[\s\S]{0,80}rejected/i);
+      assert.match(doc, /steering_accepted|structured steering audit events/i);
+      assert.match(doc, /hard-delete goals/);
+      assert.match(doc, /auto-complete work/);
+      assert.match(doc, /silently mutate/i);
+      assert.match(doc, /UserPromptSubmit/);
+      assert.match(doc, /OMX_ULTRAGOAL_STEER/);
+    }
+
+    assert.match(nativeHooksDoc, /UserPromptSubmit: bounded ultragoal steering/);
+    assert.match(nativeHooksDoc, /Only explicit structured directives/i);
+    assert.match(nativeHooksDoc, /does not infer mutations from ordinary prose/i);
+    assert.match(nativeHooksDoc, /keyword routing still takes precedence/i);
+  });
+
+  it('documents deep-interview to ralplan to ultragoal as the README default workflow', () => {
+    const readme = loadDoc('README.md');
+
+    assert.match(readme, /canonical default workflow with `\$deep-interview`, `\$ralplan`, and `\$ultragoal`/);
+    assert.match(readme, /standard workflow built around `\$deep-interview` -> `\$ralplan` -> `\$ultragoal`/);
+    assert.match(readme, /\$deep-interview "clarify the authentication change"[\s\S]*\$ralplan "approve the auth plan and review tradeoffs"[\s\S]*\$ultragoal "turn the approved plan into durable Codex goals"/);
+    assert.match(readme, /Use `\$team` inside that execution path only when a specific Ultragoal story needs coordinated parallel work/);
+    assert.match(readme, /Use `\$ralph` as an intentional alternate completion loop/);
+  });
+
   it('documents Team as the parallel execution engine while leader owns Ultragoal checkpointing', () => {
     const docs = [
       loadDoc('docs/ultragoal.md'),

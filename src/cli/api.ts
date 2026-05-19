@@ -29,6 +29,7 @@ export const API_USAGE = [
   '  generate image <prompt...> [--state-file path]',
   '',
   'Runs the native omx-api localhost gateway sidecar and forwards arguments unchanged.',
+  'Note: real-private backend mode is experimental and requires local bearer auth.',
   `Set ${OMX_API_BIN_ENV} to override the native binary path.`,
 ].join('\n');
 

@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-05-19
+
+Minor release focused on local-generation infrastructure, SparkShell operator safety, and runtime reliability after `0.17.3`. The release adds the OMX API gateway, routes SparkShell summaries through the local API surface, improves real/local generation compatibility, and closes a cluster of hook, notify, tmux, Windows MCP, and workflow-state regressions found while preparing the release.
+
+### Added
+
+- **OMX API gateway for local generation** — new `omx api` support provides a localhost-compatible API surface for OMX-owned generation flows and SparkShell summaries.
+- **Bounded best-practice research workflow** — `$best-practice-research` gives release and implementation work an upstream-evidence-first workflow with explicit bounds.
+- **SparkShell diagnostics for operators** — SparkShell can summarize team panes, cache pane observations incrementally, preserve passthrough contracts, and keep raw secrets out of summaries.
+
+### Changed
+
+- **Real/local generation compatibility** — local real generation paths and Responses metadata propagation are aligned with the OMX API gateway.
+- **Release and CI readiness** — targeted CI lanes reduce wasted PR work, API CLI tests are more reliable under load, and the release train now includes `omx api` / `omx sparkshell` smoke coverage.
+- **Workflow durability across compaction** — autopilot review state and autoresearch-goal Stop reconciliation survive the handoff conditions that previously caused review skips or stale loops.
+
+### Fixed
+
+- **Notify recursion and fork bombs** — stale wrapper recursion, `previousNotify` self-reference, fallback watcher respawns, and dispatcher recursive forks are blocked.
+- **Stop/hook false positives** — stale Ralph/ralplan state, autoresearch-goal reconciliation drift, MCP transport false positives, and tmux diagnostic false positives no longer trigger erroneous lifecycle loops.
+- **Team/tmux/HUD/Windows reliability** — wrapped tmux drafts are no longer trusted as sent input, HUD resize hooks survive reflow, worker tmux rc fan-out is stopped, provider env vars are preserved for directly launched tmux sessions, and Windows MCP siblings avoid duplicate watchdog collisions.
+- **Advisor prompt compatibility** — `omx ask` role prompts that start with YAML frontmatter are handled correctly.
+- **0.18.0 release blockers** — API auth defaults, request bounds, redaction, help text, version metadata, and smoke commands were hardened before release.
+
+### PRs
+
+- #2295, #2332, #2334, #2335, #2338, #2339, #2341, #2342, #2344, #2345, #2347, #2349, #2351, #2357, #2359, #2360, #2361, #2365, #2367, #2372, #2374, #2375, #2376
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.0.md`.
+
 ## [0.17.3] - 2026-05-14
 
 ### Highlights

@@ -1,29 +1,43 @@
-# oh-my-codex 0.17.3
+# oh-my-codex 0.18.0
 
-`0.17.3` is a hotfix release after `0.17.2` that restores default `omx team` launch for Codex CLI-first/plugin configs while preserving the worker MCP isolation introduced in `0.17.1`.
+`0.18.0` ships the OMX API gateway and a safer SparkShell/operator-runtime baseline after `0.17.3`. The release also closes the notify, Stop-hook, tmux, HUD, Windows MCP, and release-smoke blockers found while preparing the train.
 
 ## Highlights
 
-- **Default Team launch works again** — Codex team workers no longer synthesize `mcp_servers.<omx>` tables that are absent from `CODEX_HOME/config.toml`, avoiding Codex's `invalid transport` startup failure.
-- **Worker MCP isolation is preserved where valid** — legacy configs that explicitly declare first-party OMX MCP servers still get those servers disabled for Codex Team workers by default.
-- **Release-train hardening included** — AGENTS contract overwrite protection and plugin/question metadata alignment from the `dev` compare range are included in this patch.
+- **Local generation has an OMX-owned API path** — `omx api` exposes the local gateway used by OMX generation flows, with explicit real-private backend guidance and safer default auth behavior.
+- **SparkShell is safer and more observable** — summaries can diagnose team panes and cache observations while preserving passthrough contracts and keeping raw secrets out of summary prompts.
+- **Runtime loops are less sticky** — stale Ralph, ralplan, autoresearch-goal, MCP transport, and tmux diagnostic states no longer trigger erroneous loops after Stop/completion.
+- **Process-storm regressions are blocked** — recursive notify wrappers, `previousNotify` self-reference, fallback watcher respawns, and worker tmux rc fan-out are fixed.
+- **Team/HUD/Windows reliability improved** — wrapped tmux drafts are not treated as sent input, HUD resize hooks survive reflow, provider env vars reach direct tmux launches, and Windows MCP siblings avoid duplicate watchdog collisions.
 
 ## Fixes / compatibility
 
-- `OMX_TEAM_WORKER_MCP_COMPAT=1|true|on|compat` remains the explicit compatibility opt-in that suppresses worker MCP disable overrides.
-- CLI-first/plugin Codex configs without first-party OMX MCP tables now reach Team worker readiness normally.
-- Team readiness was not loosened; failed workers still fail instead of being reported as started.
+- `omx api --help` and `omx sparkshell --help` are now covered by release smoke tests.
+- Real-private API mode remains experimental and explicitly opt-in; unauthenticated accidental startup is prevented by default token generation.
+- Team readiness semantics are preserved; the release removes false draft trust and runaway launch/fan-out behavior rather than weakening failure detection.
+- Lifecycle notification grouping remains tracked separately in #2353.
+
+## Merged PR inventory
+
+#2295, #2332, #2334, #2335, #2338, #2339, #2341, #2342, #2344, #2345, #2347, #2349, #2351, #2357, #2359, #2360, #2361, #2365, #2367, #2372, #2374, #2375, #2376.
 
 ## Validation
 
 - `npm run build`
-- `node --test dist/team/__tests__/tmux-session.test.js`
+- `npm run lint`
 - `npm run check:no-unused`
-- Default live Team smoke with bounded startup timeouts
-- Compatibility live Team smoke with `OMX_TEAM_WORKER_MCP_COMPAT=1`
+- Targeted compiled Node tests for version sync and the `omx api` CLI bridge
+- `npm run verify:native-agents`
+- `npm run verify:plugin-bundle`
+- `npm run build:full`
+- `npm run smoke:packed-install`
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test -p omx-api -p omx-sparkshell -p omx-explore-harness`
+- `git diff --check`
 
 ## Contributors
 
-Thanks to everyone who tested the Team runtime after the `0.17.1` worker MCP isolation change and narrowed the regression to the default Codex worker launch path.
+Thanks to everyone who reported and narrowed the post-`0.17.3` runtime issues, especially the notify dispatcher recursion/fork-bomb reports, tmux fan-out/OOM repro, provider-env launch report, and compaction/reconciliation drift reports.
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.17.2...v0.17.3
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.17.3...v0.18.0

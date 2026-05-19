@@ -28,6 +28,7 @@ import { OMX_TMUX_HUD_OWNER_ENV } from "../../hud/reconcile.js";
 import { readAllState } from "../../hud/state.js";
 import { getLegacyWikiDir, serializePage, writePage } from "../../wiki/storage.js";
 import { WIKI_SCHEMA_VERSION } from "../../wiki/types.js";
+import { createUltragoalPlan, readUltragoalPlan } from "../../ultragoal/artifacts.js";
 
 function nativeHookScriptPath(): string {
   return join(process.cwd(), "dist", "scripts", "codex-native-hook.js");
@@ -1581,7 +1582,7 @@ describe("codex native hook dispatch", () => {
       await writeJson(join(cwd, ".omx", "ultragoal", "goals.json"), {
         version: 1,
         codexGoalMode: "aggregate",
-        codexObjective: "Complete all ultragoal stories in .omx/ultragoal/goals.json: many micro goals",
+        codexObjective: "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
         activeGoalId: "G001-micro",
         aggregateCompletion: {
           status: "complete",
@@ -1699,6 +1700,71 @@ describe("codex native hook dispatch", () => {
 
       assert.equal(result.outputJson?.decision, "block");
       assert.match(JSON.stringify(result.outputJson), /omx autoresearch-goal complete --slug verdict-pass-mission/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not repeat Stop block when the last autoresearch-goal completion attempt reported objective mismatch", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autoresearch-mismatch-reported-stop-"));
+    try {
+      await writeJson(join(cwd, ".omx", "goals", "autoresearch", "mismatched-mission", "mission.json"), {
+        version: 1,
+        workflow: "autoresearch-goal",
+        slug: "mismatched-mission",
+        topic: "Passing research bound to another Codex goal",
+        status: "passed",
+      });
+      await writeJson(join(cwd, ".omx", "goals", "autoresearch", "mismatched-mission", "completion.json"), {
+        verdict: "pass",
+        passed: true,
+      });
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "sess-autoresearch-mismatch-reported-stop",
+        thread_id: "thread-autoresearch-mismatch-reported-stop",
+        last_assistant_message: [
+          "I called get_goal and ran omx autoresearch-goal complete --slug mismatched-mission --codex-goal-json /tmp/snapshot.json.",
+          "The autoresearch-goal completion failed with Codex goal objective mismatch, so I will not repeat the same complete command blindly in this thread.",
+        ].join("\n"),
+      }, { cwd });
+
+      assert.notEqual(result.outputJson?.decision, "block");
+      assert.doesNotMatch(JSON.stringify(result.outputJson), /autoresearch-goal complete --slug mismatched-mission/);
+      assert.doesNotMatch(JSON.stringify(result.outputJson), /get_goal snapshot reconciliation/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still blocks later autoresearch-goal completion claims after an objective mismatch if no mismatch is reported in the final answer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autoresearch-mismatch-later-retry-stop-"));
+    try {
+      await writeJson(join(cwd, ".omx", "goals", "autoresearch", "retryable-mission", "mission.json"), {
+        version: 1,
+        workflow: "autoresearch-goal",
+        slug: "retryable-mission",
+        topic: "Passing research that can still retry with the correct snapshot",
+        status: "passed",
+      });
+      await writeJson(join(cwd, ".omx", "goals", "autoresearch", "retryable-mission", "completion.json"), {
+        verdict: "pass",
+        passed: true,
+      });
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "sess-autoresearch-mismatch-later-retry-stop",
+        thread_id: "thread-autoresearch-mismatch-later-retry-stop",
+        last_assistant_message: "Autoresearch goal complete; next call update_goal({status: \"complete\"}).",
+      }, { cwd });
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /get_goal snapshot reconciliation/);
+      assert.match(JSON.stringify(result.outputJson), /omx autoresearch-goal complete --slug retryable-mission/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1826,6 +1892,182 @@ describe("codex native hook dispatch", () => {
       assert.match(message, /create_goal/);
       assert.match(message, /update_goal/);
       assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "sess-ultragoal-1", "ultragoal-state.json")), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("applies only explicit structured UserPromptSubmit ultragoal steering directives", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-steer-"));
+    try {
+      await createUltragoalPlan(cwd, {
+        brief: "G002-cli-and-prompt-submit-bridge .omx/ultragoal hook steering fixture",
+        goals: [{ title: "First", objective: "Complete first milestone with tests." }],
+      });
+
+      const prose = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-ultragoal-steer-1",
+          prompt: "Please add a subgoal for docs later; this is normal prose, not a directive.",
+        },
+        { cwd },
+      );
+      assert.equal(prose.outputJson, null);
+      assert.equal((await readUltragoalPlan(cwd)).goals.length, 1);
+
+      const jsonExample = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-ultragoal-steer-1",
+          prompt: `Here is an inert example:\n\`\`\`json\n${JSON.stringify({
+            kind: "add_subgoal",
+            source: "user_prompt_submit",
+            evidence: "Example JSON should not mutate .omx/ultragoal.",
+            rationale: "Only explicit steering fences or labels are executable.",
+            title: "Inert JSON example",
+            objective: "This example must not be added.",
+          })}\n\`\`\``,
+        },
+        { cwd },
+      );
+      assert.equal(jsonExample.outputJson, null);
+      assert.equal((await readUltragoalPlan(cwd)).goals.length, 1);
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-ultragoal-steer-1",
+          prompt: `OMX_ULTRAGOAL_STEER: ${JSON.stringify({
+            kind: "add_subgoal",
+            source: "user_prompt_submit",
+            evidence: "Prompt-submit supplied a structured .omx/ultragoal directive for G002-cli-and-prompt-submit-bridge.",
+            rationale: "Add bounded hook regression work while preserving all completion gates.",
+            title: "Prompt bridge regression",
+            objective: "Verify UserPromptSubmit bounded steering bridge with tests.",
+          })}`,
+        },
+        { cwd },
+      );
+
+      const message = String(
+        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext || "",
+      );
+      assert.match(message, /bounded \.omx\/ultragoal steering/);
+      assert.match(message, /G002-cli-and-prompt-submit-bridge/);
+      assert.match(message, /accepted/);
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 2);
+      assert.equal(plan.goals[1]?.title, "Prompt bridge regression");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not apply UserPromptSubmit ultragoal steering from native subagent prompts", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-steer-subagent-"));
+    try {
+      await createUltragoalPlan(cwd, {
+        brief: "G002-cli-and-prompt-submit-bridge .omx/ultragoal subagent steering fixture",
+        goals: [{ title: "First", objective: "Complete first milestone with tests." }],
+      });
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "sess-ultragoal-parent";
+      const leaderNativeSessionId = "native-ultragoal-parent";
+      const childNativeSessionId = "native-ultragoal-child";
+      const nowIso = new Date().toISOString();
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: canonicalSessionId,
+        native_session_id: leaderNativeSessionId,
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [canonicalSessionId]: {
+            session_id: canonicalSessionId,
+            leader_thread_id: leaderNativeSessionId,
+            updated_at: nowIso,
+            threads: {
+              [leaderNativeSessionId]: {
+                thread_id: leaderNativeSessionId,
+                kind: "leader",
+                first_seen_at: nowIso,
+                last_seen_at: nowIso,
+                turn_count: 1,
+              },
+              [childNativeSessionId]: {
+                thread_id: childNativeSessionId,
+                kind: "subagent",
+                first_seen_at: nowIso,
+                last_seen_at: nowIso,
+                turn_count: 1,
+                mode: "architect",
+              },
+            },
+          },
+        },
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: childNativeSessionId,
+          thread_id: childNativeSessionId,
+          turn_id: "turn-ultragoal-child-1",
+          prompt: `OMX_ULTRAGOAL_STEER: ${JSON.stringify({
+            kind: "add_subgoal",
+            source: "user_prompt_submit",
+            evidence: "Subagent prompt text must be literal delegated context.",
+            rationale: "Subagent prompts should not mutate the parent .omx/ultragoal ledger.",
+            title: "Subagent should not add this",
+            objective: "This must remain literal prompt text.",
+          })}`,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 1);
+      const ledger = await readFile(join(cwd, ".omx/ultragoal/ledger.jsonl"), "utf-8");
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 0);
+      assert.equal((ledger.match(/"event":"steering_rejected"/g) ?? []).length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("dedupes repeated UserPromptSubmit ultragoal steering directives by prompt signature", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-steer-dedupe-"));
+    try {
+      await createUltragoalPlan(cwd, {
+        brief: "G002-cli-and-prompt-submit-bridge .omx/ultragoal dedupe fixture",
+        goals: [{ title: "First", objective: "Complete first milestone with tests." }],
+      });
+      const prompt = `\`\`\`omx-ultragoal-steer
+${JSON.stringify({
+        kind: "add_subgoal",
+        source: "user_prompt_submit",
+        evidence: "Structured prompt-submit directive adds exactly one deduped goal.",
+        rationale: "Use idempotent bridge semantics for repeated hook delivery.",
+        title: "Deduped bridge regression",
+        objective: "Verify repeated UserPromptSubmit steering does not duplicate goals.",
+      })}
+\`\`\``;
+      await dispatchCodexNativeHook({ hook_event_name: "UserPromptSubmit", cwd, session_id: "sess-dedupe", prompt }, { cwd });
+      const second = await dispatchCodexNativeHook({ hook_event_name: "UserPromptSubmit", cwd, session_id: "sess-dedupe", prompt }, { cwd });
+      const message = String(
+        (second.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext || "",
+      );
+      assert.match(message, /deduped/);
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.filter((goal) => goal.title === "Deduped bridge regression").length, 1);
+      const ledger = await readFile(join(cwd, ".omx/ultragoal/ledger.jsonl"), "utf-8");
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -515,6 +515,7 @@ jobs:
           path: dist
       - run: npm run build:explore:release
       - run: npm run build:sparkshell
+      - run: npm run build:api
 
   ci-status:
     name: CI Status

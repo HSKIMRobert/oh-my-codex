@@ -23,10 +23,14 @@ const OMX_SPARKSHELL_INSTRUCTIONS_FILE_ENV = 'OMX_SPARKSHELL_MODEL_INSTRUCTIONS_
 
 export const SPARKSHELL_USAGE = [
   'Usage: omx sparkshell <command> [args...]',
+  '   or: omx sparkshell [--json] [--budget <chars>] <command> [args...]',
+  '   or: omx sparkshell --shell \'<shell command>\'',
   '   or: omx sparkshell --tmux-pane <pane-id> [--tail-lines <100-1000>]',
-  'Runs the native omx-sparkshell sidecar with direct argv execution or explicit tmux pane summarization.',
-  'Shell metacharacters such as pipes and redirects are not interpreted in v1.',
+  'Runs the native omx-sparkshell sidecar with direct argv execution, explicit shell execution, or explicit tmux pane summarization.',
+  'Shell metacharacters are interpreted only with explicit --shell opt-in.',
   'Tmux pane mode is explicit opt-in and captures a larger pane tail before applying raw-vs-summary behavior.',
+  'Environment: OMX_SPARKSHELL_BIN overrides the native binary; OMX_SPARKSHELL_MODEL selects the summary model; OMX_SPARKSHELL_FALLBACK_MODEL selects the retry model.',
+  'Environment: OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE overrides packaged summary instructions; OMX_SPARKSHELL_SUMMARY_TIMEOUT_MS controls local API summary timeout.',
 ].join('\n');
 
 export interface ResolveSparkShellBinaryPathOptions {
@@ -235,7 +239,19 @@ export function parseSparkShellFallbackInvocation(args: readonly string[]): Spar
     throw new Error(`Missing command to run.\n${SPARKSHELL_USAGE}`);
   }
 
-  if (args[0] !== '--tmux-pane' && !args[0]?.startsWith('--tmux-pane=')) {
+  if (args[0] === '--shell') {
+    const script = args[1];
+    if (!script) throw new Error(`--shell requires a command string.\n${SPARKSHELL_USAGE}`);
+    return { kind: 'command', argv: ['sh', '-lc', script] };
+  }
+  if (args[0]?.startsWith('--shell=')) {
+    const script = args[0].slice('--shell='.length);
+    if (!script.trim()) throw new Error(`--shell requires a command string.\n${SPARKSHELL_USAGE}`);
+    return { kind: 'command', argv: ['sh', '-lc', script] };
+  }
+
+  const paneStart = args.findIndex((arg) => arg === '--tmux-pane' || arg.startsWith('--tmux-pane='));
+  if (paneStart < 0) {
     return { kind: 'command', argv: [...args] };
   }
 

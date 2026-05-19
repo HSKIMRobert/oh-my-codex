@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -8,11 +8,19 @@ import {
   buildCodexGoalInstruction,
   checkpointUltragoal,
   createUltragoalPlan,
+  isFinalRunCompletionCandidate,
   isUltragoalDone,
   readUltragoalPlan,
   recordFinalReviewBlockers,
+  steerUltragoal,
   startNextUltragoal,
+  summarizeUltragoalPlan,
+  ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE,
+  validateUltragoalSteeringProposal,
+  type UltragoalPlan,
+  type UltragoalSteeringProposal,
 } from '../artifacts.js';
+import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
 
 async function withTempRepo<T>(run: (cwd: string) => Promise<T>): Promise<T> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-ultragoal-'));
@@ -31,6 +39,63 @@ function cleanQualityGate(): object {
   };
 }
 
+async function writeFixturePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
+  await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
+  await writeFile(join(cwd, '.omx/ultragoal/brief.md'), 'G001-core-steering-model fixture for .omx/ultragoal steering behavior.\n');
+  await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify(plan, null, 2)}\n`);
+  await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), '');
+}
+
+function asChildGoals(after: unknown): Array<{ title: string; objective: string }> | undefined {
+  if (!Array.isArray(after)) return undefined;
+  return after.map((item) => {
+    assert.equal(typeof item, 'object');
+    assert.notEqual(item, null);
+    const candidate = item as { title?: unknown; objective?: unknown };
+    assert.equal(typeof candidate.title, 'string');
+    assert.equal(typeof candidate.objective, 'string');
+    return { title: String(candidate.title), objective: String(candidate.objective) };
+  });
+}
+
+function toSteeringProposal(proposal: SteeringFixtureProposal): UltragoalSteeringProposal {
+  const common = {
+    kind: proposal.kind,
+    source: proposal.source,
+    targetGoalIds: proposal.targetGoalIds,
+    evidence: proposal.evidence,
+    rationale: proposal.rationale,
+    idempotencyKey: proposal.idempotencyKey,
+  };
+  switch (proposal.kind) {
+    case 'add_subgoal':
+      return { ...common, title: proposal.title, objective: proposal.objective };
+    case 'split_subgoal':
+      return { ...common, childGoals: asChildGoals(proposal.after) };
+    case 'reorder_pending':
+      assert.ok(Array.isArray(proposal.after));
+      return { ...common, pendingOrder: proposal.after as string[] };
+    case 'revise_pending_wording':
+      return {
+        ...common,
+        objective: proposal.objective,
+        directiveText: proposal.forbidden ? 'attempt to skip verification, weaken quality gates, and auto-complete protected aggregate state' : undefined,
+        revisedTitle: proposal.title,
+        revisedObjective: proposal.objective,
+      };
+    case 'annotate_ledger':
+      return common;
+    case 'mark_blocked_superseded': {
+      const childGoals = asChildGoals(proposal.after);
+      return {
+        ...common,
+        childGoals,
+        blockedReason: childGoals ? undefined : 'Evidence-backed blocker has no safe replacement yet.',
+      };
+    }
+  }
+}
+
 describe('ultragoal artifacts', () => {
   it('creates brief, goals, and ledger artifacts from a brief', async () => {
     await withTempRepo(async (cwd) => {
@@ -41,8 +106,8 @@ describe('ultragoal artifacts', () => {
 
       assert.equal(plan.goals.length, 3);
       assert.equal(plan.codexGoalMode, 'aggregate');
-      assert.match(plan.codexObjective ?? '', /Complete all ultragoal stories/);
-      assert.match(plan.codexObjective ?? '', /G001-build-the-cli/);
+      assert.equal(plan.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
+      assert.doesNotMatch(plan.codexObjective ?? '', /G001-build-the-cli/);
       assert.equal(plan.goals[0]?.id, 'G001-build-the-cli');
       assert.equal(plan.goals[0]?.status, 'pending');
       assert.equal(await readFile(join(cwd, '.omx/ultragoal/brief.md'), 'utf-8'), '- Build the CLI\n- Add tests\n- Write docs\n');
@@ -79,7 +144,9 @@ describe('ultragoal artifacts', () => {
       assert.match(instruction, /do not call update_goal yet/i);
       assert.doesNotMatch(instruction, /fresh Codex thread/i);
       assert.match(instruction, /--codex-goal-json/);
-      assert.match(instruction, /Complete all ultragoal stories/);
+      assert.match(instruction, /Complete the durable ultragoal plan/);
+      assert.match(instruction, /including later accepted\/appended stories/);
+      assert.match(instruction, /\.omx\/ultragoal\/ledger\.jsonl/);
       assert.match(instruction, /Complete first milestone/);
       assert.doesNotMatch(instruction, /\/goal\b/);
       assert.doesNotMatch(instruction, /\.\.\/\.\.\/codex/);
@@ -344,6 +411,7 @@ describe('ultragoal artifacts', () => {
         goals: [{ title: 'First', objective: 'Complete first milestone.' }],
       });
       const objective = plan.codexObjective;
+      assert.equal(objective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
       const added = await addUltragoalGoal(cwd, {
         title: 'Resolve final code-review blockers',
         objective: 'Fix review blockers and rerun final gates.',
@@ -353,9 +421,133 @@ describe('ultragoal artifacts', () => {
       assert.equal(added.goal.id, 'G002-resolve-final-code-review-blockers');
       assert.equal(added.goal.status, 'pending');
       assert.equal(added.plan.codexObjective, objective);
+      assert.doesNotMatch(added.plan.codexObjective ?? '', /G002-resolve-final-code-review-blockers/);
 
       const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
       assert.match(ledger, /"event":"goal_added"/);
+    });
+  });
+
+  it('migrates legacy enumerated aggregate objectives to the pointer contract', async () => {
+    await withTempRepo(async (cwd) => {
+      await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
+      const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first First; G002-second Second';
+      await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify({
+        version: 1,
+        createdAt: '2026-05-04T10:00:00.000Z',
+        updatedAt: '2026-05-04T10:00:00.000Z',
+        briefPath: '.omx/ultragoal/brief.md',
+        goalsPath: '.omx/ultragoal/goals.json',
+        ledgerPath: '.omx/ultragoal/ledger.jsonl',
+        codexGoalMode: 'aggregate',
+        codexObjective: legacyObjective,
+        goals: [
+          { id: 'G001-first', title: 'First', objective: 'Complete first.', status: 'pending', attempt: 0, createdAt: '2026-05-04T10:00:00.000Z', updatedAt: '2026-05-04T10:00:00.000Z' },
+          { id: 'G002-second', title: 'Second', objective: 'Complete second.', status: 'pending', attempt: 0, createdAt: '2026-05-04T10:00:00.000Z', updatedAt: '2026-05-04T10:00:00.000Z' },
+        ],
+      }, null, 2)}\n`);
+      await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), '');
+
+      const plan = await readUltragoalPlan(cwd);
+
+      assert.equal(plan.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
+      assert.deepEqual(plan.codexObjectiveAliases, [legacyObjective]);
+      assert.doesNotMatch(plan.codexObjective ?? '', /G001-first/);
+      const persisted = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as UltragoalPlan;
+      assert.equal(persisted.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
+      assert.deepEqual(persisted.codexObjectiveAliases, [legacyObjective]);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"aggregate_objective_migrated"/);
+      assert.match(ledger, /legacy enumerated aggregate Codex objective/);
+    });
+  });
+
+  it('accepts migrated legacy aggregate objective aliases for active Codex snapshots', async () => {
+    await withTempRepo(async (cwd) => {
+      const legacyObjective = 'Complete all ultragoal stories in .omx/ultragoal/goals.json: G001-first First; G002-second Second';
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first.' },
+          { title: 'Second', objective: 'Complete second.' },
+        ],
+      });
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+      const legacyPlan = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      legacyPlan.codexObjective = legacyObjective;
+      await writeFile(planPath, `${JSON.stringify(legacyPlan, null, 2)}\n`);
+
+      const first = await startNextUltragoal(cwd);
+      const checkpointed = await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id,
+        status: 'complete',
+        evidence: 'legacy active Codex objective alias still represents the migrated aggregate run.',
+        codexGoal: { goal: { objective: legacyObjective, status: 'active' } },
+      });
+
+      assert.equal(checkpointed.goals[0]?.status, 'complete');
+      assert.equal(checkpointed.codexObjective, ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE);
+      assert.deepEqual(checkpointed.codexObjectiveAliases, [legacyObjective]);
+    });
+  });
+
+  it('applies steering idempotently and keeps split replacements schedulable', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'Core steering model', objective: 'Implement bounded dynamic steering.' },
+          { title: 'CLI bridge', objective: 'Expose structured steering through the CLI.' },
+          { title: 'Hook bridge', objective: 'Bridge explicit steering directives.' },
+        ],
+      });
+
+      const firstSteer = await steerUltragoal(cwd, {
+        kind: 'split_subgoal',
+        source: 'finding',
+        targetGoalIds: ['G001-core-steering-model'],
+        childGoals: [
+          { title: 'Core steering schema', objective: 'Add steering proposal and audit schema.' },
+          { title: 'Core steering scheduler semantics', objective: 'Make superseded and blocked metadata affect scheduling and completion.' },
+        ],
+        evidence: 'Implementation findings show schema and scheduler invariants should be isolated.',
+        rationale: 'Splitting reduces coupling without deleting or weakening the original goal.',
+        idempotencyKey: 'steering-idempotency-check',
+      });
+
+      assert.equal(firstSteer.accepted, true);
+      assert.equal(firstSteer.deduped, false);
+      assert.equal(firstSteer.plan.goals.find((goal) => goal.id === 'G001-core-steering-model')?.steeringStatus, 'superseded');
+      assert.equal(firstSteer.plan.goals.find((goal) => goal.id === 'G004-core-steering-schema')?.supersedes?.[0], 'G001-core-steering-model');
+      assert.equal(firstSteer.plan.goals.find((goal) => goal.id === 'G005-core-steering-scheduler-semantics')?.supersedes?.[0], 'G001-core-steering-model');
+      assert.equal(firstSteer.plan.goals.filter((goal) => goal.steeringStatus === 'superseded').length, 1);
+      assert.equal(isUltragoalDone(firstSteer.plan), false);
+
+      const started = await startNextUltragoal(cwd);
+      assert.equal(started.goal?.id, 'G004-core-steering-schema');
+      assert.equal(started.goal?.status, 'in_progress');
+      assert.equal(started.resumed, false);
+
+      const secondSteer = await steerUltragoal(cwd, {
+        kind: 'split_subgoal',
+        source: 'finding',
+        targetGoalIds: ['G001-core-steering-model'],
+        childGoals: [
+          { title: 'Core steering schema', objective: 'Add steering proposal and audit schema.' },
+          { title: 'Core steering scheduler semantics', objective: 'Make superseded and blocked metadata affect scheduling and completion.' },
+        ],
+        evidence: 'Implementation findings show schema and scheduler invariants should be isolated.',
+        rationale: 'Splitting reduces coupling without deleting or weakening the original goal.',
+        idempotencyKey: 'steering-idempotency-check',
+      });
+
+      assert.equal(secondSteer.accepted, true);
+      assert.equal(secondSteer.deduped, true);
+      assert.equal(secondSteer.plan.goals.filter((goal) => goal.id === 'G004-core-steering-schema').length, 1);
+      assert.equal(secondSteer.plan.goals.filter((goal) => goal.id === 'G005-core-steering-scheduler-semantics').length, 1);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 1);
     });
   });
 
@@ -505,6 +697,447 @@ describe('ultragoal artifacts', () => {
     });
   });
 
+  it('accepts core steering mutations and writes structured audit entries', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone with tests.' },
+          { title: 'Second', objective: 'Complete second milestone with tests.' },
+        ],
+      });
+
+      const added = await steerUltragoal(cwd, {
+        kind: 'add_subgoal',
+        source: 'cli',
+        evidence: 'Code review found missing migration coverage.',
+        rationale: 'Add a bounded follow-up without weakening the aggregate objective.',
+        title: 'Add migration regression test',
+        objective: 'Add migration regression coverage and keep all existing quality gates.',
+        idempotencyKey: 'add-migration-test',
+      }, { now: new Date('2026-05-04T10:10:00Z') });
+      assert.equal(added.accepted, true);
+      assert.equal(added.plan.goals.at(-1)?.id, 'G003-add-migration-regression-test');
+      assert.equal((added.audit.before as UltragoalPlan).goals.length, 2);
+      assert.equal((added.audit.after as { id?: string }).id, 'G003-add-migration-regression-test');
+
+      const split = await steerUltragoal(cwd, {
+        kind: 'split_subgoal',
+        source: 'finding',
+        targetGoalIds: ['G002-second'],
+        evidence: 'Implementation evidence shows the second milestone has two independent safety checks.',
+        rationale: 'Split the pending work into narrower goals while preserving verification burden.',
+        childGoals: [
+          { title: 'Second parser coverage', objective: 'Complete parser coverage for the second milestone with tests.' },
+          { title: 'Second CLI coverage', objective: 'Complete CLI coverage for the second milestone with tests.' },
+        ],
+      }, { now: new Date('2026-05-04T10:11:00Z') });
+      assert.equal(split.accepted, true);
+      const superseded = split.plan.goals.find((goal) => goal.id === 'G002-second');
+      assert.equal(superseded?.steeringStatus, 'superseded');
+      assert.deepEqual(superseded?.supersededBy, ['G004-second-parser-coverage', 'G005-second-cli-coverage']);
+      assert.equal(split.plan.goals.find((goal) => goal.id === 'G004-second-parser-coverage')?.supersedes?.[0], 'G002-second');
+
+      const revised = await steerUltragoal(cwd, {
+        kind: 'revise_pending_wording',
+        source: 'user_prompt_submit',
+        targetGoalIds: ['G003-add-migration-regression-test'],
+        evidence: 'Prompt-submit clarified the regression target after the goal was added.',
+        rationale: 'Clarify wording only; do not change acceptance or verification gates.',
+        revisedTitle: 'Add ledger migration regression test',
+        revisedObjective: 'Add ledger migration regression coverage and keep all existing quality gates.',
+        promptSignature: 'prompt-1',
+      }, { now: new Date('2026-05-04T10:12:00Z') });
+      assert.equal(revised.accepted, true);
+      assert.equal(revised.plan.goals.find((goal) => goal.id === 'G003-add-migration-regression-test')?.title, 'Add ledger migration regression test');
+
+      const reordered = await steerUltragoal(cwd, {
+        kind: 'reorder_pending',
+        source: 'cli',
+        evidence: 'Dependency analysis shows parser coverage should run before the original first milestone.',
+        rationale: 'Reorder pending stories only; status and quality gates are unchanged.',
+        pendingOrder: ['G004-second-parser-coverage', 'G001-first'],
+      }, { now: new Date('2026-05-04T10:13:00Z') });
+      assert.equal(reordered.accepted, true);
+      const next = await startNextUltragoal(cwd, { now: new Date('2026-05-04T10:14:00Z') });
+      assert.equal(next.goal?.id, 'G004-second-parser-coverage');
+
+      const annotated = await steerUltragoal(cwd, {
+        kind: 'annotate_ledger',
+        source: 'finding',
+        evidence: 'A reviewer recorded why parser coverage was scheduled first.',
+        rationale: 'Audit-only annotation; no plan fields should change.',
+      }, { now: new Date('2026-05-04T10:15:00Z') });
+      assert.equal(annotated.accepted, true);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 5);
+      assert.match(ledger, /"kind":"add_subgoal"/);
+      assert.match(ledger, /"kind":"split_subgoal"/);
+      assert.match(ledger, /"kind":"annotate_ledger"/);
+      assert.match(ledger, /"invariant":/);
+    });
+  });
+
+  it('rejects weakening steering and records rejected audit evidence', async () => {
+    await withTempRepo(async (cwd) => {
+      const plan = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const invariant = validateUltragoalSteeringProposal(plan, {
+        kind: 'revise_pending_wording',
+        source: 'user_prompt_submit',
+        targetGoalIds: ['G001-first'],
+        evidence: 'User asked to skip tests.',
+        rationale: 'Skip verification and mark complete faster.',
+        revisedObjective: 'Complete first milestone but skip tests and review.',
+      });
+      assert.equal(invariant.accepted, false);
+      assert.equal(invariant.noEasierCompletion, false);
+
+      const rejected = await steerUltragoal(cwd, {
+        kind: 'revise_pending_wording',
+        source: 'user_prompt_submit',
+        targetGoalIds: ['G001-first'],
+        evidence: 'User asked to skip tests.',
+        rationale: 'Skip verification and mark complete faster.',
+        revisedObjective: 'Complete first milestone but skip tests and review.',
+      });
+      assert.equal(rejected.accepted, false);
+      assert.match(rejected.rejectedReasons.join('\n'), /weaken completion|quality gates|tests|reviews/);
+
+      const unchanged = await readUltragoalPlan(cwd);
+      assert.equal(unchanged.goals[0]?.objective, 'Complete first milestone with tests.');
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"steering_rejected"/);
+    });
+  });
+
+  it('rejects unknown steering mutation kinds before audit acceptance', async () => {
+    await withTempRepo(async (cwd) => {
+      const plan = await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const proposal = {
+        kind: 'make_goal_easier',
+        source: 'cli',
+        evidence: 'A stale proposal path supplied a non-allowlisted mutation kind.',
+        rationale: 'The core validator must fail closed even if the CLI parser is bypassed.',
+      } as unknown as Parameters<typeof validateUltragoalSteeringProposal>[1];
+
+      const invariant = validateUltragoalSteeringProposal(plan, proposal);
+      assert.equal(invariant.accepted, false);
+      assert.match(invariant.rejectedReasons.join('\n'), /Invalid steering mutation kind/);
+
+      const rejected = await steerUltragoal(cwd, proposal);
+      assert.equal(rejected.accepted, false);
+      assert.match(rejected.rejectedReasons.join('\n'), /Invalid steering mutation kind/);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"steering_rejected"/);
+      assert.doesNotMatch(ledger, /"event":"steering_accepted"/);
+    });
+  });
+
+  it('dedupes steering by ledger idempotency key without duplicating child goals', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+      const proposal = {
+        kind: 'add_subgoal' as const,
+        source: 'user_prompt_submit' as const,
+        evidence: 'Prompt-submit requested a bounded regression goal.',
+        rationale: 'Add scoped regression work while preserving the end goal.',
+        title: 'Add regression',
+        objective: 'Add regression coverage with the same verification gates.',
+        idempotencyKey: 'same-prompt-signature',
+      };
+
+      const first = await steerUltragoal(cwd, proposal);
+      const firstPlan = await readUltragoalPlan(cwd);
+      const second = await steerUltragoal(cwd, proposal);
+      const secondPlan = await readUltragoalPlan(cwd);
+      assert.equal(first.accepted, true);
+      assert.equal(first.deduped, false);
+      assert.equal(second.accepted, true);
+      assert.equal(second.deduped, true);
+      assert.equal(second.plan.goals.filter((goal) => goal.title === 'Add regression').length, 1);
+      assert.deepEqual(secondPlan, firstPlan);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 1);
+      assert.equal((ledger.match(/"event":"steering_rejected"/g) ?? []).length, 0);
+      assert.equal((ledger.match(/same-prompt-signature/g) ?? []).length, 1);
+    });
+  });
+
+  it('skips superseded and blocked goals for scheduling while blocked goals prevent completion', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone with tests.' },
+          { title: 'Second', objective: 'Complete second milestone with tests.' },
+          { title: 'Third', objective: 'Complete third milestone with tests.' },
+        ],
+      });
+      await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G001-first'],
+        evidence: 'External API access is unavailable.',
+        rationale: 'Block unschedulable work without claiming completion.',
+        blockedReason: 'Waiting on external API access.',
+      });
+      await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G002-second'],
+        evidence: 'Second milestone is better represented as replacement child work.',
+        rationale: 'Supersede with a replacement goal that preserves the acceptance criteria.',
+        childGoals: [{ title: 'Replacement second', objective: 'Complete replacement second milestone with tests.' }],
+      });
+
+      const next = await startNextUltragoal(cwd);
+      assert.equal(next.goal?.id, 'G004-replacement-second');
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(isUltragoalDone(plan), false);
+      const summary = summarizeUltragoalPlan(plan);
+      assert.equal(summary.steeringBlocked, 1);
+      assert.equal(summary.superseded, 1);
+    });
+  });
+
+  it('clears the active goal when mark_blocked_superseded supersedes the running goal', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone with tests.' },
+          { title: 'Second', objective: 'Complete second milestone with tests.' },
+        ],
+      });
+
+      const started = await startNextUltragoal(cwd);
+      assert.equal(started.goal?.id, 'G001-first');
+
+      const result = await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G001-first'],
+        evidence: 'The active goal should be split into narrower replacement work.',
+        rationale: 'Supersede the active goal and keep the audit trail durable.',
+        childGoals: [
+          { title: 'Replacement first part A', objective: 'Complete replacement first part A with tests.' },
+          { title: 'Replacement first part B', objective: 'Complete replacement first part B with tests.' },
+        ],
+      });
+
+      assert.equal(result.accepted, true);
+      assert.equal(result.plan.activeGoalId, undefined);
+      assert.equal(result.plan.goals.find((goal) => goal.id === 'G001-first')?.steeringStatus, 'superseded');
+      assert.deepEqual(
+        result.plan.goals.filter((goal) => goal.supersedes?.includes('G001-first')).map((goal) => goal.status),
+        ['pending', 'pending'],
+      );
+      const summary = summarizeUltragoalPlan(result.plan);
+      assert.equal(summary.superseded, 1);
+      assert.equal(summary.steeringBlocked, 0);
+      assert.equal(isUltragoalDone(result.plan), false);
+    });
+  });
+
+  it('rejects malformed steering invariants and records a single rejection audit', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone with tests.' },
+          { title: 'Second', objective: 'Complete second milestone with tests.' },
+        ],
+      });
+
+      const plan = await readUltragoalPlan(cwd);
+      const invariant = validateUltragoalSteeringProposal(plan, {
+        kind: 'reorder_pending',
+        source: 'user_prompt_submit',
+        evidence: 'Order request from prompt submit.',
+        rationale: 'Exercise duplicate pending-order validation.',
+        pendingOrder: ['G001-first', 'G001-first'],
+      });
+      assert.equal(invariant.accepted, false);
+      assert.equal(invariant.structuralInvariantAccepted, false);
+      assert.match(invariant.rejectedReasons.join(' | '), /duplicate goal id/);
+
+      const rejected = await steerUltragoal(cwd, {
+        kind: 'reorder_pending',
+        source: 'user_prompt_submit',
+        evidence: 'Order request from prompt submit.',
+        rationale: 'Exercise duplicate pending-order validation.',
+        pendingOrder: ['G001-first', 'G001-first'],
+      });
+
+      assert.equal(rejected.accepted, false);
+      assert.equal(rejected.deduped, false);
+      assert.match(rejected.rejectedReasons.join(' | '), /duplicate goal id/);
+      assert.deepEqual(await readUltragoalPlan(cwd), plan);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"steering_rejected"/g) ?? []).length, 1);
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 0);
+    });
+  });
+
+  it('rejects invalid steering source and malformed superseded replacement children with audit evidence', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'First', objective: 'Complete first milestone with tests.' }],
+      });
+
+      const invalidSource = await steerUltragoal(cwd, {
+        kind: 'annotate_ledger',
+        source: 'forged' as never,
+        evidence: 'Invalid source must not be accepted.',
+        rationale: 'Runtime validation should protect JSON callers.',
+      });
+      assert.equal(invalidSource.accepted, false);
+      assert.match(invalidSource.rejectedReasons.join(' | '), /Invalid steering source/);
+
+      const malformedReplacement = await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G001-first'],
+        evidence: 'Replacement child is malformed.',
+        rationale: 'Malformed children should be rejected and audited instead of throwing.',
+        childGoals: [{ title: '', objective: 'Replacement objective.' }],
+      });
+      assert.equal(malformedReplacement.accepted, false);
+      assert.match(malformedReplacement.rejectedReasons.join(' | '), /replacement children require title and objective/);
+
+      const nullReplacement = await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G001-first'],
+        evidence: 'Replacement child is null.',
+        rationale: 'Malformed JSON children should reject without throwing.',
+        childGoals: [null] as never,
+      });
+      assert.equal(nullReplacement.accepted, false);
+      assert.match(nullReplacement.rejectedReasons.join(' | '), /replacement children require title and objective/);
+
+      const weakenedSplitChild = await steerUltragoal(cwd, {
+        kind: 'split_subgoal',
+        source: 'finding',
+        targetGoalId: 'G001-first',
+        evidence: 'Split child attempted to weaken tests.',
+        rationale: 'Replacement objectives must preserve verification.',
+        childGoals: [
+          { title: 'Shortcut child', objective: 'Skip tests and remove verification for faster completion.' },
+        ],
+      });
+      assert.equal(weakenedSplitChild.accepted, false);
+      assert.match(weakenedSplitChild.rejectedReasons.join(' | '), /must not weaken completion/);
+      assert.equal(weakenedSplitChild.audit.invariant.noEasierCompletion, false);
+
+      const weakenedSupersedeChild = await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G001-first'],
+        evidence: 'Replacement child attempted to weaken review.',
+        rationale: 'Replacement objectives must preserve quality gates.',
+        childGoals: [
+          { title: 'Shortcut replacement', objective: 'Bypass review and omit quality gate evidence.' },
+        ],
+      });
+      assert.equal(weakenedSupersedeChild.accepted, false);
+      assert.match(weakenedSupersedeChild.rejectedReasons.join(' | '), /must not weaken completion/);
+      assert.equal(weakenedSupersedeChild.audit.invariant.noEasierCompletion, false);
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 1);
+      assert.equal(plan.goals[0]?.steeringStatus, undefined);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"steering_rejected"/g) ?? []).length, 5);
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 0);
+    });
+  });
+
+  it('replays the G001-core-steering-model fixture matrix against .omx/ultragoal steering behavior', async () => {
+    for (const fixture of steeringFixtures) {
+      await withTempRepo(async (cwd) => {
+        await writeFixturePlan(cwd, fixture.before as UltragoalPlan);
+
+        const result = await steerUltragoal(cwd, toSteeringProposal(fixture.proposal), {
+          now: new Date('2026-05-19T04:20:00.000Z'),
+        });
+
+        assert.equal(result.accepted, fixture.expected.accepted, fixture.case);
+        assert.equal(result.audit.kind, fixture.expected.mutationKind, fixture.case);
+        assert.equal(result.audit.evidence, fixture.proposal.evidence, fixture.case);
+        assert.equal(result.audit.rationale, fixture.proposal.rationale, fixture.case);
+        assert.equal(result.audit.before !== undefined, true, fixture.case);
+        assert.equal(isUltragoalDone(result.plan), fixture.expected.isDoneAfterMutation, fixture.case);
+
+        const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+        assert.match(ledger, new RegExp(`"event":"${fixture.expected.ledgerEvent}"`), fixture.case);
+        assert.match(ledger, new RegExp(`"kind":"${fixture.expected.mutationKind}"`), fixture.case);
+
+        if (!fixture.expected.accepted) {
+          assert.equal(result.deduped, false, fixture.case);
+          assert.equal(result.audit.invariant.noEasierCompletion, false, fixture.case);
+          assert.match(result.rejectedReasons.join(' | '), /weaken completion|quality gates|tests|reviews/i, fixture.case);
+          assert.ok(fixture.proposal.forbidden?.codexObjective, fixture.case);
+          assert.ok(fixture.proposal.forbidden?.aggregateCompletion, fixture.case);
+          assert.deepEqual(await readUltragoalPlan(cwd), JSON.parse(JSON.stringify(fixture.before)), fixture.case);
+          return;
+        }
+
+        const summary = summarizeUltragoalPlan(result.plan);
+        if (fixture.expected.summaryDelta?.superseded !== undefined) {
+          assert.equal(summary.superseded, fixture.expected.summaryDelta.superseded, fixture.case);
+        }
+        if (fixture.expected.summaryDelta?.steeringBlocked !== undefined) {
+          const beforeBlocked = fixture.before.goals.filter((goal) => goal.steeringStatus === 'blocked').length;
+          assert.equal(summary.steeringBlocked, beforeBlocked + fixture.expected.summaryDelta.steeringBlocked, fixture.case);
+        }
+
+        if (fixture.case === 'split') {
+          const parent = result.plan.goals.find((goal) => goal.id === 'G001-core-steering-model');
+          assert.equal(parent?.steeringStatus, 'superseded');
+          assert.deepEqual(parent?.supersededBy, ['G004-core-steering-schema', 'G005-core-steering-scheduler-semantics']);
+        }
+        if (fixture.case === 'blocked-with-replacement') {
+          const parent = result.plan.goals.find((goal) => goal.id === 'G001-core-steering-model');
+          assert.equal(parent?.steeringStatus, 'superseded');
+          assert.deepEqual(parent?.supersededBy, ['G004-core-steering-replacement']);
+        }
+        if (fixture.case === 'blocked-without-replacement') {
+          const parent = result.plan.goals.find((goal) => goal.id === 'G001-core-steering-model');
+          assert.equal(parent?.steeringStatus, 'blocked');
+          assert.equal(isUltragoalDone(result.plan), false);
+        }
+        if (fixture.case === 'revise') {
+          const revised = result.plan.goals.find((goal) => goal.id === 'G002-cli-bridge');
+          assert.equal(revised?.title, fixture.proposal.title);
+          assert.equal(revised?.objective, fixture.proposal.objective);
+          assert.equal(revised?.status, 'pending');
+        }
+        if (fixture.case === 'annotate') {
+          assert.deepEqual(result.plan.goals, fixture.before.goals, fixture.case);
+        }
+
+        const next = await startNextUltragoal(cwd, { now: new Date('2026-05-19T04:21:00.000Z') });
+        assert.equal(next.goal?.id, fixture.expected.scheduleStartsGoalId, fixture.case);
+        if (fixture.expected.finalCandidateForGoalId) {
+          assert.equal(next.goal?.id, fixture.expected.finalCandidateForGoalId, fixture.case);
+        }
+      });
+    }
+  });
+
   it('guides different completed legacy snapshots to blocked checkpoints and fresh threads', async () => {
     await withTempRepo(async (cwd) => {
       await createUltragoalPlan(cwd, {
@@ -565,4 +1198,158 @@ describe('ultragoal artifacts', () => {
       );
     });
   });
+
+  it('steers a split pending goal through superseded lifecycle without weakening completion gates', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'G001-core-steering-model .omx/ultragoal split lifecycle coverage',
+        codexGoalMode: 'per_story',
+        goals: [{ title: 'Original', objective: 'Implement the original broad steering objective.' }],
+      });
+
+      const split = await steerUltragoal(cwd, {
+        kind: 'split_subgoal',
+        source: 'finding',
+        targetGoalIds: ['G001-original'],
+        evidence: 'G001-core-steering-model review found .omx/ultragoal needs smaller replacement children.',
+        rationale: 'Split preserves the original objective while scheduling verifiable child goals.',
+        after: {
+          children: [
+            { title: 'Child A', objective: 'Implement child A steering support.' },
+            { title: 'Child B', objective: 'Implement child B steering support.' },
+          ],
+        },
+        idempotencyKey: 'split-g001-core-steering-model',
+        now: new Date('2026-05-19T04:20:00Z'),
+      });
+
+      assert.equal(split.accepted, true);
+      assert.equal(split.plan.goals[0]?.steeringStatus, 'superseded');
+      assert.deepEqual(split.plan.goals[0]?.supersededBy, ['G002-child-a', 'G003-child-b']);
+      assert.equal(split.plan.goals.some((goal) => goal.id === 'G001-original'), true);
+
+      const first = await startNextUltragoal(cwd);
+      assert.equal(first.goal?.id, 'G002-child-a');
+      assert.equal(isUltragoalDone(first.plan), false);
+
+      await checkpointUltragoal(cwd, {
+        goalId: 'G002-child-a',
+        status: 'complete',
+        evidence: 'child A tests passed for .omx/ultragoal G001-core-steering-model',
+        codexGoal: { goal: { objective: first.goal!.objective, status: 'complete' } },
+      });
+      const second = await startNextUltragoal(cwd);
+      assert.equal(second.goal?.id, 'G003-child-b');
+      assert.equal(isFinalRunCompletionCandidate(second.plan, second.goal!), true);
+
+      const done = await checkpointUltragoal(cwd, {
+        goalId: 'G003-child-b',
+        status: 'complete',
+        evidence: 'child B tests passed for .omx/ultragoal G001-core-steering-model',
+        codexGoal: { goal: { objective: second.goal!.objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+      assert.equal(isUltragoalDone(done), true);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"steering_accepted"/);
+      assert.match(ledger, /split-g001-core-steering-model/);
+    });
+  });
+
+  it('skips blocked-without-replacement steering while keeping completion blocked', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'G001-core-steering-model .omx/ultragoal blocked lifecycle coverage',
+        codexGoalMode: 'per_story',
+        goals: [
+          { title: 'Blocked', objective: 'Investigate blocked steering dependency.' },
+          { title: 'Next', objective: 'Continue independent steering work.' },
+        ],
+      });
+
+      const blocked = await steerUltragoal(cwd, {
+        kind: 'mark_blocked_superseded',
+        source: 'finding',
+        targetGoalIds: ['G001-blocked'],
+        evidence: 'G001-core-steering-model evidence names .omx/ultragoal blocker without replacement.',
+        rationale: 'Avoid retry churn while preserving the unresolved blocker for final completion.',
+      });
+      assert.equal(blocked.accepted, true);
+      assert.equal(blocked.plan.goals[0]?.steeringStatus, 'blocked');
+
+      const next = await startNextUltragoal(cwd);
+      assert.equal(next.goal?.id, 'G002-next');
+      assert.equal(isFinalRunCompletionCandidate(next.plan, next.goal!), false);
+
+      const afterNext = await checkpointUltragoal(cwd, {
+        goalId: 'G002-next',
+        status: 'complete',
+        evidence: 'independent tests passed for .omx/ultragoal G001-core-steering-model',
+        codexGoal: { goal: { objective: next.goal!.objective, status: 'complete' } },
+      });
+      assert.equal(isUltragoalDone(afterNext), false);
+
+      const none = await startNextUltragoal(cwd);
+      assert.equal(none.goal, null);
+      assert.equal(none.done, false);
+    });
+  });
+
+  it('rejects protected steering payloads and records a rejected audit without mutation', async () => {
+    await withTempRepo(async (cwd) => {
+      const created = await createUltragoalPlan(cwd, {
+        brief: 'G001-core-steering-model protected .omx/ultragoal invariants',
+        goals: [{ title: 'First', objective: 'Keep original objective.' }],
+      });
+
+      const rejected = await steerUltragoal(cwd, {
+        kind: 'revise_pending_wording',
+        source: 'cli',
+        targetGoalIds: ['G001-first'],
+        evidence: 'attempt references .omx/ultragoal G001-core-steering-model',
+        rationale: 'malicious protected edit should be rejected',
+        after: { objective: 'new wording', codexObjective: 'weakened end goal' } as never,
+      });
+
+      assert.equal(rejected.accepted, false);
+      assert.match(rejected.rejectedReasons.join('\n'), /protected objective/);
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.codexObjective, created.codexObjective);
+      assert.equal(plan.goals[0]?.objective, 'Keep original objective.');
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"steering_rejected"/);
+    });
+  });
+
+  it('dedupes accepted steering by idempotency key', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'G001-core-steering-model idempotent .omx/ultragoal audit',
+        goals: [{ title: 'First', objective: 'First objective.' }],
+      });
+      const proposal = {
+        kind: 'add_subgoal' as const,
+        source: 'user_prompt_submit' as const,
+        title: 'Follow-up',
+        objective: 'Follow-up objective.',
+        evidence: 'prompt-submit evidence for .omx/ultragoal G001-core-steering-model',
+        rationale: 'bounded explicit directive requires one follow-up only',
+        idempotencyKey: 'same-prompt-submit',
+      };
+
+      const first = await steerUltragoal(cwd, proposal);
+      const second = await steerUltragoal(cwd, proposal);
+      assert.equal(first.accepted, true);
+      assert.equal(second.accepted, true);
+      assert.equal(second.deduped, true);
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.filter((goal) => goal.title === 'Follow-up').length, 1);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"steering_accepted"/g) ?? []).length, 1);
+    });
+  });
+
 });

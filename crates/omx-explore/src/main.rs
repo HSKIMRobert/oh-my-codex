@@ -2721,6 +2721,10 @@ sleep 30
         let TimedCommandOutput::TimedOut { .. } = result else {
             panic!("expected timeout");
         };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !term_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(read_to_string(&term_file).unwrap_or_default(), "term");
     }
 

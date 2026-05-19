@@ -345,17 +345,85 @@ fn json_string(value: &str) -> String {
 }
 
 fn extract_output_text(body: &str) -> Option<String> {
-    extract_json_string_field(body, "output_text")
+    extract_json_string_field(body, "output_text").or_else(|| extract_response_output_text(body))
+}
+
+fn extract_response_output_text(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let type_pattern = "\"type\"";
+    let mut search_start = 0;
+    let mut parts = Vec::new();
+
+    while let Some(relative_index) = body[search_start..].find(type_pattern) {
+        let type_index = search_start + relative_index;
+        let Some((value, value_end)) = extract_json_string_field_at(body, type_index, "type")
+        else {
+            search_start = type_index + type_pattern.len();
+            continue;
+        };
+        if value != "output_text" {
+            search_start = value_end;
+            continue;
+        }
+
+        let next_type = body[value_end..]
+            .find(type_pattern)
+            .map(|index| value_end + index)
+            .unwrap_or(bytes.len());
+        if let Some((text, text_end)) =
+            extract_json_string_field_before(body, value_end, next_type, "text")
+        {
+            parts.push(text);
+            search_start = text_end;
+        } else {
+            search_start = value_end;
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
+    }
 }
 
 fn extract_json_string_field(body: &str, field: &str) -> Option<String> {
+    extract_json_string_field_at(body, 0, field).map(|(value, _)| value)
+}
+
+fn extract_json_string_field_before(
+    body: &str,
+    start: usize,
+    end: usize,
+    field: &str,
+) -> Option<(String, usize)> {
+    extract_json_string_field_in_range(body, start, end.min(body.len()), field)
+}
+
+fn extract_json_string_field_at(body: &str, start: usize, field: &str) -> Option<(String, usize)> {
+    extract_json_string_field_in_range(body, start, body.len(), field)
+}
+
+fn extract_json_string_field_in_range(
+    body: &str,
+    start: usize,
+    end: usize,
+    field: &str,
+) -> Option<(String, usize)> {
     let bytes = body.as_bytes();
     let field_pattern = format!("\"{field}\"");
-    let mut search_start = 0;
-    while let Some(relative_index) = body[search_start..].find(&field_pattern) {
+    let mut search_start = start.min(body.len());
+    let search_end = end.min(body.len());
+    while search_start < search_end {
+        let Some(relative_index) = body[search_start..search_end].find(&field_pattern) else {
+            break;
+        };
         let mut index = search_start + relative_index + field_pattern.len();
         while matches!(bytes.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
             index += 1;
+        }
+        if index >= search_end {
+            break;
         }
         if bytes.get(index) != Some(&b':') {
             search_start = index;
@@ -364,6 +432,9 @@ fn extract_json_string_field(body: &str, field: &str) -> Option<String> {
         index += 1;
         while matches!(bytes.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
             index += 1;
+        }
+        if index >= search_end {
+            break;
         }
         if bytes.get(index) != Some(&b'"') {
             search_start = index;
@@ -374,13 +445,13 @@ fn extract_json_string_field(body: &str, field: &str) -> Option<String> {
     None
 }
 
-fn parse_json_string_at(body: &str, quote_index: usize) -> Option<String> {
-    let mut chars = body[quote_index + 1..].chars();
+fn parse_json_string_at(body: &str, quote_index: usize) -> Option<(String, usize)> {
+    let mut chars = body[quote_index + 1..].char_indices();
     let mut rendered = String::new();
-    while let Some(ch) = chars.next() {
+    while let Some((offset, ch)) = chars.next() {
         match ch {
-            '"' => return Some(rendered),
-            '\\' => match chars.next()? {
+            '"' => return Some((rendered, quote_index + 1 + offset + ch.len_utf8())),
+            '\\' => match chars.next()?.1 {
                 '"' => rendered.push('"'),
                 '\\' => rendered.push('\\'),
                 '/' => rendered.push('/'),
@@ -392,7 +463,7 @@ fn parse_json_string_at(body: &str, quote_index: usize) -> Option<String> {
                 'u' => {
                     let mut hex = String::new();
                     for _ in 0..4 {
-                        hex.push(chars.next()?);
+                        hex.push(chars.next()?.1);
                     }
                     let value = u16::from_str_radix(&hex, 16).ok()?;
                     rendered.push(char::from_u32(value as u32)?);
@@ -486,9 +557,9 @@ fn render_section(name: &str, entries: &[String]) -> String {
 #[allow(unused_unsafe)]
 mod tests {
     use super::{
-        normalize_summary, parse_http_url, read_summary_timeout_ms, resolve_fallback_model,
-        resolve_instructions_file, resolve_model, DEFAULT_SPARK_MODEL, DEFAULT_STANDARD_MODEL,
-        DEFAULT_SUMMARY_TIMEOUT_MS,
+        extract_output_text, normalize_summary, parse_http_url, read_summary_timeout_ms,
+        resolve_fallback_model, resolve_instructions_file, resolve_model, DEFAULT_SPARK_MODEL,
+        DEFAULT_STANDARD_MODEL, DEFAULT_SUMMARY_TIMEOUT_MS,
     };
     use crate::test_support::env_lock;
     use std::env;
@@ -608,6 +679,33 @@ mod tests {
         unsafe {
             env::remove_var("OMX_SPARKSHELL_SUMMARY_TIMEOUT_MS");
         }
+    }
+
+    #[test]
+    fn output_text_extraction_prefers_compat_top_level_field() {
+        let body = r#"{"output_text":"summary: legacy\nwarnings: none","output":[{"type":"message","content":[{"type":"output_text","text":"summary: nested"}]}]}"#;
+        assert_eq!(
+            extract_output_text(body),
+            Some("summary: legacy\nwarnings: none".to_string())
+        );
+    }
+
+    #[test]
+    fn output_text_extraction_supports_responses_output_content_shape() {
+        let body = r#"{
+            "id":"resp_123",
+            "output":[
+                {"type":"reasoning","summary":[]},
+                {"type":"message","content":[
+                    {"type":"output_text","annotations":[],"text":"summary: ok\n"},
+                    {"type":"output_text","text":"warnings: none"}
+                ]}
+            ]
+        }"#;
+        assert_eq!(
+            extract_output_text(body),
+            Some("summary: ok\nwarnings: none".to_string())
+        );
     }
 
     #[test]

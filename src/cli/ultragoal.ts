@@ -13,8 +13,15 @@ import {
   readUltragoalPlan,
   recordFinalReviewBlockers,
   startNextUltragoal,
+  steerUltragoal,
   summarizeUltragoalPlan,
   type UltragoalItem,
+  type UltragoalSteeringAfterPayload,
+  type UltragoalSteeringMutationKind,
+  type UltragoalSteeringProposal,
+  type UltragoalSteeringSource,
+  ULTRAGOAL_STEERING_MUTATION_KINDS,
+  ULTRAGOAL_STEERING_SOURCES,
   UltragoalError,
 } from '../ultragoal/artifacts.js';
 
@@ -24,7 +31,10 @@ Usage:
   omx ultragoal create-goals [--brief <text> | --brief-file <path> | --from-stdin] [--goal <title::objective>] [--codex-goal-mode <aggregate|per-story>] [--force] [--json]
   omx ultragoal complete-goals [--retry-failed] [--json]
   omx ultragoal add-goal --title <title> --objective <text> [--evidence <text>] [--json]
+  omx ultragoal steer --kind <mutation-kind> --evidence <text> --rationale <text> [--target-goal-id <id> | --target-goal-ids <id1,id2,...>] [--title <title>] [--objective <text>] [--json]
   omx ultragoal record-review-blockers --goal-id <id> --title <title> --objective <text> --evidence <review-findings> --codex-goal-json <active-json-or-path> [--json]
+  omx ultragoal steer --kind <add_subgoal|split_subgoal|reorder_pending|revise_pending_wording|annotate_ledger|mark_blocked_superseded> --evidence <text> --rationale <text> [--target-goal-id <id>] [--title <text>] [--objective <text>] [--after-json <json-or-path>] [--idempotency-key <key>] [--json]
+  omx ultragoal steer --directive-json <json-or-path> [--json]
   omx ultragoal checkpoint --goal-id <id> --status <complete|failed|blocked> [--evidence <text>] [--codex-goal-json <json-or-path>] [--quality-gate-json <json-or-path>] [--json]
   omx ultragoal status [--codex-goal-json <json-or-path>] [--json]
 
@@ -44,6 +54,9 @@ Codex goal integration:
   run while OMX checkpoints G001/G002 stories in the durable ledger. Legacy
   per-story plans retain fresh Codex thread blocker handling when a completed thread
   goal prevents create_goal for the next story.
+  Dynamic steering is explicit-only: steer accepts structured fields or directive JSON,
+  audits accepted/rejected/deduped results in .omx/ultragoal/ledger.jsonl, and
+  rejects broad natural-language mutation requests.
   Final completion is mandatory-gated: run ai-slop-cleaner, rerun verification,
   run $code-review, and pass --quality-gate-json with APPROVE + CLEAR evidence.
   Non-clean final review must use record-review-blockers before update_goal.
@@ -88,7 +101,7 @@ async function readStdin(): Promise<string> {
 }
 
 function positionalText(args: readonly string[]): string {
-  const valueTaking = new Set(['--brief', '--brief-file', '--goal', '--goal-id', '--status', '--evidence', '--codex-goal-json', '--codex-goal-mode', '--title', '--objective', '--quality-gate-json']);
+  const valueTaking = new Set(['--brief', '--brief-file', '--goal', '--goal-id', '--target-goal-id', '--status', '--evidence', '--codex-goal-json', '--codex-goal-mode', '--title', '--objective', '--rationale', '--kind', '--source', '--after-json', '--directive-json', '--directive-file', '--idempotency-key', '--quality-gate-json']);
   const words: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -129,7 +142,7 @@ async function parseCodexGoalJson(raw: string | undefined): Promise<unknown> {
   return readCodexGoalSnapshotInput(raw, process.cwd());
 }
 
-async function readJsonInput(raw: string | undefined): Promise<unknown> {
+async function readJsonInput(raw: string | undefined, label = '--quality-gate-json'): Promise<unknown> {
   if (!raw) return undefined;
   try {
     const trimmed = raw.trim();
@@ -137,8 +150,121 @@ async function readJsonInput(raw: string | undefined): Promise<unknown> {
     return JSON.parse(await readFile(trimmed, 'utf-8'));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new UltragoalError(`Invalid --quality-gate-json: ${message}`);
+    throw new UltragoalError(`Invalid ${label}: ${message}`);
   }
+}
+
+const STEERING_KINDS = new Set<UltragoalSteeringMutationKind>(ULTRAGOAL_STEERING_MUTATION_KINDS);
+const STEERING_SOURCES = new Set<UltragoalSteeringSource>(ULTRAGOAL_STEERING_SOURCES);
+
+type CliSteerResult = Awaited<ReturnType<typeof steerUltragoal>>;
+
+function parseSteeringKind(raw: string | undefined): UltragoalSteeringMutationKind {
+  if (!raw) throw new UltragoalError('Missing --kind for structured ultragoal steer.');
+  if (!STEERING_KINDS.has(raw as UltragoalSteeringMutationKind)) throw new UltragoalError(`Invalid --kind: ${raw}. Expected one of ${Array.from(STEERING_KINDS).join(', ')}.`);
+  return raw as UltragoalSteeringMutationKind;
+}
+
+function parseSteeringSource(raw: string | undefined, fallback: UltragoalSteeringSource = 'cli'): UltragoalSteeringSource {
+  if (!raw) return fallback;
+  if (!STEERING_SOURCES.has(raw as UltragoalSteeringSource)) throw new UltragoalError(`Invalid --source: ${raw}. Expected one of ${Array.from(STEERING_SOURCES).join(', ')}.`);
+  return raw as UltragoalSteeringSource;
+}
+
+function assertPlainObject(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new UltragoalError(`${label} must be a JSON object.`);
+  return value as Record<string, unknown>;
+}
+
+function normalizeTargetGoalId(raw: Record<string, unknown>): string | undefined {
+  if (typeof raw.targetGoalId === 'string' && raw.targetGoalId.trim()) return raw.targetGoalId.trim();
+  if (Array.isArray(raw.targetGoalIds)) return raw.targetGoalIds.find((id): id is string => typeof id === 'string' && id.trim().length > 0)?.trim();
+  return undefined;
+}
+
+function normalizeSteeringProposal(raw: Record<string, unknown>, _fallbackDirectiveText?: string): UltragoalSteeringProposal {
+  const kind = parseSteeringKind(typeof raw.kind === 'string' ? raw.kind : undefined);
+  const source = parseSteeringSource(typeof raw.source === 'string' ? raw.source : undefined);
+  const after = raw.after && typeof raw.after === 'object' && !Array.isArray(raw.after)
+    ? raw.after as UltragoalSteeringAfterPayload
+    : undefined;
+  return {
+    kind,
+    source,
+    evidence: typeof raw.evidence === 'string' ? raw.evidence : '',
+    rationale: typeof raw.rationale === 'string' ? raw.rationale : '',
+    targetGoalId: normalizeTargetGoalId(raw),
+    title: typeof raw.title === 'string' ? raw.title : undefined,
+    objective: typeof raw.objective === 'string' ? raw.objective : undefined,
+    after,
+    pendingOrder: Array.isArray(raw.pendingOrder) ? raw.pendingOrder.filter((id): id is string => typeof id === 'string') : undefined,
+    idempotencyKey: typeof raw.idempotencyKey === 'string' ? raw.idempotencyKey : undefined,
+  };
+}
+
+async function parseSteeringProposal(args: readonly string[]): Promise<UltragoalSteeringProposal> {
+  const directiveFile = readValue(args, '--directive-file');
+  const directiveRaw = readValue(args, '--directive-json') ?? (directiveFile ? await readFile(directiveFile, 'utf-8') : undefined);
+  if (directiveRaw) {
+    const directive = assertPlainObject(await readJsonInput(directiveRaw, '--directive-json'), '--directive-json');
+    return normalizeSteeringProposal(directive, directiveRaw.trim().startsWith('{') ? directiveRaw : undefined);
+  }
+
+  const freeform = positionalText(args);
+  if (freeform) throw new UltragoalError('omx ultragoal steer rejects broad natural-language mutation requests; pass structured fields or --directive-json.');
+
+  const after = await readJsonInput(readValue(args, '--after-json'), '--after-json');
+  return normalizeSteeringProposal({
+    kind: readValue(args, '--kind'),
+    evidence: readValue(args, '--evidence'),
+    rationale: readValue(args, '--rationale'),
+    targetGoalId: readValue(args, '--target-goal-id') ?? readValue(args, '--goal-id'),
+    title: readValue(args, '--title'),
+    objective: readValue(args, '--objective'),
+    after,
+    idempotencyKey: readValue(args, '--idempotency-key'),
+  });
+}
+
+function buildSteerDirectiveText(args: readonly string[]): string {
+  return args.join(' ');
+}
+
+function steeringAudit(proposal: UltragoalSteeringProposal, result: CliSteerResult): Record<string, unknown> {
+  return {
+    kind: result.audit.kind,
+    source: result.audit.source,
+    targetGoalId: proposal.targetGoalId,
+    targetGoalIds: result.audit.targetGoalIds,
+    evidence: proposal.evidence,
+    rationale: proposal.rationale,
+    idempotencyKey: proposal.idempotencyKey,
+    accepted: result.accepted,
+    rejectedReasons: result.rejectedReasons ?? [],
+    deduped: Boolean(result.deduped),
+  };
+}
+
+function printSteerResult(proposal: UltragoalSteeringProposal, result: CliSteerResult, json: boolean): void {
+  const audit = steeringAudit(proposal, result);
+  if (json) {
+    printJson({
+      ok: result.accepted,
+      accepted: result.accepted,
+      rejectedReasons: result.rejectedReasons ?? [],
+      deduped: Boolean(result.deduped),
+      audit,
+      summary: summarizeUltragoalPlan(result.plan),
+      planSummary: summarizeUltragoalPlan(result.plan),
+      plan: result.plan,
+    });
+    return;
+  }
+  const outcome = result.deduped ? 'deduped' : result.accepted ? 'accepted' : 'rejected';
+  console.log(`ultragoal steer: ${outcome} ${proposal.kind}`);
+  if (result.rejectedReasons?.length) console.log(`rejected: ${result.rejectedReasons.join('; ')}`);
+  if (proposal.idempotencyKey) console.log(`idempotency-key: ${proposal.idempotencyKey}`);
+  printStatus(result.plan);
 }
 
 export async function ultragoalCommand(args: string[]): Promise<void> {
@@ -187,6 +313,7 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
       const reconciliation = activeGoal
         ? reconcileCodexGoalSnapshot(snapshot, {
           expectedObjective: expectedObjective ?? activeGoal.objective,
+          acceptedObjectives: plan.codexGoalMode === 'aggregate' ? plan.codexObjectiveAliases : undefined,
           allowedStatuses: plan.codexGoalMode === 'aggregate' ? ['active'] : ['active', 'complete'],
           requireSnapshot: false,
         })
@@ -211,6 +338,27 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
         console.log(`ultragoal added goal: ${result.goal.id}`);
         printStatus(result.plan);
       }
+      return;
+    }
+
+    if (command === 'steer') {
+      const proposalText = readValue(rest, '--proposal');
+      const source = readValue(rest, '--source');
+      if (proposalText) {
+        const parsed = assertPlainObject(await readJsonInput(proposalText, '--proposal'), '--proposal');
+        const proposal = normalizeSteeringProposal({ ...parsed, source: source ?? parsed.source }, proposalText);
+        const result = await steerUltragoal(cwd, proposal, { directiveText: proposalText });
+        printSteerResult(proposal, result, json);
+        if (!result.accepted) process.exitCode = 1;
+        return;
+      }
+      const proposal = await parseSteeringProposal(rest);
+      if (!proposal.evidence?.trim?.()) throw new UltragoalError('Missing --evidence.');
+      if (!proposal.rationale?.trim?.()) throw new UltragoalError('Missing --rationale.');
+      proposal.source = parseSteeringSource(source, proposal.source);
+      const result = await steerUltragoal(cwd, proposal, { directiveText: buildSteerDirectiveText(rest) });
+      printSteerResult(proposal, result, json);
+      if (!result.accepted) process.exitCode = 1;
       return;
     }
 
@@ -243,6 +391,14 @@ export async function ultragoalCommand(args: string[]): Promise<void> {
       const instruction = buildCodexGoalInstruction(result.goal, result.plan);
       if (json) printJson({ ok: true, resumed: result.resumed, goal: result.goal, instruction });
       else console.log(instruction);
+      return;
+    }
+
+    if (command === 'steer') {
+      const proposal = await parseSteeringProposal(rest);
+      const result = await steerUltragoal(cwd, proposal);
+      printSteerResult(proposal, result, json);
+      if (!result.accepted) process.exitCode = 1;
       return;
     }
 

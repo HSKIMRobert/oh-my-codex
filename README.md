@@ -28,7 +28,7 @@ OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex).
 It keeps Codex as the execution engine and makes it easier to:
 - start a stronger Codex session by default
 - run one consistent workflow from clarification to completion
-- invoke the canonical skills with `$deep-interview`, `$ralplan`, `$team`, and `$ralph`
+- invoke the canonical default workflow with `$deep-interview`, `$ralplan`, and `$ultragoal`
 - keep project guidance, plans, logs, and state in `.omx/`
 
 ## Core Maintainers
@@ -72,20 +72,18 @@ Then work normally inside Codex:
 ```text
 $deep-interview "clarify the authentication change"
 $ralplan "approve the auth plan and review tradeoffs"
-$ralph "carry the approved plan to completion"
-$team 3:executor "execute the approved plan in parallel"
-$ultragoal "turn this launch into durable Codex goals"
+$ultragoal "turn the approved plan into durable Codex goals"
 ```
 
 That is the main path.
 Before you treat the runtime as ready, run the quick-start smoke test below: `omx doctor` verifies the install shape, while `omx exec` proves the active Codex runtime can actually authenticate and complete a model call from the current environment.
-Start OMX strongly, clarify first when needed, approve the plan, then choose `$team` for coordinated parallel execution or `$ralph` for the persistent completion loop.
+Start OMX strongly, clarify first when needed, approve the plan, then use `$ultragoal` as the default durable completion wrapper. Use `$team` inside that execution path only when a specific Ultragoal story needs coordinated parallel work; use `$ralph` when you intentionally want a single-owner completion loop instead of a durable multi-goal run.
 
 ## What OMX is for
 
 Use OMX if you already like Codex and want a better day-to-day runtime around it:
-- a standard workflow built around `$deep-interview`, `$ralplan`, `$team`, and `$ralph`
-- durable multi-goal handoffs with `$ultragoal` and `.omx/ultragoal` artifacts when a launch needs sequential Codex goals
+- a standard workflow built around `$deep-interview` -> `$ralplan` -> `$ultragoal`
+- durable multi-goal handoffs with `$ultragoal` and `.omx/ultragoal` artifacts as the default completion path after planning
 - specialist roles and supporting skills when the task needs them
 - project guidance through scoped `AGENTS.md`
 - durable state under `.omx/` for plans, logs, memory, and mode tracking
@@ -160,11 +158,10 @@ Then try the canonical workflow:
 ```text
 $deep-interview "clarify the authentication change"
 $ralplan "approve the safest implementation path"
-$ralph "carry the approved plan to completion"
-$team 3:executor "execute the approved plan in parallel"
+$ultragoal "turn the approved path into durable Codex goals"
 ```
 
-Use `$team` when the approved plan needs coordinated parallel work, or `$ralph` when one persistent owner should keep pushing to completion.
+Use `$team` when an active Ultragoal story needs coordinated parallel work, or `$ralph` when one persistent owner should keep pushing to completion without a multi-goal ledger.
 
 ## A simple mental model
 
@@ -187,13 +184,15 @@ Most users should think of OMX as **better task routing + better workflow + bett
 5. Launch with `omx --madmax --high`
 6. Use `$deep-interview "..."` when the request or boundaries are still unclear
 7. Use `$ralplan "..."` to approve the plan and review tradeoffs
-8. Choose `$team` for coordinated parallel execution or `$ralph` for persistent completion loops
+8. Use `$ultragoal "..."` to turn the approved plan into durable goals and ledger checkpoints
 
 ## Recommended workflow
 
 1. `$deep-interview` — clarify scope when the request or boundaries are still vague.
 2. `$ralplan` — turn that clarified scope into an approved architecture and implementation plan.
-3. `$team` or `$ralph` — use `$team` for coordinated parallel execution, or `$ralph` when you want a persistent completion loop with one owner.
+3. `$ultragoal` — make the approved plan durable as sequential Codex goals with `.omx/ultragoal` ledger checkpoints.
+
+Inside an Ultragoal story, use `$team` only when that story benefits from coordinated parallel execution. Use `$ralph` as an intentional alternate completion loop when you do not need a durable multi-goal ledger.
 
 ## Common in-session surfaces
 
@@ -201,6 +200,7 @@ Most users should think of OMX as **better task routing + better workflow + bett
 | --- | --- |
 | `$deep-interview "..."` | clarifying intent, boundaries, and non-goals |
 | `$ralplan "..."` | approving the implementation plan and tradeoffs |
+| `$ultragoal "..."` | durable multi-goal completion after the approved plan |
 | `$ralph "..."` | persistent completion and verification loops |
 | `$team "..."` | coordinated parallel execution when the work is big enough |
 | `/skills` | browsing installed skills and supporting helpers |
@@ -267,6 +267,7 @@ If `Shift+Enter` still submits instead of inserting a newline inside an OMX-mana
 - `omx sparkshell <command>` is for shell-native inspection and bounded verification
 - when `omx_wiki/` exists, `omx explore` can inject wiki-first context before falling back to broader repository search
 - fallback boundaries are explicit: sparkshell-backend fallback is reported on stderr, and spark-model fallback emits stderr metadata plus an `## OMX Explore fallback` notice in stdout so users can see when cost/behavior may differ from the low-cost path
+- sparkshell env overrides are intentionally narrow: `OMX_SPARKSHELL_BIN` selects a native sidecar path, `OMX_SPARKSHELL_MODEL` selects the primary summary model, `OMX_SPARKSHELL_FALLBACK_MODEL` selects the retry model, `OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE` selects summary instructions, and `OMX_SPARKSHELL_SUMMARY_TIMEOUT_MS` controls the local API summary timeout
 
 Examples:
 
