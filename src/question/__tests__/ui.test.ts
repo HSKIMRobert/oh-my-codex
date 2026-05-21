@@ -146,7 +146,7 @@ describe('question ui arrow navigation', () => {
     assert.deepEqual(update.state.selectedIndices, [0, 1]);
   });
 
-  it('renders option descriptions beneath each option when present', () => {
+  it('renders option descriptions inline next to each option to keep the frame compact', () => {
     const frame = renderInteractiveQuestionFrame(
       makeRecord({
         options: [
@@ -160,11 +160,12 @@ describe('question ui arrow navigation', () => {
       },
     );
 
-    assert.match(frame, /› \[x\] 1\. Alpha\n\s+First choice explanation/);
-    assert.match(frame, /\[ \] 2\. Beta\n\s+Second choice explanation/);
+    assert.match(frame, /› \[x\] 1\. Alpha — First choice explanation/);
+    assert.match(frame, /\[ \] 2\. Beta — Second choice explanation/);
+    assert.doesNotMatch(frame, /Alpha\n\s+First choice/, 'description must NOT be rendered on a separate line below the option');
   });
 
-  it('renders navigation instructions with checkbox markers', () => {
+  it('renders compact navigation instructions with checkbox markers', () => {
     const frame = renderInteractiveQuestionFrame(
       makeRecord({ multi_select: true, type: 'multi-answerable' }),
       {
@@ -173,7 +174,7 @@ describe('question ui arrow navigation', () => {
       },
     );
 
-    assert.match(frame, /Use ↑\/↓ to move, Space to toggle, Enter to submit\./);
+    assert.match(frame, /↑↓ move · Space toggle · Enter submit/);
     assert.match(frame, /\[x\] 1\. Alpha/);
     assert.match(frame, /› \[ \] 2\. Beta/);
   });
@@ -191,7 +192,7 @@ describe('question ui arrow navigation', () => {
     const selections = await promise;
     assert.deepEqual(selections, [2]);
     assert.equal(input.rawMode, false);
-    assert.match(output.toString(), /Use ↑\/↓ to move, Enter to select\./);
+    assert.match(output.toString(), /↑↓ move · Enter select/);
   });
 
   it('writes answered state from arrow-key interaction', async () => {

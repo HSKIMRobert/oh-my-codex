@@ -212,17 +212,17 @@ export function renderInteractiveQuestionFrame(record: QuestionRecord, state: In
   const lines: string[] = [];
 
   if (record.header || question.header) lines.push(record.header ?? question.header ?? '');
-  lines.push(question.question, '');
+  lines.push(question.question);
 
   optionEntries.forEach((entry, index) => {
     const isActive = state.cursorIndex === index;
     const isChecked = isMultiAnswerableQuestion(question) ? state.selectedIndices.includes(index) : isActive;
-    lines.push(`${isActive ? '›' : ' '} [${isChecked ? 'x' : ' '}] ${entry.label}`);
-    if (entry.description) lines.push(`      ${entry.description}`);
+    const cursor = isActive ? '›' : ' ';
+    const box = `[${isChecked ? 'x' : ' '}]`;
+    lines.push(entry.description ? `${cursor} ${box} ${entry.label} — ${entry.description}` : `${cursor} ${box} ${entry.label}`);
   });
 
-  lines.push('');
-  lines.push(isMultiAnswerableQuestion(question) ? 'Use ↑/↓ to move, Space to toggle, Enter to submit.' : 'Use ↑/↓ to move, Enter to select.');
+  lines.push(isMultiAnswerableQuestion(question) ? '↑↓ move · Space toggle · Enter submit' : '↑↓ move · Enter select');
   if (state.error) lines.push(state.error);
   return `${lines.join('\n')}\n`;
 }
@@ -348,15 +348,16 @@ export function renderQuestionWizardFrame(record: QuestionRecord, state: WizardS
   const lines: string[] = [];
   if (record.header) lines.push(record.header);
   if (question.header && question.header !== record.header) lines.push(question.header);
-  lines.push(`Question ${state.currentQuestionIndex + 1} of ${questions.length}`);
-  lines.push(question.question, '');
+  if (questions.length > 1) lines.push(`Question ${state.currentQuestionIndex + 1} of ${questions.length}`);
+  lines.push(question.question);
   optionEntries.forEach((entry, index) => {
     const isActive = selection.cursorIndex === index;
     const isChecked = isMultiAnswerableQuestion(question) ? selection.selectedIndices.includes(index) : isActive;
-    lines.push(`${isActive ? '›' : ' '} [${isChecked ? 'x' : ' '}] ${entry.label}`);
-    if (entry.description) lines.push(`      ${entry.description}`);
+    const cursor = isActive ? '›' : ' ';
+    const box = `[${isChecked ? 'x' : ' '}]`;
+    lines.push(entry.description ? `${cursor} ${box} ${entry.label} — ${entry.description}` : `${cursor} ${box} ${entry.label}`);
   });
-  lines.push('', isMultiAnswerableQuestion(question) ? 'Use ↑/↓ to move, Space to toggle, Enter/→ to continue, ← to go back.' : 'Use ↑/↓ to move, Enter/→ to continue, ← to go back.');
+  lines.push(isMultiAnswerableQuestion(question) ? '↑↓ move · Space toggle · Enter/→ next · ← back' : '↑↓ move · Enter/→ next · ← back');
   if (selection.error || state.error) lines.push(selection.error ?? state.error ?? '');
   return `${lines.join('\n')}\n`;
 }
