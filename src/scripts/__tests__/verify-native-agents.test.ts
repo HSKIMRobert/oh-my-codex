@@ -53,7 +53,7 @@ describe("verify-native-agents", () => {
       ]),
       definitions: { executor: definition, "style-reviewer": { ...definition, name: "style-reviewer" } },
       promptNames: new Set(["executor", "style-reviewer", "explore-harness"]),
-      pluginManifest: { skills: "./skills/" },
+      pluginManifest: { skills: "./skills/", hooks: "./hooks/hooks.json" },
     });
 
     assert.deepEqual(result.installableAgentNames, ["executor"]);
@@ -183,6 +183,26 @@ describe("verify-native-agents", () => {
         pluginManifest: { agents: "./agents/" },
       }),
     );
+
+    await rejectsWithCode("native_agent_plugin_boundary_violation", () =>
+      verifyNativeAgents({
+        manifest: manifest([{ name: "executor", category: "build", status: "active" }]),
+        definitions: { executor: definition },
+        promptNames: new Set(["executor"]),
+        pluginManifest: { prompts: "./prompts/" },
+      }),
+    );
+  });
+
+  it("allows plugin-scoped lifecycle hooks without treating them as native agents", async () => {
+    const result = await verifyNativeAgents({
+      manifest: manifest([{ name: "executor", category: "build", status: "active" }]),
+      definitions: { executor: definition },
+      promptNames: new Set(["executor"]),
+      pluginManifest: { hooks: "./hooks/hooks.json" },
+    });
+
+    assert.deepEqual(result.installableAgentNames, ["executor"]);
   });
 
   it("keeps merged prompt-backed agents out of the installable set", () => {
