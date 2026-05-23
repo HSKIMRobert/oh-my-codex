@@ -31,6 +31,7 @@ import {
 } from "./omx-first-party-mcp.js";
 import {
   buildManagedCodexHookTrustToml,
+  escapeTomlBasicString,
   type ManagedCodexHookOptions,
 } from "./codex-hooks.js";
 import type { HudPreset } from "../hud/types.js";
@@ -809,6 +810,139 @@ function upsertFeatureFlags(
 
 const OMX_HOOK_TRUST_START_MARKER = "# OMX-owned Codex hook trust state";
 const OMX_HOOK_TRUST_END_MARKER = "# End OMX-owned Codex hook trust state";
+const OMX_PROJECT_TRUST_START_MARKER =
+  "# OMX-synced Codex project trust state (from runtime CODEX_HOME)";
+const OMX_PROJECT_TRUST_END_MARKER =
+  "# End OMX-synced Codex project trust state";
+
+function stripMarkerBlock(
+  config: string,
+  startMarker: string,
+  endMarker: string,
+): string {
+  const lines = config.split(/\r?\n/);
+  const kept: string[] = [];
+
+  for (let i = 0; i < lines.length;) {
+    if (lines[i].trim() !== startMarker) {
+      kept.push(lines[i]);
+      i += 1;
+      continue;
+    }
+
+    const nextEndIdx = lines.findIndex(
+      (line, index) => index > i && line.trim() === endMarker,
+    );
+    const nextStartIdx = lines.findIndex(
+      (line, index) => index > i && line.trim() === startMarker,
+    );
+    if (nextEndIdx === -1 || (nextStartIdx !== -1 && nextStartIdx < nextEndIdx)) {
+      kept.push(lines[i]);
+      i += 1;
+      continue;
+    }
+    i = nextEndIdx + 1;
+  }
+
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+}
+
+function isPlainTomlRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
+function safeParseToml(content: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = TOML.parse(content);
+    return isPlainTomlRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Project-scope launches mirror the durable project config.toml into an
+ * ephemeral runtime CODEX_HOME. Codex writes its workspace-trust ledger and
+ * hook trust ledger into the runtime config.toml during the session. Without
+ * persistence, those entries die with the runtime, so Codex prompts to trust
+ * the workspace and hooks on every launch (issue #2470).
+ *
+ * This function extracts only trust-state tables (`[projects."<cwd>"]` and
+ * `[hooks.state."<projectHooksPath>:..."]`) from the runtime config.toml and
+ * upserts them into the durable project config.toml inside a marker-fenced
+ * block, preserving any surrounding user-managed content and comments and
+ * ignoring Codex's NUX counters or other ephemeral runtime-only writes.
+ */
+export function syncProjectScopeTrustStateFromRuntime(
+  projectConfig: string,
+  runtimeConfig: string,
+  projectHooksPath: string,
+): string {
+  const parsed = safeParseToml(runtimeConfig);
+  if (!parsed) return projectConfig;
+
+  const trustBlockLines: string[] = [];
+
+  const projectsTable = parsed.projects;
+  if (isPlainTomlRecord(projectsTable)) {
+    for (const [projectKey, entry] of Object.entries(projectsTable).sort(
+      ([a], [b]) => a.localeCompare(b),
+    )) {
+      if (!isPlainTomlRecord(entry)) continue;
+      const serialized = TOML.stringify({ [projectKey]: entry } as TOML.JsonMap);
+      const renderedHeader = `[projects."${escapeTomlBasicString(projectKey)}"]`;
+      const body = serialized
+        .split(/\r?\n/)
+        .filter((line) => !/^\s*\[/.test(line) && line.trim() !== "")
+        .join("\n");
+      if (body.length === 0) continue;
+      trustBlockLines.push(renderedHeader, body, "");
+    }
+  }
+
+  const hooksTable = parsed.hooks;
+  const hooksState = isPlainTomlRecord(hooksTable) ? hooksTable.state : undefined;
+  if (isPlainTomlRecord(hooksState)) {
+    for (const [stateKey, entry] of Object.entries(hooksState).sort(
+      ([a], [b]) => a.localeCompare(b),
+    )) {
+      if (!isPlainTomlRecord(entry)) continue;
+      if (!stateKey.startsWith(`${projectHooksPath}:`)) continue;
+      const trusted = entry.trusted_hash;
+      if (typeof trusted !== "string" || trusted.length === 0) continue;
+      trustBlockLines.push(
+        `[hooks.state."${escapeTomlBasicString(stateKey)}"]`,
+        `trusted_hash = "${escapeTomlBasicString(trusted)}"`,
+        "",
+      );
+    }
+  }
+
+  const stripped = stripMarkerBlock(
+    projectConfig,
+    OMX_PROJECT_TRUST_START_MARKER,
+    OMX_PROJECT_TRUST_END_MARKER,
+  );
+
+  if (trustBlockLines.length === 0) {
+    return stripped.length === 0 ? "" : `${stripped}\n`;
+  }
+
+  const block = [
+    OMX_PROJECT_TRUST_START_MARKER,
+    ...trustBlockLines,
+    OMX_PROJECT_TRUST_END_MARKER,
+    "",
+  ].join("\n");
+
+  if (stripped.length === 0) return block;
+  return `${stripped}\n\n${block}`;
+}
 
 export function stripManagedCodexHookTrustState(config: string): string {
   const lines = config.split(/\r?\n/);

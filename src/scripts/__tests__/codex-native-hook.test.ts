@@ -26,6 +26,7 @@ import { resetTriageConfigCache } from "../../hooks/triage-config.js";
 import { executeStateOperation } from "../../state/operations.js";
 import { OMX_TMUX_HUD_OWNER_ENV } from "../../hud/reconcile.js";
 import { readAllState } from "../../hud/state.js";
+import { renderHud } from "../../hud/render.js";
 import { getLegacyWikiDir, serializePage, writePage } from "../../wiki/storage.js";
 import { WIKI_SCHEMA_VERSION } from "../../wiki/types.js";
 import { createUltragoalPlan, readUltragoalPlan } from "../../ultragoal/artifacts.js";
@@ -1938,6 +1939,9 @@ describe("codex native hook dispatch", () => {
       assert.match(output, /omx ultragoal checkpoint --goal-id G001-demo --status complete/);
       assert.match(output, /--status blocked/);
       assert.match(output, /Codex goal context/);
+      assert.match(output, /no such table: thread_goals/);
+      assert.match(output, /unavailable get_goal error JSON or path/);
+      assert.match(output, /safe-recovery blocker/);
       assert.doesNotMatch(output, /fresh (?:Codex )?(?:thread|session)s?/i);
       assert.match(output, /Hooks must not mutate Codex goal state/);
     } finally {
@@ -11978,6 +11982,62 @@ describe("codex native hook triage integration", () => {
 
       const stateFile = join(cwd, ".omx", "state", "sessions", "triage-kw-autopilot-1", "prompt-routing-state.json");
       assert.equal(existsSync(stateFile), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("makes autopilot keyword activation observable in state, HUD context, and prompt guidance", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-autopilot-observable-"));
+    try {
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      await writeSessionStart(cwd, "sess-autopilot-observable");
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-autopilot-observable",
+          thread_id: "thread-autopilot-observable",
+          turn_id: "turn-autopilot-observable",
+          prompt: "$autopilot implement issue #2430",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.skillState?.skill, "autopilot");
+      assert.equal(result.skillState?.phase, "deep-interview");
+      assert.equal(result.skillState?.initialized_state_path, ".omx/state/sessions/sess-autopilot-observable/autopilot-state.json");
+
+      const additionalContext = String(
+        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
+      );
+      assert.match(additionalContext, /detected workflow keyword "\$autopilot" -> autopilot/);
+      assert.match(additionalContext, /\$deep-interview -> \$ralplan -> \$ultragoal \(\+ \$team if needed\) -> \$code-review -> \$ultraqa/);
+      assert.match(additionalContext, /deep_interview_gate\.skip_reason/);
+      assert.match(additionalContext, /Do not silently fall back to ordinary \$plan\/ralplan-only handling/);
+      assert.match(additionalContext, /Codex goal-mode handoff guidance/);
+      assert.doesNotMatch(additionalContext, /multi-step goal with no workflow keyword/);
+
+      const statePath = join(cwd, ".omx", "state", "sessions", "sess-autopilot-observable", "autopilot-state.json");
+      const modeState = JSON.parse(await readFile(statePath, "utf-8")) as {
+        active: boolean;
+        current_phase: string;
+        state?: { phase_cycle?: string[]; deep_interview_gate?: { status?: string; skip_reason?: string | null } };
+      };
+      assert.equal(modeState.active, true);
+      assert.equal(modeState.current_phase, "deep-interview");
+      assert.deepEqual(modeState.state?.phase_cycle, ["deep-interview", "ralplan", "ultragoal", "code-review", "ultraqa"]);
+      assert.deepEqual(modeState.state?.deep_interview_gate, {
+        status: "required",
+        skip_reason: null,
+        rationale: "Autopilot starts at the deep-interview gate by default; clear bounded tasks may skip only with an explicit persisted skip reason.",
+      });
+
+      const hudState = await readAllState(cwd);
+      assert.equal(hudState.autopilot?.active, true);
+      assert.equal(hudState.autopilot?.current_phase, "deep-interview");
+      assert.match(renderHud(hudState, "focused"), /autopilot:deep-interview/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

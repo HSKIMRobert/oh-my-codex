@@ -1698,6 +1698,17 @@ function buildSkillStateCliInstruction(mode: string, statePath: string): string 
   return `skill: ${mode} activated and initial state initialized at ${statePath}; use CLI-first state updates via \`omx state write/read/clear --input '<json>' --json\`; use omx_state MCP only when explicit MCP compatibility is enabled.`;
 }
 
+function buildAutopilotPromptActivationNote(skillState?: SkillActiveState | null): string | null {
+  if (skillState?.initialized_mode !== "autopilot") return null;
+  return [
+    "Autopilot protocol: the durable default chain is $deep-interview -> $ralplan -> $ultragoal (+ $team if needed) -> $code-review -> $ultraqa (deep-interview -> ralplan -> ultragoal -> code-review -> ultraqa).",
+    "Start/resume at current_phase=deep-interview unless the task is clear and bounded; if deep-interview is intentionally skipped, persist and state an explicit deep_interview_gate.skip_reason before moving to ralplan.",
+    "The ralplan phase is not complete until Planner output has been reviewed sequentially by Architect and then Critic; do not hand off to Ultragoal or implementation until the ralplan state/artifact records both ralplan_architect_review and ralplan_critic_review with approval or an explicit blocker.",
+    "Do not silently fall back to ordinary $plan/ralplan-only handling; keep autopilot-state.json, skill-active-state.json, HUD/statusline, and Codex goal-mode handoff guidance visible while the workflow is active.",
+    "When Codex goal tools are available, call get_goal/create_goal only from the active thread handoff and treat the active goal as the completion contract until code-review and ultraqa are clean.",
+  ].join(" ");
+}
+
 function buildAdditionalContextMessage(
   prompt: string,
   skillState?: SkillActiveState | null,
@@ -1731,9 +1742,7 @@ function buildAdditionalContextMessage(
   const ultragoalPromptActivationNote = match.skill === "ultragoal"
     ? "Ultragoal protocol: use `omx ultragoal create-goals` / `complete-goals` / `checkpoint` for `.omx/ultragoal` artifacts, then use Codex goal model tools only from the active agent handoff (`get_goal`, `create_goal`, `update_goal`) and never overwrite a different active Codex goal. Ultragoal does not call `/goal clear`; for multiple sequential ultragoal runs in one Codex session/thread, manually clear the completed Codex goal in the UI before creating the next aggregate goal."
     : null;
-  const autopilotPromptActivationNote = skillState?.initialized_mode === "autopilot"
-    ? "Autopilot protocol: execute the durable chain `deep-interview -> ralplan -> ultragoal -> code-review -> ultraqa`. The ralplan phase is not complete until Planner output has been reviewed sequentially by Architect and then Critic; do not hand off to Ultragoal or implementation until the ralplan state/artifact records both `ralplan_architect_review` and `ralplan_critic_review` with approval or an explicit blocker."
-    : null;
+  const autopilotPromptActivationNote = buildAutopilotPromptActivationNote(skillState);
   const combinedTransitionMessage = (() => {
     if (!skillState?.transition_message) return null;
     if (matches.length <= 1 || activeSkills.length <= 1) return skillState.transition_message;
@@ -1813,7 +1822,7 @@ function buildAdditionalContextMessage(
     ].join(" ");
   }
 
-  return [detectedKeywordMessage, promptPriorityMessage, ultragoalPromptActivationNote, "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules."].filter(Boolean).join(" ");
+  return [detectedKeywordMessage, promptPriorityMessage, ultragoalPromptActivationNote, autopilotPromptActivationNote, "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules."].filter(Boolean).join(" ");
 }
 
 function parseTeamWorkerEnv(rawValue: string): { teamName: string; workerName: string } | null {
@@ -2062,6 +2071,7 @@ async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Pro
         `If get_goal returns a completed task-scoped objective for the same aggregate ultragoal plan, checkpoint ${goalId} with evidence naming ${goalId} plus .omx/ultragoal/goals.json or ledger.jsonl and pass final quality-gate JSON; OMX will reconcile the completed planned scope without mutating Codex goal state.`,
         `If get_goal instead returns a different completed legacy objective and complete checkpointing fails, do not repeat --status complete in this thread.`,
         `Record the non-terminal blocker with: omx ultragoal checkpoint --goal-id ${goalId} --status blocked --codex-goal-json '<different completed get_goal JSON or path>' --evidence '<completed legacy Codex goal blocks create_goal in this thread>'.`,
+        `If get_goal itself is unavailable with a Codex DB/schema/context error such as "no such table: thread_goals", record an auditable safe-recovery blocker instead: omx ultragoal checkpoint --goal-id ${goalId} --status blocked --codex-goal-json '<unavailable get_goal error JSON or path>' --evidence '<get_goal unavailable due to Codex DB/schema/context error; safe recovery requires a working Codex goal context>'.`,
         "Then continue only from a Codex goal context with no active/completed conflicting goal in the same repo/worktree and create the intended goal there.",
       ].join(" "),
     };

@@ -48,6 +48,7 @@ import {
   resolveDisposableWorktreeOmxRootForLaunch,
   prepareCodexHomeForLaunch,
   persistProjectLaunchRuntimeAuthState,
+  persistProjectLaunchRuntimeProjectTrustState,
   runtimeCodexHomePath,
   buildDetachedSessionBootstrapSteps,
   buildDetachedTmuxSessionName,
@@ -2119,8 +2120,10 @@ describe("project launch scope helpers", () => {
         await readFile(join(runtimeCodexHome, "agents", "planner.toml"), "utf-8"),
         'name = "planner"\n',
       );
-      assert.equal(await readFile(join(runtimeCodexHome, "hooks.json"), "utf-8"), '{"hooks":{}}\n');
-      assert.equal((await lstat(join(runtimeCodexHome, "hooks.json"))).isSymbolicLink(), false);
+      // GH #2470: hooks.json must NOT be mirrored into the runtime CODEX_HOME.
+      // Codex still loads the canonical project .codex/hooks.json as Project
+      // config; a runtime mirror would add a duplicate User config hook source.
+      assert.equal(existsSync(join(runtimeCodexHome, "hooks.json")), false);
       assert.equal(existsSync(join(runtimeCodexHome, "state_5.sqlite")), false);
       assert.equal(existsSync(join(runtimeCodexHome, "state_5.sqlite-wal")), false);
       assert.equal(existsSync(join(runtimeCodexHome, "logs_2.sqlite-shm")), false);
@@ -2172,7 +2175,118 @@ describe("project launch scope helpers", () => {
     }
   });
 
-  it("rewrites setup-owned hook trust state for the runtime CODEX_HOME mirror", async () => {
+  it("project-scope launch registers native hooks exactly once and persists trust state (GH #2470)", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-issue-2470-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      const originalProjectConfig = [
+        'model = "gpt-5.5"',
+        "",
+        "[features]",
+        "hooks = true",
+        "",
+        "# OMX-owned Codex hook trust state",
+        "# Trusts only setup-managed codex-native-hook.js wrappers.",
+        `[hooks.state."${join(projectCodexHome, "hooks.json")}:pre_tool_use:0:0"]`,
+        'trusted_hash = "sha256:project-hooks-trusted"',
+        "# End OMX-owned Codex hook trust state",
+        "",
+      ].join("\n");
+      await writeFile(join(projectCodexHome, "config.toml"), originalProjectConfig);
+      await writeFile(join(projectCodexHome, "hooks.json"), '{"hooks":{}}\n');
+
+      const prepared = await prepareCodexHomeForLaunch(wd, "session-2470", {});
+      const runtimeCodexHome = runtimeCodexHomePath(wd, "session-2470");
+
+      // 1. Hooks register exactly once: runtime CODEX_HOME holds no hooks.json
+      //    mirror, so Codex only sees the canonical project .codex/hooks.json.
+      assert.equal(prepared.codexHomeOverride, runtimeCodexHome);
+      assert.equal(existsSync(join(runtimeCodexHome, "hooks.json")), false);
+      assert.equal(existsSync(join(projectCodexHome, "hooks.json")), true);
+
+      // Simulate Codex writing workspace trust + a new hook trust ledger
+      // entry into the runtime config.toml during the session.
+      const runtimeConfigPath = join(runtimeCodexHome, "config.toml");
+      const runtimeConfigBefore = await readFile(runtimeConfigPath, "utf-8");
+      await writeFile(
+        runtimeConfigPath,
+        [
+          runtimeConfigBefore.replace(/\n+$/, ""),
+          "",
+          `[projects."${wd}"]`,
+          'trust_level = "trusted"',
+          "",
+          "[tui.model_availability_nux]",
+          '"gpt-5.5" = 1',
+          "",
+        ].join("\n"),
+      );
+
+      // 2. Workspace trust + ephemeral runtime state are persisted to the
+      //    project config.toml in a marker-fenced block; NUX counters and
+      //    other runtime-only writes are NOT leaked back to the project.
+      await persistProjectLaunchRuntimeProjectTrustState(
+        prepared.runtimeCodexHomeForCleanup,
+        prepared.projectLocalCodexHomeForCleanup,
+      );
+
+      const persistedProjectConfig = await readFile(
+        join(projectCodexHome, "config.toml"),
+        "utf-8",
+      );
+      assert.ok(
+        persistedProjectConfig.includes(
+          "# OMX-synced Codex project trust state",
+        ),
+        "expected synced-trust marker block in project config.toml",
+      );
+      assert.ok(
+        persistedProjectConfig.includes(`[projects."${wd}"]`),
+        "expected workspace trust entry to be persisted to project config.toml",
+      );
+      assert.ok(
+        persistedProjectConfig.includes('trust_level = "trusted"'),
+        "expected trust_level to be persisted to project config.toml",
+      );
+      assert.doesNotMatch(
+        persistedProjectConfig,
+        /model_availability_nux/,
+        "NUX counters must not leak into durable project config.toml",
+      );
+      assert.ok(
+        persistedProjectConfig.includes(
+          `[hooks.state."${join(projectCodexHome, "hooks.json")}:pre_tool_use:0:0"]`,
+        ),
+        "setup-owned project hook trust state must remain intact",
+      );
+
+      // 3. On a subsequent launch, the runtime mirror carries the persisted
+      //    project trust state forward — so Codex finds the workspace as
+      //    already-trusted and never re-prompts.
+      await rm(runtimeCodexHome, { recursive: true, force: true });
+      await prepareCodexHomeForLaunch(wd, "session-2470-repeat", {});
+      const nextRuntimeCodexHome = runtimeCodexHomePath(wd, "session-2470-repeat");
+      const nextRuntimeConfig = await readFile(
+        join(nextRuntimeCodexHome, "config.toml"),
+        "utf-8",
+      );
+      assert.ok(
+        nextRuntimeConfig.includes(`[projects."${wd}"]`),
+        "next launch must inherit the persisted workspace trust entry",
+      );
+      assert.equal(existsSync(join(nextRuntimeCodexHome, "hooks.json")), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps setup-owned hook trust state targeted at the project hooks path (GH #2470)", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-launch-runtime-hook-trust-"));
     try {
       const projectCodexHome = join(wd, ".codex");
@@ -2183,6 +2297,8 @@ describe("project launch scope helpers", () => {
         JSON.stringify({ scope: "project" }),
       );
       await writeFile(join(projectCodexHome, "hooks.json"), '{"hooks":{}}\n');
+      const projectHookTrustHeader =
+        `[hooks.state."${join(projectCodexHome, "hooks.json")}:pre_tool_use:0:0"]`;
       await writeFile(
         join(projectCodexHome, "config.toml"),
         [
@@ -2191,8 +2307,8 @@ describe("project launch scope helpers", () => {
           "",
           "# OMX-owned Codex hook trust state",
           "# Trusts only setup-managed codex-native-hook.js wrappers.",
-          `[hooks.state."${join(projectCodexHome, "hooks.json")}:pre_tool_use:0:0"]`,
-          'trusted_hash = "stale"',
+          projectHookTrustHeader,
+          'trusted_hash = "sha256:abc"',
           "# End OMX-owned Codex hook trust state",
           "",
         ].join("\n"),
@@ -2202,12 +2318,17 @@ describe("project launch scope helpers", () => {
       const runtimeCodexHome = runtimeCodexHomePath(wd, "session-trust");
       const runtimeConfig = await readFile(join(runtimeCodexHome, "config.toml"), "utf-8");
 
-      assert.match(
-        runtimeConfig,
-        new RegExp(`\\[hooks\\.state\\."${join(runtimeCodexHome, "hooks.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:pre_tool_use:0:0"\\]`),
+      // Runtime CODEX_HOME no longer holds a hooks.json mirror, so the trust
+      // block must continue pointing at the canonical project hooks.json path.
+      assert.equal(existsSync(join(runtimeCodexHome, "hooks.json")), false);
+      assert.ok(
+        runtimeConfig.includes(projectHookTrustHeader),
+        `expected runtime config.toml to keep ${projectHookTrustHeader}`,
       );
-      assert.doesNotMatch(runtimeConfig, /trusted_hash = "stale"/);
-      assert.doesNotMatch(runtimeConfig, new RegExp(join(projectCodexHome, "hooks.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.doesNotMatch(
+        runtimeConfig,
+        new RegExp(join(runtimeCodexHome, "hooks.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

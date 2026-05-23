@@ -122,7 +122,7 @@ import {
 } from "../team/tmux-session.js";
 import { getPackageRoot } from "../utils/package.js";
 import { codexConfigPath, omxRoot, rememberOmxLaunchContext, resolveOmxEntryPath } from "../utils/paths.js";
-import { cleanCodexModelAvailabilityNuxIfNeeded, extractSharedMcpRegistryServersFromConfig, repairConfigIfNeeded, upsertManagedCodexHookTrustState } from "../config/generator.js";
+import { cleanCodexModelAvailabilityNuxIfNeeded, extractSharedMcpRegistryServersFromConfig, repairConfigIfNeeded, syncProjectScopeTrustStateFromRuntime } from "../config/generator.js";
 import type { UnifiedMcpRegistryServer } from "../config/mcp-registry.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../hud/constants.js";
@@ -719,6 +719,12 @@ const PROJECT_LAUNCH_PERSISTED_RUNTIME_ENTRY_NAMES = new Set([
   "auth.json",
 ]);
 
+// Mirroring these files into the runtime CODEX_HOME would cause Codex to load
+// them as user-scope config alongside the canonical project-scope copies under
+// <cwd>/.codex, duplicating every native hook and asking the user to re-trust
+// hooks on every launch. See GH issue #2470.
+const PROJECT_LAUNCH_RUNTIME_SKIPPED_ENTRY_NAMES = new Set(["hooks.json"]);
+
 function shouldPersistProjectLaunchRuntimeEntry(entryName: string): boolean {
   return PROJECT_LAUNCH_PERSISTED_RUNTIME_ENTRY_NAMES.has(entryName);
 }
@@ -756,30 +762,14 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
 
   for (const entry of await readdir(projectCodexHome, { withFileTypes: true })) {
     if (isCodexSqliteArtifact(entry.name)) continue;
+    if (PROJECT_LAUNCH_RUNTIME_SKIPPED_ENTRY_NAMES.has(entry.name)) continue;
     const source = join(projectCodexHome, entry.name);
     const destination = join(runtimeCodexHome, entry.name);
-    if (entry.name === "config.toml" || entry.name === "hooks.json") {
+    if (entry.name === "config.toml") {
       await copyFile(source, destination);
       continue;
     }
     await linkOrCopyCodexHomeEntry(source, destination);
-  }
-
-  const runtimeConfigPath = join(runtimeCodexHome, "config.toml");
-  const runtimeHooksPath = join(runtimeCodexHome, "hooks.json");
-  if (existsSync(runtimeConfigPath) && existsSync(runtimeHooksPath)) {
-    const runtimeConfig = await readFile(runtimeConfigPath, "utf-8");
-    if (runtimeConfig.includes("# OMX-owned Codex hook trust state")) {
-      await writeFile(
-        runtimeConfigPath,
-        upsertManagedCodexHookTrustState(
-          runtimeConfig,
-          getPackageRoot(),
-          runtimeHooksPath,
-        ),
-        "utf-8",
-      );
-    }
   }
 
   return runtimeCodexHome;
@@ -820,12 +810,40 @@ export async function prepareCodexHomeForLaunch(
   };
 }
 
+export async function persistProjectLaunchRuntimeProjectTrustState(
+  runtimeCodexHome: string | undefined,
+  projectCodexHome: string | undefined,
+): Promise<void> {
+  if (!runtimeCodexHome || !projectCodexHome) return;
+  const runtimeConfigPath = join(runtimeCodexHome, "config.toml");
+  if (!existsSync(runtimeConfigPath)) return;
+  const projectConfigPath = join(projectCodexHome, "config.toml");
+  const runtimeConfig = await readFile(runtimeConfigPath, "utf-8");
+  const projectConfig = existsSync(projectConfigPath)
+    ? await readFile(projectConfigPath, "utf-8")
+    : "";
+  const projectHooksPath = join(projectCodexHome, "hooks.json");
+  const nextProjectConfig = syncProjectScopeTrustStateFromRuntime(
+    projectConfig,
+    runtimeConfig,
+    projectHooksPath,
+  );
+  if (nextProjectConfig !== projectConfig) {
+    await mkdir(projectCodexHome, { recursive: true });
+    await writeFile(projectConfigPath, nextProjectConfig, "utf-8");
+  }
+}
+
 async function cleanupRuntimeCodexHome(
   runtimeCodexHomeForCleanup?: string,
   projectCodexHomeForPersistence?: string,
 ): Promise<void> {
   if (!runtimeCodexHomeForCleanup) return;
   await persistProjectLaunchRuntimeAuthState(
+    runtimeCodexHomeForCleanup,
+    projectCodexHomeForPersistence,
+  );
+  await persistProjectLaunchRuntimeProjectTrustState(
     runtimeCodexHomeForCleanup,
     projectCodexHomeForPersistence,
   );

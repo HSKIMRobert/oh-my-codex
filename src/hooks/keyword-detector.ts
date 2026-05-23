@@ -52,7 +52,7 @@ function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing' | 'ralplan';
+export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing' | 'ralplan' | 'deep-interview';
 
 export interface DeepInterviewInputLock {
   active: boolean;
@@ -423,6 +423,13 @@ async function persistStatefulSkillSeedState(
       return_to_ralplan_reason: Object.prototype.hasOwnProperty.call(existingState, 'return_to_ralplan_reason')
         ? existingState.return_to_ralplan_reason
         : null,
+      deep_interview_gate: (existingState.deep_interview_gate && typeof existingState.deep_interview_gate === 'object')
+        ? existingState.deep_interview_gate
+        : {
+            status: 'required',
+            skip_reason: null,
+            rationale: 'Autopilot starts at the deep-interview gate by default; clear bounded tasks may skip only with an explicit persisted skip reason.',
+          },
     };
   }
 
@@ -722,7 +729,7 @@ function resolveContinuationKeywordMatch(
 
 function initialWorkflowPhaseForMode(mode: TrackedWorkflowMode): SkillActivePhase {
   if (mode === 'autoresearch') return 'executing';
-  if (mode === 'autopilot') return 'ralplan';
+  if (mode === 'autopilot') return 'deep-interview';
   return 'planning';
 }
 
