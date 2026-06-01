@@ -6,7 +6,6 @@ import {
   createHudWatchPane,
   findLegacyFocusedHudWatchPaneIds,
   findHudWatchPaneIds,
-  isHudWatchPane,
   killTmuxPane,
   listCurrentWindowPanes,
   registerHudResizeHook,
@@ -44,7 +43,7 @@ export interface ReconcileHudForPromptSubmitDeps {
   createHudWatchPane?: (
     cwd: string,
     hudCmd: string,
-    options?: { heightLines?: number; fullWidth?: boolean; targetPaneId?: string },
+    options?: { heightLines?: number; targetPaneId?: string },
   ) => string | null;
   killTmuxPane?: (paneId: string) => boolean;
   resizeTmuxPane?: (paneId: string, heightLines: number) => boolean;
@@ -139,7 +138,6 @@ export async function reconcileHudForPromptSubmit(
     ...findLegacyFocusedHudWatchPaneIds(panes, currentPaneId),
   ].filter((paneId, index, paneIds) => paneIds.indexOf(paneId) === index);
   const duplicateCount = Math.max(0, hudPaneIds.length - 1);
-  const nonHudPaneCount = panes.filter((pane) => !isHudWatchPane(pane)).length;
   const readHudConfigFn = deps.readHudConfig ?? readHudConfig;
   const hudConfig = await readHudConfigFn(cwd).catch(() => null);
   const readAllStateFn = deps.readAllState ?? readAllState;
@@ -204,7 +202,6 @@ export async function reconcileHudForPromptSubmit(
 
   const paneId = createPane(cwd, hudCmd, {
     heightLines: desiredHeight,
-    fullWidth: nonHudPaneCount > 1,
     targetPaneId: currentPaneId,
   });
   if (!paneId) {
