@@ -59,6 +59,7 @@ async function terminalFixture(prefix: string) {
   const inactiveMode = {
     ...activeMode, active: false, current_phase: 'complete', planning_complete: true,
     execution_handoff_authorized: false, host_verified: false,
+    ralplan_consensus_gate: { complete: false },
   };
   await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(inactiveMode));
   await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify(inactiveMode));
@@ -187,7 +188,10 @@ describe('ralplan advisory non-authoritative native hooks', () => {
         } },
       },
     } as typeof base;
-    const advisoryBinding = { workflow_variant: 'advisory', advisory_generation_id: base.activation.generation_id };
+    const advisoryBinding = {
+      active: false, workflow_variant: 'advisory', advisory_generation_id: base.activation.generation_id,
+      execution_handoff_authorized: false, host_verified: false, ralplan_consensus_gate: { complete: false },
+    };
     const positive = buildRalplanAdvisoryRoutingObservation('execute', approved, advisoryBinding) ?? '';
     assert.match(positive, /planning is complete/i);
     assert.match(buildRalplanAdvisoryRoutingObservation('execute', approved, null) ?? '', /planning is complete/i);

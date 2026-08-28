@@ -18,6 +18,11 @@ export interface PinnedDirectory {
   close(): Promise<void>;
 }
 
+export interface DigestAdvisoryArtifactsDependencies {
+  afterCanonicalArtifactPath?: (artifact: { absolute: string; relative: string }) => void | Promise<void>;
+  beforePinnedRead?: (artifact: { absolute: string; relative: string }) => void | Promise<void>;
+}
+
 async function readBoundedHandle(handle: Awaited<ReturnType<typeof open>>, size: bigint): Promise<Buffer> {
   if (size < 0n || size > BigInt(MAX_ARTIFACT_BYTES) || size > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error('ralplan_advisory_artifact_not_regular');
@@ -30,11 +35,6 @@ async function readBoundedHandle(handle: Awaited<ReturnType<typeof open>>, size:
     offset += result.bytesRead;
   }
   return bytes;
-}
-
-export interface DigestAdvisoryArtifactsDependencies {
-  afterCanonicalArtifactPath?: (artifact: { absolute: string; relative: string }) => void | Promise<void>;
-  beforePinnedRead?: (artifact: { absolute: string; relative: string }) => void | Promise<void>;
 }
 
 function safeBasename(name: string): boolean {
@@ -87,7 +87,7 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
       canonicalPath,
       identity: { dev: before.dev, ino: before.ino },
       async readFile(name, maxBytes = MAX_ARTIFACT_BYTES) {
-      if (maxBytes > MAX_ARTIFACT_BYTES) throw new Error('ralplan_advisory_artifact_limit_unsupported');
+        if (maxBytes > MAX_ARTIFACT_BYTES) throw new Error('ralplan_advisory_artifact_limit_unsupported');
         const bytes = await pinned.read(name, maxBytes);
         if (!bytes) throw new Error('ralplan_advisory_artifact_read_failed');
         return bytes;
@@ -101,15 +101,15 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
     canonicalPath,
     identity: { dev: opened.dev, ino: opened.ino },
     async readFile(name, maxBytes = MAX_ARTIFACT_BYTES) {
-      if (closed || !safeBasename(name) || !Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_ARTIFACT_BYTES) {
+        throw new Error('ralplan_advisory_artifact_limit_unsupported');
+      }
+      if (closed || !safeBasename(name)) {
         throw new Error('ralplan_advisory_artifact_name_invalid');
       }
       if (!descriptorPath) throw new Error('ralplan_advisory_descriptor_relative_open_unsupported');
       const directoryBefore = await handle.stat();
       if (!sameIdentity(opened, directoryBefore)) throw new Error('ralplan_advisory_directory_identity_changed');
-      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_ARTIFACT_BYTES) {
-        throw new Error('ralplan_advisory_artifact_limit_unsupported');
-      }
       const file = await open(join(descriptorPath, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const first = await file.stat({ bigint: true });
@@ -164,7 +164,7 @@ interface CanonicalArtifactPath {
   relative: string;
   ancestry: Array<{ path: string; dev: number; ino: number }>;
   fileIdentity: ArtifactFileIdentity;
-  initialBytes: Buffer<ArrayBufferLike>;
+  initialBytes: Buffer;
   initialBytesCaptured: boolean;
 }
 

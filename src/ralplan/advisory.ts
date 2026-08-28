@@ -11,7 +11,6 @@ export type AdvisoryOutcome = 'approved' | 'exhausted' | 'rejected' | 'failed' |
 export type AdvisoryIntent = 'execute' | 'replan' | 'new_advisory' | 'abandon' | 'unrelated';
 export type AdvisoryIntegrityStatus = 'proven' | 'unproven';
 
-const DENY_STATES = new Set<AdvisoryFenceState>(['pending_closeout', 'recovery_required', 'closed', 'abandoned']);
 const JOURNAL_STEPS = [
   'session_mode', 'root_mode', 'session_skill', 'root_skill',
   'post_digest', 'journal_commit', 'fence_terminal',
@@ -24,8 +23,6 @@ type AdvisoryEventType =
   | 'ralplan_advisory_closeout_reconciled'
   | 'ralplan_advisory_closeout_committed'
   | 'ralplan_advisory_fence_closed'
-  | 'ralplan_advisory_release_denied'
-  | 'ralplan_advisory_fence_released'
   | 'ralplan_advisory_digest_mismatch';
 
 export function ralplanAdvisoryEventsPath(cwd: string, now = new Date()): string {
@@ -186,6 +183,7 @@ export interface AdvisoryProjection {
   fence: AdvisoryFence | null;
   journal: AdvisoryJournal | null;
   admin_event?: AdvisoryAdminEvent | null;
+  /** @deprecated Compatibility diagnostic only. Always false; never used for enforcement. */
   denyProductWrites: boolean;
   corruption: string | null;
 }
@@ -273,6 +271,62 @@ function fenceValid(value: Record<string, unknown>, activation: AdvisoryActivati
     && typeof value.updated_at === 'string';
 }
 
+const FENCE_INHERITED_FIELDS = [
+  'schema_version', 'generation_id', 'predecessor_generation_id', 'canonical_cwd', 'session_id',
+  'root_thread_id', 'activation_turn_id', 'created_at', 'closing_turn_id', 'iteration',
+  'iteration_id', 'plan_manifest_sha256', 'architect_review_sha256', 'critic_review_sha256',
+  'evidence_bundle_sha256',
+] as const;
+
+function fenceStateSemanticsValid(fence: AdvisoryFence): boolean {
+  if (fence.state === 'pending_closeout') return fence.outcome === undefined && fence.integrity_status === undefined;
+  if (fence.state === 'recovery_required') return fence.integrity_status === 'unproven' && fence.outcome !== undefined;
+  if (fence.state === 'closed') {
+    return fence.outcome === 'approved' && fence.integrity_status === 'proven'
+      && [fence.iteration_id, fence.plan_manifest_sha256, fence.architect_review_sha256,
+        fence.critic_review_sha256, fence.evidence_bundle_sha256]
+        .every((value) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value));
+  }
+  if (fence.state === 'abandoned') return fence.outcome !== undefined && fence.outcome !== 'approved'
+    && (fence.integrity_status === 'proven' || fence.integrity_status === 'unproven');
+  return false;
+}
+
+function fenceTransitionSemanticsValid(prior: AdvisoryFence, event: AdvisoryFence): boolean {
+  if (!FENCE_INHERITED_FIELDS.every((field) => JSON.stringify(event[field]) === JSON.stringify(prior[field]))) return false;
+  return fenceStateSemanticsValid(event);
+}
+
+function releasedEventValid(
+  prior: AdvisoryFence,
+  event: AdvisoryFence,
+  journal: Record<string, unknown> | null,
+): boolean {
+  if (!['closed', 'abandoned'].includes(prior.state)) return false;
+  if (!FENCE_INHERITED_FIELDS.every((field) => JSON.stringify(event[field]) === JSON.stringify(prior[field]))) return false;
+  if (prior.state === 'closed' && !committedJournalMatchesFence(
+    journal as AdvisoryJournal | null, prior, true,
+  )) return false;
+  if (prior.state === 'closed' && !fenceStateSemanticsValid(prior)) return false;
+  return event.authority_kind === 'new_root_user_execution_request'
+    && typeof event.release_turn_id === 'string' && safeId(event.release_turn_id)
+    && typeof event.release_thread_id === 'string' && safeId(event.release_thread_id)
+    && typeof event.release_prompt_sha256 === 'string' && /^[a-f0-9]{64}$/i.test(event.release_prompt_sha256)
+    && typeof event.requested_lane === 'string' && event.requested_lane.trim().length > 0;
+}
+
+function committedJournalMatchesFence(
+  journal: AdvisoryJournal | null,
+  fence: AdvisoryFence,
+  requireCompleteSteps = false,
+): boolean {
+  return Boolean(journal && journal.phase === 'committed'
+    && journal.outcome === fence.outcome
+    && journal.integrity_status === fence.integrity_status
+    && journal.evidence_bundle_sha256 === fence.evidence_bundle_sha256
+    && (!requireCompleteSteps || JOURNAL_STEPS.every((step) => journal.steps[step] === 'applied')));
+}
+
 function journalValid(value: Record<string, unknown>, generationId: string): boolean {
   const outcome = ['approved', 'exhausted', 'rejected', 'failed', 'cancelled', 'abandoned'].includes(String(value.outcome));
   const steps = object(value.steps);
@@ -294,41 +348,6 @@ function completeLifecycleBinding(lifecycle: AdvisoryReviewLifecycle | undefined
     && [lifecycle.iteration_id, lifecycle.plan_manifest_sha256, lifecycle.architect_review_sha256,
       lifecycle.critic_review_sha256, lifecycle.evidence_bundle_sha256]
       .every((value) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value)));
-}
-
-const RELEASE_BOUND_FIELDS = [
-  'iteration_id', 'plan_manifest_sha256', 'architect_review_sha256',
-  'critic_review_sha256', 'evidence_bundle_sha256', 'outcome', 'integrity_status',
-] as const;
-
-function validProvenClosedBinding(fence: Record<string, unknown>, journal: Record<string, unknown> | null): boolean {
-  return fence.state === 'closed'
-    && fence.outcome === 'approved'
-    && fence.integrity_status === 'proven'
-    && Boolean(journal && journalValid(journal, String(fence.generation_id)))
-    && journal?.phase === 'committed'
-    && journal.outcome === 'approved'
-    && journal.integrity_status === 'proven'
-    && typeof journal.evidence_bundle_sha256 === 'string'
-    && journal.evidence_bundle_sha256 === fence.evidence_bundle_sha256
-    && RELEASE_BOUND_FIELDS.slice(0, 5).every((field) => typeof fence[field] === 'string' && /^[a-f0-9]{64}$/i.test(fence[field] as string));
-}
-
-function validReleaseEvent(
-  event: Record<string, unknown>,
-  predecessor: Record<string, unknown>,
-  journal: Record<string, unknown> | null,
-): boolean {
-  if (event.state !== 'released' || !['closed', 'abandoned'].includes(String(predecessor.state))) return false;
-  if (typeof event.release_turn_id !== 'string' || !safeId(event.release_turn_id)
-    || typeof event.release_thread_id !== 'string' || !safeId(event.release_thread_id)
-    || typeof event.release_prompt_sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(event.release_prompt_sha256)
-    || typeof event.requested_lane !== 'string' || event.requested_lane.trim() === '') return false;
-  if (!RELEASE_BOUND_FIELDS.slice(0, 5).every((field) => event[field] === undefined
-    || (typeof event[field] === 'string' && /^[a-f0-9]{64}$/i.test(event[field] as string)))) return false;
-  if (!RELEASE_BOUND_FIELDS.every((field) => event[field] === predecessor[field])) return false;
-  if (predecessor.state === 'closed') return validProvenClosedBinding(predecessor as unknown as Record<string, unknown>, journal);
-  return predecessor.outcome === 'abandoned' && predecessor.integrity_status === 'unproven';
 }
 
 async function canonicalCwd(cwd: string): Promise<string> {
@@ -527,12 +546,12 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
   try {
     const canonicalDir = await realpath(dir);
     if (canonicalDir !== dir || relative(advisoryRoot(cwd, sessionId), canonicalDir).startsWith('..')) throw new Error('generation_path_invalid');
-  } catch { return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'generation_missing_or_untrusted' }; }
+  } catch { return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'generation_missing_or_untrusted' }; }
   let activationRaw: Record<string, unknown> | null;
   try { activationRaw = await readStrictJson(join(dir, 'activation.json')); }
-  catch { return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'activation_corrupt' }; }
+  catch { return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'activation_corrupt' }; }
   if (!activationRaw || !activationValid(activationRaw, cwd, sessionId, generationId)) {
-    return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'activation_invalid' };
+    return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'activation_invalid' };
   }
   const activation = activationRaw as unknown as AdvisoryActivation;
   let base: Record<string, unknown> | null;
@@ -541,13 +560,14 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
     base = await readStrictJson(join(dir, 'fence.json'));
     journalRaw = await readStrictJson(join(dir, 'closeout-journal.json'));
   } catch {
-    return { activation, fence: null, journal: null, denyProductWrites: true, corruption: 'fence_or_journal_corrupt' };
+    return { activation, fence: null, journal: null, denyProductWrites: false, corruption: 'fence_or_journal_corrupt' };
   }
   let fence = base ? base as unknown as AdvisoryFence : null;
-  if (fence && !fenceValid(base!, activation)) return { activation, fence: null, journal: null, denyProductWrites: true, corruption: 'fence_invalid' };
-  if (fence && (fence.state !== 'pending_closeout' || fence.sequence !== 0 || fence.previous_event_sha256 !== undefined
-    || fence.release_turn_id !== undefined || fence.release_thread_id !== undefined || fence.authority_kind !== undefined)) {
-    return { activation, fence: null, journal: null, denyProductWrites: true, corruption: 'fence_base_semantics_invalid' };
+  if (fence && !fenceValid(base!, activation)) return { activation, fence: null, journal: null, denyProductWrites: false, corruption: 'fence_invalid' };
+  if (fence && (fence.state !== 'pending_closeout' || !fenceStateSemanticsValid(fence)
+    || fence.sequence !== 0 || fence.previous_event_sha256 !== undefined
+    || base?.release_turn_id !== undefined || base?.release_thread_id !== undefined || base?.authority_kind !== undefined)) {
+    return { activation, fence: null, journal: null, denyProductWrites: false, corruption: 'fence_base_semantics_invalid' };
   }
   let sequence = fence?.sequence ?? -1;
   let priorDigest = fence ? sha256(`${JSON.stringify(fence)}\n`) : undefined;
@@ -555,27 +575,38 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
   for (let index = 1; ; index += 1) {
     let event: Record<string, unknown> | null;
     try { event = await readStrictJson(join(dir, `fence-event-${String(index).padStart(4, '0')}.json`)); }
-    catch { return { activation, fence, journal: null, denyProductWrites: true, corruption: 'fence_event_corrupt' }; }
+    catch { return { activation, fence, journal: null, denyProductWrites: false, corruption: 'fence_event_corrupt' }; }
     if (!event) break;
-    if (!fence || !fenceValid(event, activation) || event.sequence !== sequence + 1 || event.previous_event_sha256 !== priorDigest
-      || !transitionAllowed(fence.state, event.state as AdvisoryFenceState)
-      || (event.state === 'released' && !validReleaseEvent(event, fence as unknown as Record<string, unknown>, journalRaw))) {
-      return { activation, fence, journal: null, denyProductWrites: true, corruption: 'fence_event_chain_invalid' };
+    if (event.state === 'released') {
+      if (!fence || !fenceValid(event, activation) || event.sequence !== sequence + 1
+        || event.previous_event_sha256 !== priorDigest
+        || !releasedEventValid(fence, event as unknown as AdvisoryFence, journalRaw)) {
+        return { activation, fence, journal: null, denyProductWrites: true, corruption: 'fence_event_chain_invalid' };
+      }
+      // Valid release records are historical and inert in the non-authoritative
+      // projection. Keep the terminal predecessor as the planning result.
+      break;
     }
     if (event.state === 'abandoned') {
       const predecessorPath = index === 1 ? join(dir, 'fence.json') : join(dir, `fence-event-${String(index - 1).padStart(4, '0')}.json`);
       abandonedPredecessorBytes = await readFile(predecessorPath).catch(() => null);
+    }
+    if (!fence || !fenceValid(event, activation) || event.sequence !== sequence + 1 || event.previous_event_sha256 !== priorDigest
+      || !transitionAllowed(fence.state, event.state as AdvisoryFenceState)
+      || !fenceTransitionSemanticsValid(fence, event as unknown as AdvisoryFence)) {
+      return { activation, fence, journal: null, denyProductWrites: false, corruption: 'fence_event_chain_invalid' };
     }
     fence = event as unknown as AdvisoryFence;
     sequence = fence.sequence;
     priorDigest = sha256(`${JSON.stringify(fence)}\n`);
   }
   const journal = journalRaw && journalValid(journalRaw, generationId) ? journalRaw as unknown as AdvisoryJournal : null;
-  if (journalRaw && !journal) return { activation, fence, journal: null, denyProductWrites: true, corruption: 'journal_invalid' };
+  if (journalRaw && !journal) return { activation, fence, journal: null, denyProductWrites: false, corruption: 'journal_invalid' };
   let adminRaw: Record<string, unknown> | null;
   try { adminRaw = await readStrictJson(join(dir, 'admin-event-0001.json')); }
-  catch { return { activation, fence, journal, denyProductWrites: true, corruption: 'admin_event_corrupt' }; }
+  catch { return { activation, fence, journal, denyProductWrites: false, corruption: 'admin_event_corrupt' }; }
   const adminEvent = adminRaw as unknown as AdvisoryAdminEvent | null;
+  const terminalFence = fence;
   const priorFenceBytes = adminRaw ? abandonedPredecessorBytes : null;
   const journalBytes = adminRaw && journal ? await readFile(join(dir, 'closeout-journal.json')).catch(() => null) : null;
   if (adminRaw && (adminRaw.schema_version !== 1 || adminRaw.action !== 'abandon'
@@ -584,24 +615,26 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
     || typeof adminRaw.turn_id !== 'string' || !safeId(adminRaw.turn_id)
     || typeof adminRaw.created_at !== 'string' || typeof adminRaw.prior_fence_sha256 !== 'string'
     || (adminRaw.prior_journal_sha256 !== undefined && typeof adminRaw.prior_journal_sha256 !== 'string')
-    || !['abandoned', 'released'].includes(String(fence?.state)) || !priorFenceBytes || sha256(priorFenceBytes) !== adminRaw.prior_fence_sha256
+    || !['abandoned', 'released'].includes(String(terminalFence?.state)) || !priorFenceBytes || sha256(priorFenceBytes) !== adminRaw.prior_fence_sha256
     || (journalBytes ? sha256(journalBytes) : undefined) !== adminRaw.prior_journal_sha256)) {
-    return { activation, fence, journal, admin_event: null, denyProductWrites: true, corruption: 'admin_event_invalid' };
+    return { activation, fence, journal, admin_event: null, denyProductWrites: false, corruption: 'admin_event_invalid' };
   }
-  if (fence?.state === 'closed' && journal?.phase !== 'committed') {
-    return { activation, fence, journal, denyProductWrites: true, corruption: 'closed_without_committed_journal' };
+  if (terminalFence?.state === 'closed' && !committedJournalMatchesFence(journal, terminalFence)) {
+    return { activation, fence, journal, denyProductWrites: false, corruption: 'closed_without_committed_journal' };
   }
-  if (fence?.state === 'closed' && (fence.outcome !== 'approved' || fence.integrity_status !== 'proven'
+  if (terminalFence?.state === 'closed' && (terminalFence.outcome !== 'approved' || terminalFence.integrity_status !== 'proven'
     || journal?.outcome !== 'approved' || journal.integrity_status !== 'proven'
-    || !fence.iteration_id || !fence.plan_manifest_sha256 || !fence.architect_review_sha256
-    || !fence.critic_review_sha256 || !fence.evidence_bundle_sha256
-    || journal.evidence_bundle_sha256 !== fence.evidence_bundle_sha256)) {
-    return { activation, fence, journal, admin_event: adminEvent, denyProductWrites: true, corruption: 'approved_proven_binding_invalid' };
+    || !terminalFence.iteration_id || !terminalFence.plan_manifest_sha256 || !terminalFence.architect_review_sha256
+    || !terminalFence.critic_review_sha256 || !terminalFence.evidence_bundle_sha256
+    || journal.evidence_bundle_sha256 !== terminalFence.evidence_bundle_sha256)) {
+    return { activation, fence, journal, admin_event: adminEvent, denyProductWrites: false, corruption: 'approved_proven_binding_invalid' };
   }
-  if (fence?.state === 'abandoned' && fence.outcome === 'abandoned' && !adminEvent) {
-    return { activation, fence, journal, admin_event: null, denyProductWrites: true, corruption: 'abandoned_without_journal_or_admin_event' };
+  if (terminalFence?.state === 'abandoned'
+    && !committedJournalMatchesFence(journal, terminalFence)
+    && !adminEvent) {
+    return { activation, fence, journal, admin_event: null, denyProductWrites: false, corruption: 'abandoned_without_matching_journal_or_admin_event' };
   }
-  return { activation, fence, journal, admin_event: adminEvent, denyProductWrites: Boolean(fence && DENY_STATES.has(fence.state)), corruption: null };
+  return { activation, fence, journal, admin_event: adminEvent, denyProductWrites: false, corruption: null };
 }
 
 export async function readCurrentRalplanAdvisory(cwdInput: string, sessionId: string): Promise<AdvisoryProjection | null> {
@@ -609,60 +642,59 @@ export async function readCurrentRalplanAdvisory(cwdInput: string, sessionId: st
   const root = advisoryRoot(cwd, sessionId);
   let current: Record<string, unknown> | null;
   try { current = await readStrictJson(join(root, 'current.json')); }
-  catch { return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'current_corrupt' }; }
+  catch { return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'current_corrupt' }; }
   if (!current) {
     try {
       const rootStat = await stat(root);
-      if (rootStat.isDirectory()) return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'current_missing_with_advisory_state' };
-      return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'advisory_root_not_directory' };
+      if (rootStat.isDirectory()) return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'current_missing_with_advisory_state' };
+      return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'advisory_root_not_directory' };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'current_state_stat_failed' };
+        return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'current_state_stat_failed' };
       }
     }
     return null;
   }
   if (current.schema_version !== 1 || current.session_id !== sessionId || current.canonical_cwd !== cwd
     || typeof current.generation_id !== 'string' || !safeId(current.generation_id)) {
-    return { activation: null as never, fence: null, journal: null, denyProductWrites: true, corruption: 'current_invalid' };
+    return { activation: null as never, fence: null, journal: null, denyProductWrites: false, corruption: 'current_invalid' };
   }
   const projection = await readProjectionForGeneration(cwd, sessionId, current.generation_id);
   const pendingRollover = await readStrictJson(join(root, 'rollover-intent.json')).catch(() => ({ invalid: true }));
   if (pendingRollover) {
-    return { ...projection, denyProductWrites: true, corruption: 'rollover_pending_admin' };
+    return { ...projection, denyProductWrites: false, corruption: 'rollover_pending_admin' };
   }
   if (projection.activation?.generation_id) {
     let bound: Record<string, unknown> | null;
     try {
       bound = await readStrictJson(join(getBaseStateDir(cwd), 'sessions', sessionId, 'ralplan-state.json'));
     } catch {
-      return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_corrupt' };
+      return { ...projection, denyProductWrites: false, corruption: 'generation_mode_binding_corrupt' };
     }
     const canonicalBinding = Boolean(bound && bound.workflow_variant === 'advisory'
       && bound.advisory_generation_id === projection.activation.generation_id);
-    if (bound?.workflow_variant === 'advisory' && bound.active === false && projection.fence?.state === 'released') {
-      const inactiveError = validateAdvisoryInactiveState(bound, projection);
-      if (inactiveError) return { ...projection, denyProductWrites: true, corruption: inactiveError };
-    }
-    if (!projection.fence && (!canonicalBinding || bound?.active !== true)) {
-      return { ...projection, denyProductWrites: true, corruption: 'inactive_without_closeout' };
-    }
     const hasAdvisoryMarkers = Boolean(bound && (
       bound.workflow_variant === 'advisory'
       || Object.prototype.hasOwnProperty.call(bound, 'advisory_generation_id')
       || Object.prototype.hasOwnProperty.call(bound, 'execution_handoff_authorized')
       || Object.prototype.hasOwnProperty.call(bound, 'host_verified')
     ));
-    const genuineStandardRalplan = Boolean(bound && bound.mode === 'ralplan'
-      && !hasAdvisoryMarkers);
-    // A released generation is historical evidence only when the current mode
-    // is provably a standard non-Advisory Ralplan state. Missing, malformed, or
-    // inactive Advisory-marked state remains fail-closed.
-    if (projection.fence && projection.fence.state === 'released' && !canonicalBinding && !genuineStandardRalplan) {
-      return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_missing' };
+    const genuineStandardRalplan = Boolean(bound && bound.mode === 'ralplan' && !hasAdvisoryMarkers);
+    if (projection.fence && ['closed', 'abandoned', 'recovery_required', 'released'].includes(projection.fence.state)) {
+      if (hasAdvisoryMarkers && !canonicalBinding) {
+        return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_missing' };
+      }
+      if (bound?.workflow_variant === 'advisory' && bound.active === false) {
+        const inactiveError = validateAdvisoryInactiveState(bound, projection);
+        if (inactiveError) return { ...projection, denyProductWrites: true, corruption: inactiveError };
+      }
+      if (genuineStandardRalplan || canonicalBinding) return projection;
     }
-    if (projection.fence && projection.fence.state !== 'released' && !canonicalBinding) {
-      return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_missing' };
+    if (!projection.fence && (!canonicalBinding || bound?.active !== true)) {
+      return { ...projection, denyProductWrites: false, corruption: 'inactive_without_closeout' };
+    }
+    if (projection.fence && !canonicalBinding) {
+      return { ...projection, denyProductWrites: false, corruption: 'generation_mode_binding_missing' };
     }
   }
   return projection;
@@ -671,8 +703,7 @@ export async function readCurrentRalplanAdvisory(cwdInput: string, sessionId: st
 function transitionAllowed(from: AdvisoryFenceState, to: AdvisoryFenceState): boolean {
   return (from === 'pending_closeout' && ['recovery_required', 'closed', 'abandoned'].includes(to))
     || (from === 'recovery_required' && to === 'abandoned')
-    || (from === 'closed' && ['abandoned', 'released'].includes(to))
-    || (from === 'abandoned' && ['released'].includes(to));
+    || (from === 'closed' && to === 'abandoned');
 }
 
 async function appendFenceEvent(cwd: string, fence: AdvisoryFence, next: Omit<AdvisoryFence, keyof AdvisoryActivation | 'sequence' | 'previous_event_sha256'>): Promise<AdvisoryFence> {
@@ -690,6 +721,7 @@ async function appendFenceEvent(cwd: string, fence: AdvisoryFence, next: Omit<Ad
 export async function prepareAdvisoryCloseout(input: {
   cwd: string; sessionId: string; generationId: string; closingTurnId: string;
   iteration: number; lifecycle?: AdvisoryReviewLifecycle; nowIso?: string;
+  beforeMutation?: (checkpoint: string) => void | Promise<void>;
 }): Promise<AdvisoryFence> {
   const projection = await readProjectionForGeneration(input.cwd, input.sessionId, input.generationId);
   if (projection.corruption) throw new Error(`ralplan_advisory_${projection.corruption}`);
@@ -721,6 +753,7 @@ export async function prepareAdvisoryCloseout(input: {
     sequence: 0,
   };
   const fencePath = join(generationDir(projection.activation.canonical_cwd, input.sessionId, input.generationId), 'fence.json');
+  await input.beforeMutation?.('fence_create');
   await writeExclusive(fencePath, fence);
   await emitAdvisoryEvent(projection.activation.canonical_cwd, {
     type: 'ralplan_advisory_fence_created', generationId: input.generationId, iteration: input.iteration,
@@ -766,17 +799,17 @@ export interface TerminalizeAdvisoryOptions {
   terminalModeUpdates?: Record<string, unknown>;
   revalidateEvidence?: () => Promise<string | undefined>;
   failpoint?: (name: string) => void | Promise<void>;
+  beforeMutation?: (checkpoint: string) => void | Promise<void>;
   nowIso?: string;
 }
 
 async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOptions): Promise<AdvisoryProjection> {
   const now = options.nowIso ?? new Date().toISOString();
-  const currentMode = await readStrictJson(join(
+  const currentBinding = await readStrictJson(join(
     getBaseStateDir(await canonicalCwd(options.cwd)), 'sessions', options.sessionId, 'ralplan-state.json',
   ));
-  if (!currentMode || currentMode.active !== true
-    || currentMode.workflow_variant !== 'advisory'
-    || currentMode.advisory_generation_id !== options.generationId) {
+  if (!currentBinding || currentBinding.workflow_variant !== 'advisory'
+    || currentBinding.advisory_generation_id !== options.generationId) {
     throw new Error('ralplan_advisory_current_generation_changed');
   }
   if (options.outcome === 'approved' && options.integrityStatus === 'proven'
@@ -816,11 +849,14 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
       options.generationId, options.outcome, options.integrityStatus,
       options.lifecycle?.evidence_bundle_sha256, options.terminalModeUpdates, terminalSkillUpdates, now,
     );
+    await options.beforeMutation?.('journal_prepare');
     await writeAtomic(journalPath, journal);
   }
   await options.failpoint?.('journal-prepare');
   const mark = async (step: JournalStep) => {
-    journal.steps[step] = 'applied'; journal.updated_at = new Date().toISOString(); await writeAtomic(journalPath, journal);
+    journal.steps[step] = 'applied'; journal.updated_at = new Date().toISOString();
+    await options.beforeMutation?.(`journal_step_${step}`);
+    await writeAtomic(journalPath, journal);
     await emitAdvisoryEvent(fence.canonical_cwd, {
       type: 'ralplan_advisory_closeout_step', generationId: fence.generation_id, iteration: fence.iteration,
       transition: 'pending->applied', checkpoint: step, reason: 'closeout_checkpoint_applied',
@@ -835,6 +871,7 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     if (journal.steps[step] === 'applied'
       && await closeoutStepPostcondition(fence.canonical_cwd, options.sessionId, step, journal.terminal_mode_updates, expectedSkill)) continue;
     if ((step === 'session_skill' || step === 'root_skill') && expectedSkill !== undefined) {
+      await options.beforeMutation?.(`mirror_${step}`);
       const base = getBaseStateDir(fence.canonical_cwd);
       const path = step === 'session_skill'
         ? join(base, 'sessions', options.sessionId, 'skill-active-state.json')
@@ -842,6 +879,7 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
       if (expectedSkill === null) await rm(path, { force: true });
       else await writeAtomic(path, expectedSkill);
     } else {
+      await options.beforeMutation?.(`mirror_${step}`);
       await options.applyStep?.(step, journal.terminal_mode_updates, journal.terminal_timestamp);
     }
     if (!await closeoutStepPostcondition(fence.canonical_cwd, options.sessionId, step, journal.terminal_mode_updates, expectedSkill)) {
@@ -857,6 +895,7 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
         transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'evidence_digest_changed',
         path: journalPath, digest: digest ?? options.lifecycle.evidence_bundle_sha256,
       });
+      await options.beforeMutation?.('fence_recovery_required');
       fence = await appendFenceEvent(fence.canonical_cwd, fence, {
         state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
         outcome: journal.outcome, integrity_status: 'unproven', updated_at: journal.terminal_timestamp,
@@ -867,6 +906,7 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
   }
   if (journal.steps.journal_commit !== 'applied') {
     journal.steps.journal_commit = 'applied'; journal.phase = 'committed'; journal.updated_at = new Date().toISOString();
+    await options.beforeMutation?.('journal_commit');
     await writeAtomic(journalPath, journal);
     await emitAdvisoryEvent(fence.canonical_cwd, {
       type: 'ralplan_advisory_closeout_committed', generationId: fence.generation_id, iteration: fence.iteration,
@@ -879,6 +919,7 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     const targetState = terminalState(journal.outcome, journal.integrity_status);
     if (fence.state !== targetState) {
       const priorState = fence.state;
+      await options.beforeMutation?.('fence_terminal');
       fence = await appendFenceEvent(fence.canonical_cwd, fence, {
         state: targetState, closing_turn_id: fence.closing_turn_id,
         iteration: fence.iteration, outcome: journal.outcome, integrity_status: journal.integrity_status,
@@ -891,6 +932,7 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
       });
     }
     journal.steps.fence_terminal = 'applied'; journal.updated_at = new Date().toISOString();
+    await options.beforeMutation?.('journal_fence_terminal');
     await writeAtomic(journalPath, journal); await options.failpoint?.('fence_terminal');
   }
   return readProjectionForGeneration(fence.canonical_cwd, options.sessionId, options.generationId);
@@ -898,32 +940,54 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
 
 export async function terminalizeRalplanAdvisory(options: TerminalizeAdvisoryOptions): Promise<AdvisoryProjection> {
   return withRalplanAdvisoryCurrentLock(options.cwd, options.sessionId, () =>
-    withGenerationLock(options.cwd, options.sessionId, options.generationId, async () => {
-      const current = await readCurrentRalplanAdvisory(options.cwd, options.sessionId);
-      if (!current?.activation || current.activation.generation_id !== options.generationId) {
-        throw new Error('ralplan_advisory_current_generation_changed');
-      }
-      return terminalizeRalplanAdvisoryUnlocked(options);
-    }));
+    withGenerationLock(options.cwd, options.sessionId, options.generationId, () => terminalizeRalplanAdvisoryUnlocked(options)));
 }
 
 /** Replays the stored terminal mode patch after a crash, then completes the
  * journal/fence tail. Every checkpoint is persisted before advancing. */
-async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string): Promise<AdvisoryProjection | null> {
+class AdvisoryLiveBindingConflictError extends Error {
+  constructor(readonly diagnostic: string) {
+    super(diagnostic);
+  }
+}
+
+async function liveAdvisoryBindingConflict(
+  cwd: string,
+  sessionId: string,
+  generationId: string,
+): Promise<string | null> {
+  let binding: Record<string, unknown> | null;
+  try {
+    binding = await readStrictJson(join(getBaseStateDir(cwd), 'sessions', sessionId, 'ralplan-state.json'));
+  } catch {
+    return 'live_session_binding_unreadable';
+  }
+  return binding?.active === true
+    && (binding.workflow_variant !== 'advisory' || binding.advisory_generation_id !== generationId)
+    ? 'live_session_binding_conflict'
+    : null;
+}
+
+async function reconcileRalplanAdvisoryUnlocked(
+  cwd: string,
+  sessionId: string,
+  beforeReplayCheck?: (checkpoint: string) => void | Promise<void>,
+): Promise<AdvisoryProjection | null> {
   const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
   if (!projection || projection.corruption || !projection.fence || !projection.journal) return projection;
   const { fence, journal } = projection;
-  if (fence.state === 'released' || fence.state === 'recovery_required') return projection;
-  // Administrative abandonment is an immutable terminal decision. Its
-  // original closeout journal may still describe the predecessor's approved
-  // outcome; replaying that journal would attempt the invalid abandoned->closed
-  // transition and strand a legitimately releasable history.
-  if (fence.state === 'abandoned' && projection.admin_event) return projection;
+  if (fence.state === 'recovery_required') return projection;
+  const guardReplay = async (checkpoint: string): Promise<void> => {
+    await beforeReplayCheck?.(checkpoint);
+    const conflict = await liveAdvisoryBindingConflict(cwd, sessionId, fence.generation_id);
+    if (conflict) throw new AdvisoryLiveBindingConflictError(conflict);
+  };
   const immutableAdminRecovery = Boolean(projection.admin_event);
   const journalPath = join(generationDir(fence.canonical_cwd, sessionId, fence.generation_id), 'closeout-journal.json');
   let reconciled = false;
   const emitReconciled = async (reason: string): Promise<void> => {
     if (!reconciled) return;
+    await guardReplay('emit_reconciled');
     await emitAdvisoryEvent(fence.canonical_cwd, {
       type: 'ralplan_advisory_closeout_reconciled', generationId: fence.generation_id, iteration: fence.iteration,
       transition: `${fence.state}->${fence.state}`, checkpoint: 'reconcile', reason,
@@ -933,8 +997,10 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
   const mark = async (step: JournalStep): Promise<void> => {
     journal.steps[step] = 'applied';
     journal.updated_at = new Date().toISOString();
+    await guardReplay(`journal_step_${step}`);
     await writeAtomic(journalPath, journal);
     reconciled = true;
+    await guardReplay(`emit_step_${step}`);
     await emitAdvisoryEvent(fence.canonical_cwd, {
       type: 'ralplan_advisory_closeout_step', generationId: fence.generation_id, iteration: fence.iteration,
       transition: 'pending->applied', checkpoint: step, reason: 'reconciled_checkpoint',
@@ -944,7 +1010,13 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
   if (journal.terminal_mode_updates) {
     const canonicalPatch = async (): Promise<void> => {
       const { updateModeState } = await import('../modes/base.js');
-      await updateModeState('ralplan', journal.terminal_mode_updates!, cwd, sessionId);
+      await updateModeState(
+        'ralplan',
+        journal.terminal_mode_updates!,
+        cwd,
+        sessionId,
+        (site) => guardReplay(`mode_commit_${site}`),
+      );
     };
     for (const step of ['session_mode', 'root_mode', 'session_skill', 'root_skill'] as const) {
       const expectedSkill = step === 'session_skill' || step === 'root_skill'
@@ -957,9 +1029,13 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
           const path = step === 'session_skill'
             ? join(base, 'sessions', sessionId, 'skill-active-state.json')
             : join(base, 'skill-active-state.json');
+          await guardReplay(`mirror_${step}`);
           if (expectedSkill === null) await rm(path, { force: true });
           else await writeAtomic(path, expectedSkill);
-        } else await canonicalPatch();
+        } else {
+          await guardReplay(`mirror_${step}`);
+          await canonicalPatch();
+        }
       }
       if (!await closeoutStepPostcondition(cwd, sessionId, step, journal.terminal_mode_updates, expectedSkill)) {
         throw new Error(`ralplan_advisory_reconcile_${step}_postcondition_failed`);
@@ -994,11 +1070,13 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
           },
         });
         if (lifecycle.evidence_bundle_sha256 !== fence.evidence_bundle_sha256) {
+          await guardReplay('emit_digest_mismatch');
           await emitAdvisoryEvent(fence.canonical_cwd, {
             type: 'ralplan_advisory_digest_mismatch', generationId: fence.generation_id, iteration: fence.iteration,
             transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'reconcile_evidence_digest_changed',
             path: journalPath, digest: lifecycle.evidence_bundle_sha256,
           });
+          await guardReplay('fence_recovery_required');
           await appendFenceEvent(fence.canonical_cwd, fence, {
             state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
             outcome: journal.outcome, integrity_status: 'unproven', updated_at: new Date().toISOString(),
@@ -1009,6 +1087,10 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
       await mark('post_digest');
     }
   }
+  if (immutableAdminRecovery) {
+    await emitReconciled('admin_recovery_preserved');
+    return readCurrentRalplanAdvisory(cwd, sessionId);
+  }
   const prerequisiteSteps: JournalStep[] = ['session_mode', 'root_mode', 'session_skill', 'root_skill', 'post_digest'];
   if (!prerequisiteSteps.every((step) => journal.steps[step] === 'applied')) {
     await emitReconciled('partial_closeout_replay');
@@ -1018,8 +1100,10 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
     journal.phase = 'committed';
     journal.steps.journal_commit = 'applied';
     journal.updated_at = new Date().toISOString();
+    await guardReplay('journal_commit');
     await writeAtomic(journalPath, journal);
     reconciled = true;
+    await guardReplay('emit_journal_commit');
     await emitAdvisoryEvent(fence.canonical_cwd, {
       type: 'ralplan_advisory_closeout_committed', generationId: fence.generation_id, iteration: fence.iteration,
       transition: 'prepared->committed', checkpoint: 'journal_commit', reason: 'reconciled_closeout_commit',
@@ -1028,11 +1112,13 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
   }
   const target = terminalState(journal.outcome, journal.integrity_status);
   if (fence.state !== target) {
+    await guardReplay('fence_terminal');
     const terminalFence = await appendFenceEvent(fence.canonical_cwd, fence, {
       state: target, closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
       outcome: journal.outcome, integrity_status: journal.integrity_status, updated_at: journal.terminal_timestamp,
     });
     reconciled = true;
+    await guardReplay('emit_fence_terminal');
     await emitAdvisoryEvent(fence.canonical_cwd, {
       type: 'ralplan_advisory_fence_closed', generationId: fence.generation_id, iteration: fence.iteration,
       transition: `${fence.state}->${target}`, checkpoint: 'fence_terminal', reason: 'reconciled_terminal_fence',
@@ -1042,6 +1128,7 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
   if (journal.steps.fence_terminal !== 'applied') {
     journal.steps.fence_terminal = 'applied';
     journal.updated_at = new Date().toISOString();
+    await guardReplay('journal_fence_terminal');
     await writeAtomic(journalPath, journal);
     reconciled = true;
   }
@@ -1054,6 +1141,7 @@ export async function reconcileRalplanAdvisory(
   sessionId: string,
   authority?: {
     producer: string; threadKind: string; rootThreadId: string; activationTurnId: string;
+    beforeReplayCheck?: (checkpoint: string) => void | Promise<void>;
   },
 ): Promise<AdvisoryProjection | null> {
   const cwdCanonical = await canonicalCwd(cwd);
@@ -1072,8 +1160,23 @@ export async function reconcileRalplanAdvisory(
     await commitBoundActivationIntent(cwdCanonical, sessionId, pending);
   }
   const projection = await readCurrentRalplanAdvisory(cwdCanonical, sessionId);
-  if (!projection?.activation?.generation_id || projection.corruption) return projection;
-  return withGenerationLock(cwd, sessionId, projection.activation.generation_id, () => reconcileRalplanAdvisoryUnlocked(cwd, sessionId));
+  if (!projection?.activation?.generation_id) return projection;
+  const initialConflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
+  if (initialConflict) return { ...projection, corruption: initialConflict };
+  if (projection.corruption) return projection;
+  return withGenerationLock(cwd, sessionId, projection.activation.generation_id, async () => {
+    const conflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
+    if (conflict) return { ...projection, corruption: conflict };
+    try {
+      return await reconcileRalplanAdvisoryUnlocked(cwd, sessionId, authority?.beforeReplayCheck);
+    } catch (error) {
+      if (error instanceof AdvisoryLiveBindingConflictError) {
+        const current = await readCurrentRalplanAdvisory(cwdCanonical, sessionId) ?? projection;
+        return { ...current, corruption: error.diagnostic };
+      }
+      throw error;
+    }
+  });
 }
 
 const EXECUTION_VERBS = /\b(?:implement(?:á|a|e|ar)?|fix(?:e|ear|á)?|correg(?:í|ir|i)|ejecut(?:á|a|e|ar)|corr(?:é|e|er)|build|ship|deploy|aplic(?:á|a|ar)|cre(?:á|a|ar))\b/iu;
@@ -1112,78 +1215,72 @@ export function classifyAdvisoryPrompt(prompt: string): AdvisoryIntent {
   return PRIMARY_EXECUTION_DIRECTIVE.test(text) && EXECUTION_VERBS.test(text) && EXECUTION_ANCHOR.test(text) ? 'execute' : 'unrelated';
 }
 
-export async function releaseAdvisoryFence(input: {
+export async function observeRalplanAdvisoryPrompt(input: {
   cwd: string; sessionId: string; turnId: string; threadId: string; prompt: string;
   producer: 'native' | string; threadKind: 'root-or-drift' | string;
-  isSubagentPromptSubmit: boolean; markedContinuation?: boolean; synthetic?: boolean; requestedLane?: string;
+  isSubagentPromptSubmit: boolean; markedContinuation?: boolean; synthetic?: boolean;
   reservedInput?: string | null;
   activationFailpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer') => void | Promise<void>;
-}): Promise<{ intent: AdvisoryIntent; released: boolean; projection: AdvisoryProjection | null }> {
-  const projection = await reconcileRalplanAdvisory(input.cwd, input.sessionId, {
+}): Promise<{ intent: AdvisoryIntent; projection: AdvisoryProjection | null }> {
+  // Prompt observation is deliberately read-only. In particular, an explicit
+  // execution request must not reconcile state, append an event, or mint any
+  // durable authorization. Lifecycle mutations below are reserved for the
+  // explicit administrative abandon/replan/new-advisory intents.
+  let projection = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
+  if (!projection) return { intent: 'unrelated', projection: null };
+  if (projection.activation?.generation_id) {
+    const bindingConflict = await liveAdvisoryBindingConflict(
+      projection.activation.canonical_cwd,
+      input.sessionId,
+      projection.activation.generation_id,
+    );
+    if (bindingConflict) {
+      return { intent: 'unrelated', projection: { ...projection, corruption: bindingConflict } };
+    }
+  }
+  if (projection.corruption || !projection.fence) return { intent: 'unrelated', projection };
+  if (input.threadId !== projection.activation.root_thread_id) {
+    return { intent: 'unrelated', projection };
+  }
+  if (input.producer !== 'native' || input.isSubagentPromptSubmit
+    || input.markedContinuation || input.synthetic || input.reservedInput || !safeId(input.turnId) || !safeId(input.threadId)
+    || input.turnId === projection.fence.closing_turn_id) {
+    return { intent: 'unrelated', projection };
+  }
+  const intent = classifyAdvisoryPrompt(input.prompt);
+  if (intent === 'execute') {
+    return { intent, projection };
+  }
+  if (intent === 'unrelated') return { intent, projection };
+
+  // Administrative lifecycle intents may mutate durable state, so they require
+  // both the authenticated root classification and the exact current Advisory
+  // session binding. Historical Advisory evidence must stay inert after another
+  // workflow has replaced that binding.
+  if (input.producer !== 'native' || input.threadKind !== 'root-or-drift') {
+    return { intent: 'unrelated', projection };
+  }
+  let binding: Record<string, unknown> | null;
+  try {
+    binding = await readStrictJson(join(getBaseStateDir(projection.activation.canonical_cwd), 'sessions', input.sessionId, 'ralplan-state.json'));
+  } catch {
+    return { intent: 'unrelated', projection };
+  }
+  if (!binding || binding.workflow_variant !== 'advisory'
+    || binding.advisory_generation_id !== projection.activation.generation_id) {
+    return { intent: 'unrelated', projection };
+  }
+
+  projection = await reconcileRalplanAdvisory(input.cwd, input.sessionId, {
     producer: input.producer,
     threadKind: input.threadKind,
     rootThreadId: input.threadId,
     activationTurnId: input.turnId,
-  });
-  if (!projection) return { intent: 'unrelated', released: false, projection: null };
-  if (projection.corruption || !projection.fence) return { intent: 'unrelated', released: false, projection };
-  const fencePath = projection.fence.sequence === 0
-    ? join(generationDir(projection.activation.canonical_cwd, input.sessionId, projection.activation.generation_id), 'fence.json')
-    : join(generationDir(projection.activation.canonical_cwd, input.sessionId, projection.activation.generation_id), `fence-event-${String(projection.fence.sequence).padStart(4, '0')}.json`);
-  const emitDenied = async (reason: string): Promise<void> => {
-    await emitAdvisoryEvent(projection.activation.canonical_cwd, {
-      type: 'ralplan_advisory_release_denied', generationId: projection.activation.generation_id,
-      iteration: projection.fence!.iteration, transition: `${projection.fence!.state}->${projection.fence!.state}`,
-      checkpoint: 'release_classifier', reason, path: fencePath,
-      digest: projection.fence!.evidence_bundle_sha256,
-    });
-  };
-  if (input.producer !== 'native' || input.threadKind !== 'root-or-drift' || input.isSubagentPromptSubmit
-    || input.markedContinuation || input.synthetic || input.reservedInput || !safeId(input.turnId) || !safeId(input.threadId)
-    || input.turnId === projection.fence.closing_turn_id) {
-    await emitDenied('root_execution_authority_rejected');
-    return { intent: 'unrelated', released: false, projection };
-  }
-  const intent = classifyAdvisoryPrompt(input.prompt);
-  if (input.threadId !== projection.activation.root_thread_id) {
-    await emitDenied('root_thread_identity_mismatch');
-    return { intent: 'unrelated', released: false, projection };
-  }
-  if (intent === 'execute' && (projection.fence.state === 'closed' || projection.fence.state === 'abandoned')) {
-    return withRalplanAdvisoryCurrentLock(input.cwd, input.sessionId, () =>
-      withGenerationLock(input.cwd, input.sessionId, projection.activation.generation_id, async () => {
-      const latest = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
-      if (!latest?.activation || latest.activation.generation_id !== projection.activation.generation_id
-        || latest.activation.root_thread_id !== input.threadId
-        || !latest.fence || !['closed', 'abandoned'].includes(latest.fence.state)) {
-        throw new Error('ralplan_advisory_release_generation_changed');
-      }
-      const releasedFence = await appendFenceEvent(latest.activation.canonical_cwd, latest.fence, {
-        state: 'released', closing_turn_id: latest.fence.closing_turn_id, iteration: latest.fence.iteration,
-        release_turn_id: input.turnId, release_thread_id: input.threadId,
-        release_prompt_sha256: sha256(input.prompt), requested_lane: input.requestedLane ?? 'execution',
-        authority_kind: 'new_root_user_execution_request', updated_at: new Date().toISOString(),
-      });
-      await emitAdvisoryEvent(latest.activation.canonical_cwd, {
-        type: 'ralplan_advisory_fence_released', generationId: latest.activation.generation_id,
-        iteration: latest.fence.iteration, transition: `${latest.fence.state}->released`, checkpoint: 'release',
-        reason: 'authenticated_root_execution_directive',
-        path: join(dirname(fencePath), `fence-event-${String(releasedFence.sequence).padStart(4, '0')}.json`),
-        digest: latest.fence.evidence_bundle_sha256,
-      });
-      const verified = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
-      if (!verified || verified.corruption || verified.activation.generation_id !== latest.activation.generation_id
-        || verified.fence?.state !== 'released' || verified.denyProductWrites !== false) {
-        throw new Error(`ralplan_advisory_release_projection_invalid:${verified?.corruption ?? 'missing_or_mismatched'}`);
-      }
-      return { intent, released: true, projection: verified };
-    }));
-  }
+  }) ?? projection;
+  if (projection.corruption || !projection.fence) return { intent: 'unrelated', projection };
   if (intent === 'abandon' && ['recovery_required', 'closed'].includes(projection.fence.state)) {
-    await emitDenied('administrative_abandon_is_not_execution_release');
     return {
       intent,
-      released: false,
       projection: await administrativelyAbandonRalplanAdvisory({
         cwd: input.cwd, sessionId: input.sessionId, generationId: projection.activation.generation_id,
         rootThreadId: input.threadId, turnId: input.turnId,
@@ -1191,13 +1288,8 @@ export async function releaseAdvisoryFence(input: {
     };
   }
   if (intent === 'replan' || intent === 'new_advisory') {
-    if (!safeId(input.turnId)) {
-      await emitDenied('activation_turn_invalid');
-      return { intent, released: false, projection };
-    }
     if (projection.fence.state === 'pending_closeout') {
-      await emitDenied('closeout_still_pending');
-      return { intent: 'unrelated', released: false, projection };
+      return { intent: 'unrelated', projection };
     }
     if (projection.fence.state === 'recovery_required') {
       await administrativelyAbandonRalplanAdvisory({
@@ -1212,23 +1304,22 @@ export async function releaseAdvisoryFence(input: {
       activationPrompt: input.prompt,
       failpoint: input.activationFailpoint,
     });
-    await emitDenied('new_advisory_generation_requested');
-    return { intent, released: false, projection: await readCurrentRalplanAdvisory(input.cwd, input.sessionId) };
+    return { intent, projection: await readCurrentRalplanAdvisory(input.cwd, input.sessionId) };
   }
-  await emitDenied(intent === 'execute' ? 'fence_not_releasable' : 'prompt_not_execution_directive');
-  return { intent, released: false, projection };
+  return { intent, projection };
 }
 
 export async function administrativelyAbandonRalplanAdvisory(input: {
   cwd: string; sessionId: string; generationId: string; rootThreadId: string; turnId: string; nowIso?: string;
   failpoint?: (name: 'after_fence_event' | 'after_admin_event') => void | Promise<void>;
+  beforeMutation?: (checkpoint: string) => void | Promise<void>;
 }): Promise<AdvisoryProjection> {
   if (![input.sessionId, input.generationId, input.rootThreadId, input.turnId].every(safeId)) {
     throw new Error('ralplan_advisory_admin_identity_missing');
   }
   return withGenerationLock(input.cwd, input.sessionId, input.generationId, async () => {
     let projection = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
-    const recoverableMissingAdmin = projection?.corruption === 'abandoned_without_journal_or_admin_event'
+    const recoverableMissingAdmin = projection?.corruption === 'abandoned_without_matching_journal_or_admin_event'
       && projection.fence?.state === 'abandoned';
     if (!projection || (projection.corruption && !recoverableMissingAdmin) || !projection.fence
       || projection.activation.generation_id !== input.generationId
@@ -1254,6 +1345,7 @@ export async function administrativelyAbandonRalplanAdvisory(input: {
       created_at: now,
     };
     if (!alreadyAppended) {
+      await input.beforeMutation?.('admin_fence_event');
       await appendFenceEvent(projection.activation.canonical_cwd, projection.fence, {
         state: 'abandoned', closing_turn_id: projection.fence.closing_turn_id, iteration: projection.fence.iteration,
         outcome: 'abandoned', integrity_status: 'unproven', updated_at: now,
@@ -1261,16 +1353,11 @@ export async function administrativelyAbandonRalplanAdvisory(input: {
       await input.failpoint?.('after_fence_event');
       projection = await readProjectionForGeneration(projection.activation.canonical_cwd, input.sessionId, input.generationId);
     }
+    await input.beforeMutation?.('admin_event');
     await writeExclusive(join(dir, 'admin-event-0001.json'), adminEvent);
     await input.failpoint?.('after_admin_event');
     return readProjectionForGeneration(projection.activation.canonical_cwd, input.sessionId, input.generationId);
   });
-}
-
-export function advisoryFenceBlocksProductWrites(projection: AdvisoryProjection | null): boolean {
-  return projection?.corruption !== null && projection?.corruption !== undefined
-    ? true
-    : projection?.denyProductWrites === true;
 }
 
 export function validateAdvisoryInactiveState(state: Record<string, unknown>, projection: AdvisoryProjection | null): string | null {
