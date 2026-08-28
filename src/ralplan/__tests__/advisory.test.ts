@@ -751,9 +751,8 @@ describe('ralplan advisory fence and journal', () => {
       };
       await writeFile(join(dir, `fence-event-${String(forged.sequence).padStart(4, '0')}.json`), JSON.stringify(forged));
       const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-      assert.equal(projection?.corruption, null);
-      assert.equal(projection?.fence?.state, predecessor.state);
-      assert.equal(projection?.fence?.sequence, predecessor.sequence);
+      assert.equal(projection?.corruption, 'fence_event_chain_invalid');
+      assert.equal(projection?.denyProductWrites, true);
       if (outcome === 'approved') {
         delete forged.critic_review_sha256;
         await writeFile(join(dir, `fence-event-${String(forged.sequence).padStart(4, '0')}.json`), JSON.stringify(forged));

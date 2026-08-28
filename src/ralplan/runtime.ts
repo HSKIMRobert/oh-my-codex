@@ -510,8 +510,15 @@ export async function runRalplanConsensus(
       advisoryGenerationId = requiredAdvisoryIdentity(String(existing.advisory_generation_id ?? ''), 'generation_id');
     } else {
       let prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
-      if (prior?.corruption) {
+      if (prior?.corruption || prior?.fence?.state === 'pending_closeout') {
         prior = await reconcileRalplanAdvisory(cwd, advisorySessionId);
+        if (prior?.fence?.state === 'pending_closeout' && !prior.journal) {
+          await administrativelyAbandonRalplanAdvisory({
+            cwd, sessionId: advisorySessionId, generationId: prior.activation.generation_id,
+            rootThreadId: prior.activation.root_thread_id, turnId: prior.fence.closing_turn_id,
+          });
+          prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
+        }
       }
       if (prior?.corruption) throw new Error(`ralplan_advisory_${prior.corruption}`);
       if (prior && (!prior.fence || !['closed', 'abandoned', 'recovery_required'].includes(prior.fence.state))) {
@@ -528,6 +535,7 @@ export async function runRalplanConsensus(
       });
       advisoryGenerationId = activation.generation_id;
       await writeRalplanState({
+        session_id: advisorySessionId,
         workflow_variant: 'advisory',
         advisory_generation_id: advisoryGenerationId,
         execution_handoff_authorized: false,

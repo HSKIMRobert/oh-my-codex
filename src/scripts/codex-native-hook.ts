@@ -22311,9 +22311,9 @@ export async function dispatchCodexNativeHook(
     && (hookEventName === "SessionStart" || hookEventName === "Stop" || hookEventName === "UserPromptSubmit")
     ? await detectRalplanAdvisoryState(policyCwd, canonicalSessionId)
     : null;
-  let advisoryActivationBlocked = advisoryStateDetection?.status === "normal"
+  let advisoryActivationBlocked = hookEventName === "UserPromptSubmit" && (advisoryStateDetection?.status === "normal"
     || advisoryStateDetection?.status === "missing"
-    || advisoryStateDetection?.status === "unreadable";
+    || advisoryStateDetection?.status === "unreadable");
   if (advisoryStateDetection?.status === "missing" || advisoryStateDetection?.status === "unreadable") {
     allowGlobalSideEffects = false;
   }
@@ -22325,7 +22325,9 @@ export async function dispatchCodexNativeHook(
         || reconciledAdvisory?.corruption === "live_session_binding_unreadable") {
         throw new Error(reconciledAdvisory.corruption);
       }
+      if (reconciledAdvisory?.corruption) allowGlobalSideEffects = false;
     } catch (error) {
+      allowGlobalSideEffects = false;
       const diagnostic = `Ralplan Advisory lifecycle reconciliation reported a non-authoritative diagnostic: ${error instanceof Error ? error.message : String(error)}. It does not grant or deny host tool permission.`;
       if (hookEventName === "SessionStart") {
         advisoryAdditionalContext = diagnostic;
@@ -22441,7 +22443,7 @@ export async function dispatchCodexNativeHook(
         advisoryActivationBlocked = !(
           advisory.projection
           && advisory.projection.corruption === null
-          && advisory.projection.fence?.state === "released"
+          && ["closed", "abandoned"].includes(advisory.projection.fence?.state ?? "")
         );
         if (advisoryActivationBlocked) allowGlobalSideEffects = false;
       } catch (error) {
@@ -22654,7 +22656,8 @@ export async function dispatchCodexNativeHook(
       allowTeamWorkerSideEffects: false,
     });
   }
-  if (hookEventName === "UserPromptSubmit" && !isSubagentPromptSubmit && teamNoticeTargetKey) {
+  if (hookEventName === "UserPromptSubmit" && !isSubagentPromptSubmit && teamNoticeTargetKey
+    && allowGlobalSideEffects && !advisoryActivationBlocked) {
     const reconciled = await reconcileTeamNoticeLedger({ stateRoot: stateDir, targetKey: teamNoticeTargetKey }).catch(() => null);
     if (!reconciled || reconciled.context.length === 0) {
       teamNoticeAdditionalContext = "OMX invalidated this queued Team wake immediately before model input because no active source-proven Team notices remain. Do not infer or reference a removed Team from the generic wake.";
