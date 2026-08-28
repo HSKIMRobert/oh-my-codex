@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { lstat, open, readFile, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { readSubagentTrackingStateStrict } from '../subagents/tracker.js';
 import { pinDirectory as pinPlatformDirectory } from './documented-leader-preflight.js';
@@ -147,6 +147,8 @@ interface CanonicalArtifactPath {
   relative: string;
   ancestry: Array<{ path: string; dev: number; ino: number }>;
   fileIdentity: ArtifactFileIdentity;
+  initialBytes: Buffer;
+  initialBytesCaptured: boolean;
 }
 
 async function canonicalDirectoryIdentity(path: string): Promise<{ path: string; dev: number; ino: number }> {
@@ -210,11 +212,21 @@ async function canonicalArtifactPath(cwd: string, input: string): Promise<Canoni
     ancestry.push(await canonicalDirectoryIdentity(cursor));
   }
   const fileIdentity = await readArtifactFileIdentity(canonical);
+  // Capture a bounded content baseline before any caller interposition. Some
+  // filesystems can preserve nanosecond timestamps across two same-size writes;
+  // identity metadata alone therefore cannot detect that overwrite. The later
+  // descriptor read must match these bytes as well as the pinned identities.
+  const initialBytes = fileIdentity.size <= BigInt(MAX_ARTIFACT_BYTES)
+    ? await readFile(canonical)
+    : Buffer.alloc(0);
+  await assertFileIdentity(canonical, fileIdentity);
   return {
     absolute: canonical,
     relative: rel,
     ancestry,
     fileIdentity,
+    initialBytes,
+    initialBytesCaptured: fileIdentity.size <= BigInt(MAX_ARTIFACT_BYTES),
   };
 }
 
@@ -252,6 +264,9 @@ export async function digestAdvisoryArtifacts(
       await assertFileIdentity(canonical.absolute, canonical.fileIdentity);
       await dependencies.beforePinnedRead?.({ absolute: canonical.absolute, relative: canonical.relative });
       const bytes = await pinned.at(-1)!.readFile(canonical.absolute.slice(dirname(canonical.absolute).length + 1));
+      if (canonical.initialBytesCaptured && !canonical.initialBytes.equals(bytes)) {
+        throw new Error('ralplan_advisory_artifact_changed_during_read');
+      }
       await assertFileIdentity(canonical.absolute, canonical.fileIdentity);
       await Promise.all(canonical.ancestry.map(assertDirectoryIdentity));
       entries.push({

@@ -598,7 +598,12 @@ export async function readCurrentRalplanAdvisory(cwdInput: string, sessionId: st
     if (!projection.fence && (!canonicalBinding || bound?.active !== true)) {
       return { ...projection, denyProductWrites: true, corruption: 'inactive_without_closeout' };
     }
-    if (projection.fence && !canonicalBinding) {
+    // A released generation is historical evidence, not an active execution
+    // fence. Normal Ralplan is allowed to replace the mode state after release;
+    // requiring the old advisory binding here would poison every later run with
+    // generation_mode_binding_missing. Active and otherwise terminal-but-not-
+    // released generations remain bound fail-closed.
+    if (projection.fence && projection.fence.state !== 'released' && !canonicalBinding) {
       return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_missing' };
     }
   }

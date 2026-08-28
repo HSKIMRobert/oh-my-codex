@@ -590,6 +590,30 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(released.projection?.fence?.authority_kind, 'new_root_user_execution_request');
   });
 
+  it('does not let a released historical generation poison a later standard Ralplan state', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    const released = await releaseAdvisoryFence({
+      cwd, sessionId, turnId: 'turn-execute', threadId: 'root-a',
+      prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native',
+      threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    assert.equal(released.released, true);
+
+    // A normal Ralplan run replaces the old advisory-bound mode state.
+    await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), JSON.stringify({
+      active: true, mode: 'ralplan', current_phase: 'planning', session_id: sessionId,
+    }));
+    const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.equal(projection?.fence?.state, 'released');
+    assert.equal(projection?.corruption, null);
+    assert.equal(projection?.denyProductWrites, false);
+  });
+
   it('rolls over with CAS and preserves the predecessor generation', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });

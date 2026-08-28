@@ -10211,7 +10211,19 @@ async function cancelModes(
     if (activeAdvisory?.state.active === true && activeAdvisory.state.workflow_variant === "advisory") {
       if (!currentSessionId) throw new Error("Refusing Advisory cancellation without an authoritative session scope.");
       const { cancelRalplanConsensus } = await import("../ralplan/runtime.js");
-      await cancelRalplanConsensus(cwd);
+      // A detached selection owns a different state root than the source cwd.
+      // Preserve both identities through the runtime cancellation path; using
+      // the implicit source scope can report success while leaving the fence
+      // and detached state untouched.
+      const cancellationCwd = runSelection?.record.run_dir ?? cwd;
+      await cancelRalplanConsensus(cancellationCwd, currentSessionId);
+      const cancelledState = JSON.parse(await readFile(activeAdvisory.path, "utf-8")) as Record<string, unknown>;
+      const { readCurrentRalplanAdvisory } = await import("../ralplan/advisory.js");
+      const cancelledProjection = await readCurrentRalplanAdvisory(cancellationCwd, currentSessionId);
+      if (cancelledState.active === true || cancelledProjection?.fence?.state !== "abandoned"
+        || cancelledProjection.denyProductWrites !== true) {
+        throw new Error("Refusing false-success Advisory cancellation: selected fence remains active or unverifiable.");
+      }
       console.log("Cancelled: ralplan");
       return;
     }
