@@ -13,9 +13,11 @@ import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle, type AdvisoryR
 import {
   administrativelyAbandonRalplanAdvisory,
   activateRalplanAdvisory,
+  isCanonicalInactiveAdvisoryBinding,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
   terminalizeRalplanAdvisory,
+  type AdvisoryProjection,
   type AdvisoryOutcome,
 } from './advisory.js';
 
@@ -141,6 +143,23 @@ export interface RalplanRuntimeResult {
   executionHandoffAuthorized?: false;
   hostVerified?: false;
   returnToCaller?: boolean;
+}
+
+type AdvisoryCatchRecoveryProjection = Pick<AdvisoryProjection, 'corruption'> & {
+  fence: { state: string } | null;
+  journal: { outcome: string } | null;
+};
+
+export function isCompletedAdvisoryCatchRecovery(
+  recovered: AdvisoryCatchRecoveryProjection | null,
+  binding: Record<string, unknown> | null,
+  sessionId: string,
+  generationId: string,
+): boolean {
+  return recovered?.corruption === null
+    && recovered.fence?.state === 'closed'
+    && recovered.journal?.outcome === 'approved'
+    && isCanonicalInactiveAdvisoryBinding(binding, sessionId, generationId);
 }
 
 interface RalplanModeUpdates {
@@ -928,7 +947,8 @@ export async function runRalplanConsensus(
     const message = error instanceof Error ? error.message : String(error);
     if (advisory && advisorySessionId && advisoryGenerationId && advisoryClosingTurnId) {
       const recovered = await reconcileRalplanAdvisory(cwd, advisorySessionId).catch(() => null);
-      if (recovered?.fence?.state === 'closed' && recovered.journal?.outcome === 'approved') {
+      const recoveredBinding = await readModeStateForExplicitSession('ralplan', advisorySessionId, cwd).catch(() => null);
+      if (isCompletedAdvisoryCatchRecovery(recovered, recoveredBinding, advisorySessionId, advisoryGenerationId)) {
         return {
           status: 'completed', iteration, phase: 'complete', planningComplete: true,
           drafts, architectReviews, criticReviews,

@@ -8,7 +8,7 @@ import { readModeState, startMode } from '../../modes/base.js';
 import { getBaseStateDir, getStatePath } from '../../state/paths.js';
 import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
-import { cancelRalplanConsensus, runRalplanConsensus } from '../runtime.js';
+import { cancelRalplanConsensus, isCompletedAdvisoryCatchRecovery, runRalplanConsensus } from '../runtime.js';
 import { readCurrentRalplanAdvisory } from '../advisory.js';
 
 function sessionStatePath(cwd: string, sessionId: string): string {
@@ -335,10 +335,41 @@ describe('ralplan advisory runtime', () => {
       const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
       assert.equal(projection?.journal?.outcome, 'approved');
       assert.equal(projection?.fence?.state, 'closed');
+      assert.equal(result.planningComplete, true);
     } finally {
       if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
       if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_FAILPOINT; else process.env.OMX_RALPLAN_ADVISORY_FAILPOINT = priorFailpoint;
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for every invalid catch recovery projection or binding', () => {
+    const sessionId = 'sess-advisory-runtime-catch';
+    const generationId = 'generation-a';
+    const recovered = {
+      fence: { state: 'closed' },
+      journal: { outcome: 'approved' },
+      corruption: null,
+    };
+    const binding = {
+      mode: 'ralplan', session_id: sessionId, workflow_variant: 'advisory',
+      advisory_generation_id: generationId, active: false,
+    };
+    assert.equal(isCompletedAdvisoryCatchRecovery(recovered, binding, sessionId, generationId), true);
+
+    for (const corruption of [
+      'closed_without_committed_journal', 'admin_event_invalid', 'rollover_pending_admin', 'live_session_binding_conflict',
+    ]) {
+      assert.equal(isCompletedAdvisoryCatchRecovery({ ...recovered, corruption }, binding, sessionId, generationId), false, corruption);
+    }
+    for (const invalidBinding of [
+      null,
+      { ...binding, active: true },
+      { ...binding, session_id: 'other-session' },
+      { ...binding, advisory_generation_id: 'other-generation' },
+      { mode: 'ralplan', session_id: sessionId, workflow_variant: 'advisory', active: false },
+    ]) {
+      assert.equal(isCompletedAdvisoryCatchRecovery(recovered, invalidBinding, sessionId, generationId), false);
     }
   });
 });

@@ -1385,6 +1385,19 @@ export function validateAdvisoryInactiveState(state: Record<string, unknown>, pr
   return null;
 }
 
+export function isCanonicalInactiveAdvisoryBinding(
+  state: Record<string, unknown> | null,
+  sessionId: string,
+  generationId: string,
+): boolean {
+  return Boolean(state
+    && state.mode === 'ralplan'
+    && state.session_id === sessionId
+    && state.workflow_variant === 'advisory'
+    && state.advisory_generation_id === generationId
+    && state.active === false);
+}
+
 /** Internal fence-first write boundary used by the canonical mode writer while
  * a prepared closeout journal is still in progress. Public state_write remains
  * stricter and requires the terminal committed projection above. */
