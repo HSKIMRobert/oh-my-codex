@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -12,19 +13,38 @@ import {
 import {
   administrativelyAbandonRalplanAdvisory,
   activateRalplanAdvisory,
-  advisoryFenceBlocksProductWrites,
   classifyAdvisoryPrompt,
   prepareAdvisoryCloseout,
   ralplanAdvisoryEventsPath,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
-  releaseAdvisoryFence,
+  observeRalplanAdvisoryPrompt,
   terminalizeRalplanAdvisory,
   validateAdvisoryInactiveState,
 } from '../advisory.js';
 import { updateModeState } from '../../modes/base.js';
 
 const roots: string[] = [];
+
+async function snapshotBytes(root: string): Promise<Array<[string, string]>> {
+  const snapshot: Array<[string, string]> = [];
+  const walk = async (directory: string, prefix = ''): Promise<void> => {
+    for (const entry of (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name.endsWith('.lock')) continue;
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        snapshot.push([`${relativePath}/`, 'directory']);
+        await walk(path, relativePath);
+      } else {
+        snapshot.push([relativePath, (await readFile(path)).toString('base64')]);
+      }
+    }
+  };
+  await walk(root);
+  return snapshot;
+}
+
 async function fixture(): Promise<{ cwd: string; sessionId: string; lifecycle: Awaited<ReturnType<typeof projectAdvisoryReviewLifecycle>> }> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-'));
   roots.push(cwd);
@@ -220,7 +240,7 @@ describe('ralplan advisory fence and journal', () => {
     }), /crash/);
     const pending = await readCurrentRalplanAdvisory(cwd, sessionId);
     assert.equal(pending?.fence?.state, 'pending_closeout');
-    assert.equal(advisoryFenceBlocksProductWrites(pending), true);
+    assert.equal(pending?.denyProductWrites, false);
     const complete = await terminalizeRalplanAdvisory({
       cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
       outcome: 'approved', integrityStatus: 'proven', lifecycle,
@@ -259,7 +279,7 @@ describe('ralplan advisory fence and journal', () => {
       outcome: 'approved', integrityStatus: 'unproven',
     });
     assert.equal(recovery.fence?.state, 'recovery_required');
-    assert.equal(recovery.denyProductWrites, true);
+    assert.equal(recovery.denyProductWrites, false);
   });
 
   it('durably abandons recovery state and leaves a canonically valid inactive boundary', async () => {
@@ -271,7 +291,7 @@ describe('ralplan advisory fence and journal', () => {
     });
     const journalPath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a', 'closeout-journal.json');
     const originalJournal = await readFile(journalPath, 'utf8');
-    const abandoned = await releaseAdvisoryFence({
+    const abandoned = await observeRalplanAdvisoryPrompt({
       cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'abandoná el advisory',
       producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
     });
@@ -495,6 +515,49 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(state.advisory_generation_id, 'generation-a');
   });
 
+  it('skips journal and mirror replay when a live standard workflow owns the session, including a binding race', async () => {
+    const prepare = async () => {
+      const prepared = await fixture();
+      const terminalPatch = {
+        active: false, mode: 'ralplan', workflow_variant: 'advisory', advisory_generation_id: 'generation-a',
+        current_phase: 'complete', execution_handoff_authorized: false, host_verified: false,
+      };
+      await assert.rejects(terminalizeRalplanAdvisory({
+        cwd: prepared.cwd, sessionId: prepared.sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'cancelled', integrityStatus: 'proven', terminalModeUpdates: terminalPatch,
+        failpoint: (name) => { if (name === 'journal-prepare') throw new Error('prepared-before-replay'); },
+      }), /prepared-before-replay/);
+      return prepared;
+    };
+    const standardMode = {
+      active: true, mode: 'ralplan', workflow_variant: 'standard', current_phase: 'architect-review',
+      session_id: 'session-a', thread_id: 'root-standard', turn_id: 'turn-standard',
+    };
+
+    const stable = await prepare();
+    const stableModePath = join(stable.cwd, '.omx', 'state', 'sessions', stable.sessionId, 'ralplan-state.json');
+    await writeFile(stableModePath, JSON.stringify(standardMode));
+    const stableBefore = await snapshotBytes(join(stable.cwd, '.omx'));
+    const skipped = await reconcileRalplanAdvisory(stable.cwd, stable.sessionId);
+    assert.equal(skipped?.corruption, 'live_session_binding_conflict');
+    assert.deepEqual(await snapshotBytes(join(stable.cwd, '.omx')), stableBefore);
+
+    const raced = await prepare();
+    const racedModePath = join(raced.cwd, '.omx', 'state', 'sessions', raced.sessionId, 'ralplan-state.json');
+    let afterSwitch: Array<[string, string]> | null = null;
+    const racedResult = await reconcileRalplanAdvisory(raced.cwd, raced.sessionId, {
+      producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      beforeReplayCheck: async (checkpoint) => {
+        if (afterSwitch || checkpoint !== 'mode_commit_mode.primary') return;
+        await writeFile(racedModePath, JSON.stringify(standardMode));
+        afterSwitch = await snapshotBytes(join(raced.cwd, '.omx'));
+      },
+    });
+    assert.equal(racedResult?.corruption, 'live_session_binding_conflict');
+    assert.ok(afterSwitch);
+    assert.deepEqual(await snapshotBytes(join(raced.cwd, '.omx')), afterSwitch);
+  });
+
   it('persists both expected skill projections before mirror steps and never learns later drift', async () => {
     const { cwd, sessionId } = await fixture();
     const stateDir = join(cwd, '.omx', 'state');
@@ -533,13 +596,13 @@ describe('ralplan advisory fence and journal', () => {
     assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'skill-active-state.json'), 'utf8')), stored.terminal_skill_updates.root_skill);
   });
 
-  it('fails closed on current and fence corruption', async () => {
+  it('reports current and lifecycle-event corruption without treating it as valid evidence', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await prepareAdvisoryCloseout({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, lifecycle });
     await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'current.json'), '{bad');
     const result = await readCurrentRalplanAdvisory(cwd, sessionId);
     assert.equal(result?.corruption, 'current_corrupt');
-    assert.equal(advisoryFenceBlocksProductWrites(result), true);
+    assert.equal(result?.denyProductWrites, false);
   });
 
   it('fails closed on absent, unreadable, or mismatched active bindings before closeout', async () => {
@@ -558,7 +621,7 @@ describe('ralplan advisory fence and journal', () => {
       await bindAndCommitActivation(cwd, sessionId, activation);
       await mutate(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'));
       const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-      assert.equal(projection?.denyProductWrites, true);
+      assert.equal(projection?.denyProductWrites, false);
       assert.ok(projection?.corruption, String(index));
     }
   });
@@ -576,47 +639,7 @@ describe('ralplan advisory fence and journal', () => {
     delete forged.critic_review_sha256;
     await writeFile(eventPath, JSON.stringify(forged));
     const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-    assert.equal(projection?.corruption, 'approved_proven_binding_invalid');
-    assert.equal(projection?.denyProductWrites, true);
-  });
-
-  it('releases only from a later native root concrete anchored execution request', async () => {
-    const { cwd, sessionId, lifecycle } = await fixture();
-    await terminalizeRalplanAdvisory({
-      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
-      outcome: 'approved', integrityStatus: 'proven', lifecycle,
-      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
-    });
-    const vague = await releaseAdvisoryFence({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'dale', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
-    assert.equal(vague.released, false);
-    const child = await releaseAdvisoryFence({ cwd, sessionId, turnId: 'turn-c', threadId: 'child', prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: true });
-    assert.equal(child.released, false);
-    const released = await releaseAdvisoryFence({ cwd, sessionId, turnId: 'turn-c', threadId: 'root-a', prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
-    assert.equal(released.released, true);
-    assert.equal(released.projection?.fence?.authority_kind, 'new_root_user_execution_request');
-  });
-
-  it('does not let a released historical generation poison a later standard Ralplan state', async () => {
-    const { cwd, sessionId, lifecycle } = await fixture();
-    await terminalizeRalplanAdvisory({
-      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
-      outcome: 'approved', integrityStatus: 'proven', lifecycle,
-      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
-    });
-    const released = await releaseAdvisoryFence({
-      cwd, sessionId, turnId: 'turn-execute', threadId: 'root-a',
-      prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native',
-      threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
-    });
-    assert.equal(released.released, true);
-
-    // A normal Ralplan run replaces the old advisory-bound mode state.
-    await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), JSON.stringify({
-      active: true, mode: 'ralplan', current_phase: 'planning', session_id: sessionId,
-    }));
-    const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-    assert.equal(projection?.fence?.state, 'released');
-    assert.equal(projection?.corruption, null);
+    assert.equal(projection?.corruption, 'fence_event_chain_invalid');
     assert.equal(projection?.denyProductWrites, false);
 
     // A malformed inactive Advisory-shaped binding is not a standard state and
@@ -688,10 +711,130 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(released.projection?.fence?.state, 'released');
   });
 
+  it('classifies a later execution request without persisting permission or changing terminal evidence', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    const vague = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'dale', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+    assert.equal(vague.intent, 'unrelated');
+    const child = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-c', threadId: 'child', prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: true });
+    assert.equal(child.intent, 'unrelated');
+    const logDir = join(cwd, '.omx', 'logs');
+    await rm(logDir, { recursive: true, force: true });
+    const before = await readCurrentRalplanAdvisory(cwd, sessionId);
+    const beforeBytes = await snapshotBytes(join(cwd, '.omx'));
+    const observed = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-c', threadId: 'root-a', prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+    assert.equal(observed.intent, 'execute');
+    assert.deepEqual(observed.projection?.fence, before?.fence);
+    assert.deepEqual(await snapshotBytes(join(cwd, '.omx')), beforeBytes);
+    await assert.rejects(lstat(logDir), /ENOENT/);
+    const generationDir = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a');
+    await assert.rejects(readFile(join(generationDir, 'release-authority.json')), /ENOENT/);
+  });
+
+  it('keeps administrative intents byte-exactly inert without native root provenance and the matching live Advisory binding', async () => {
+    const cases = [
+      { prompt: 'abandoná el advisory', expected: 'abandon' },
+      { prompt: 'replanificá el plan', expected: 'replan' },
+      { prompt: '$ralplan --advisory nueva versión', expected: 'new_advisory' },
+    ] as const;
+    for (const authorityCase of ['standard_binding', 'unknown_thread', 'generation_mismatch'] as const) {
+      for (const [index, intentCase] of cases.entries()) {
+        const { cwd, sessionId, lifecycle } = await fixture();
+        await terminalizeRalplanAdvisory({
+          cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+          outcome: 'approved', integrityStatus: 'proven', lifecycle,
+          revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+        });
+        const modePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+        if (authorityCase === 'standard_binding') {
+          await writeFile(modePath, JSON.stringify({ active: true, mode: 'ralplan', workflow_variant: 'standard', session_id: sessionId }));
+        } else if (authorityCase === 'generation_mismatch') {
+          await writeFile(modePath, JSON.stringify({ active: false, mode: 'ralplan', workflow_variant: 'advisory', advisory_generation_id: 'generation-other', session_id: sessionId }));
+        }
+        const before = await snapshotBytes(join(cwd, '.omx'));
+        const result = await observeRalplanAdvisoryPrompt({
+          cwd, sessionId, turnId: `turn-admin-${authorityCase}-${index}`, threadId: 'root-a', prompt: intentCase.prompt,
+          producer: 'native', threadKind: authorityCase === 'unknown_thread' ? 'unknown' : 'root-or-drift',
+          isSubagentPromptSubmit: false,
+        });
+        assert.equal(result.intent, 'unrelated', `${authorityCase}:${intentCase.expected}`);
+        assert.deepEqual(await snapshotBytes(join(cwd, '.omx')), before, `${authorityCase}:${intentCase.expected}`);
+      }
+    }
+  });
+
+  it('keeps closed and admin-abandoned terminal evidence audit-complete', async () => {
+    for (const journalMutation of ['delete', 'corrupt'] as const) {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      await terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'approved', integrityStatus: 'proven', lifecycle,
+        revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+      });
+      const dir = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a');
+      if (journalMutation === 'delete') await rm(join(dir, 'closeout-journal.json'));
+      else await writeFile(join(dir, 'closeout-journal.json'), '{');
+      const missing = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(missing?.denyProductWrites, false);
+      assert.match(String(missing?.corruption), journalMutation === 'delete'
+        ? /closed_without_committed_journal/
+        : /fence_or_journal_corrupt/);
+    }
+    for (const adminMutation of ['delete', 'corrupt'] as const) {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      await terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'approved', integrityStatus: 'proven', lifecycle,
+        revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+      });
+      await administrativelyAbandonRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', rootThreadId: 'root-a', turnId: 'turn-admin',
+      });
+      const dir = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a');
+      if (adminMutation === 'delete') await rm(join(dir, 'admin-event-0001.json'));
+      else await writeFile(join(dir, 'admin-event-0001.json'), '{');
+      const corrupt = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(corrupt?.denyProductWrites, false);
+      assert.match(String(corrupt?.corruption), adminMutation === 'delete'
+        ? /abandoned_without_matching_journal_or_admin_event/
+        : /admin_event_corrupt/);
+    }
+  });
+
+  it('ignores forged local release events and preserves the terminal planning projection', async () => {
+    for (const outcome of ['approved', 'cancelled'] as const) {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      const terminal = await terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome, integrityStatus: 'proven', ...(outcome === 'approved' ? { lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 } : {}),
+      });
+      const dir = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a');
+      const predecessor = terminal.fence!;
+      const forged = {
+        ...predecessor,
+        state: 'released',
+        sequence: predecessor.sequence + 1,
+        previous_event_sha256: createHash('sha256').update(`${JSON.stringify(predecessor)}\n`).digest('hex'),
+        release_turn_id: 'turn-forged', release_thread_id: 'root-a',
+        release_prompt_sha256: 'f'.repeat(64), requested_lane: 'execution',
+        authority_kind: 'new_root_user_execution_request', updated_at: '2026-08-28T23:00:00.000Z',
+      };
+      await writeFile(join(dir, `fence-event-${String(forged.sequence).padStart(4, '0')}.json`), JSON.stringify(forged));
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(projection?.corruption, null);
+      assert.equal(projection?.fence?.state, predecessor.state);
+      assert.equal(projection?.fence?.sequence, predecessor.sequence);
+    }
+  });
+
   it('rolls over with CAS and preserves the predecessor generation', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
-    const result = await releaseAdvisoryFence({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'replanificá el plan', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+    const result = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'replanificá el plan', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
     assert.equal(result.intent, 'replan');
     assert.equal(result.projection?.activation.predecessor_generation_id, 'generation-a');
     assert.equal(result.projection?.corruption, 'rollover_pending_admin');
@@ -707,7 +850,7 @@ describe('ralplan advisory fence and journal', () => {
         cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', predecessorGenerationId: 'generation-a',
         failpoint: (name) => { if (name === failpoint) throw new Error(`crash:${name}`); },
       }), /crash/);
-      assert.equal(advisoryFenceBlocksProductWrites(await readCurrentRalplanAdvisory(cwd, sessionId)), true);
+      assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.denyProductWrites, false);
       const intent = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'rollover-intent.json'), 'utf8'));
       const recovered = await bindAndCommitActivation(cwd, sessionId, {
         generation_id: intent.generation_id, root_thread_id: intent.root_thread_id, activation_turn_id: intent.activation_turn_id,
@@ -731,7 +874,7 @@ describe('ralplan advisory fence and journal', () => {
     const reconciled = await reconcileRalplanAdvisory(cwd, sessionId);
     assert.equal(reconciled?.activation.generation_id, 'generation-a');
     assert.equal(reconciled?.corruption, 'rollover_pending_admin');
-    assert.equal(reconciled?.denyProductWrites, true);
+    assert.equal(reconciled?.denyProductWrites, false);
     const stillDenied = await reconcileRalplanAdvisory(cwd, sessionId, {
       producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'attacker-root', activationTurnId: 'turn-b',
     });
@@ -742,8 +885,8 @@ describe('ralplan advisory fence and journal', () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
     const requests = await Promise.allSettled([
-      releaseAdvisoryFence({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: '$ralplan --advisory nuevo advisory', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false }),
-      releaseAdvisoryFence({ cwd, sessionId, turnId: 'turn-c', threadId: 'root-a', prompt: '$ralplan --advisory otro advisory', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false }),
+      observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: '$ralplan --advisory nuevo advisory', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false }),
+      observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-c', threadId: 'root-a', prompt: '$ralplan --advisory otro advisory', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false }),
     ]);
     assert.equal(requests.filter((result) => result.status === 'fulfilled').length, 1);
     assert.equal(requests.filter((result) => result.status === 'rejected').length, 1);
@@ -752,7 +895,7 @@ describe('ralplan advisory fence and journal', () => {
     assert.ok(current?.activation.activation_turn_id === 'turn-b' || current?.activation.activation_turn_id === 'turn-c');
   });
 
-  it('creates a deny-first intent for generation one before activation publication', async () => {
+  it('persists generation-one activation intent before publication without granting authority', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-g1-intent-'));
     roots.push(cwd);
     await assert.rejects(activateRalplanAdvisory({
@@ -760,13 +903,13 @@ describe('ralplan advisory fence and journal', () => {
       failpoint: (name) => { if (name === 'rollover_intent') throw new Error('crash-after-intent'); },
     }), /crash-after-intent/);
     const projection = await readCurrentRalplanAdvisory(cwd, 'session-g1');
-    assert.equal(advisoryFenceBlocksProductWrites(projection), true);
+    assert.equal(projection?.denyProductWrites, false);
     const recovered = await reconcileRalplanAdvisory(cwd, 'session-g1');
     assert.equal(recovered?.corruption, 'current_missing_with_advisory_state');
-    assert.equal(recovered?.denyProductWrites, true);
+    assert.equal(recovered?.denyProductWrites, false);
   });
 
-  it('keeps a published G+1 denied until the session mode is bound to that generation', async () => {
+  it('keeps a published G+1 lifecycle-incomplete until its session mode is bound', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     const stateDir = join(cwd, '.omx', 'state');
     const sessionDir = join(stateDir, 'sessions', sessionId);
@@ -780,7 +923,7 @@ describe('ralplan advisory fence and journal', () => {
     const denied = await readCurrentRalplanAdvisory(cwd, sessionId);
     assert.equal(denied?.activation.generation_id, next.generation_id);
     assert.equal(denied?.corruption, 'rollover_pending_admin');
-    assert.equal(denied?.denyProductWrites, true);
+    assert.equal(denied?.denyProductWrites, false);
     const committed = await bindAndCommitActivation(cwd, sessionId, next);
     assert.equal(committed?.corruption, null);
   });
@@ -788,7 +931,7 @@ describe('ralplan advisory fence and journal', () => {
   it('does not roll over a pending closeout and recovers a dead-process lock', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await prepareAdvisoryCloseout({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, lifecycle });
-    const pending = await releaseAdvisoryFence({
+    const pending = await observeRalplanAdvisoryPrompt({
       cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'replanificá el plan',
       producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
     });
@@ -805,7 +948,7 @@ describe('ralplan advisory fence and journal', () => {
   });
 });
 
-describe('ralplan advisory release classifier', () => {
+describe('ralplan advisory routing classifier', () => {
   it('rejects questions, conditionals, future intent, negations, docs/status, and vague continuations', () => {
     for (const prompt of [
       '¿podés implementar el plan?', 'si todo está bien implementá issue #12', 'más adelante ejecutá test foo',
@@ -847,7 +990,7 @@ describe('ralplan advisory release classifier', () => {
     assert.equal(classifyAdvisoryPrompt('abandoná el advisory'), 'abandon');
   });
 
-  it('emits content-safe structured lifecycle, reconciliation, denial, and release events', async () => {
+  it('emits content-safe structured lifecycle observations without persisting prompt routing', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await assert.rejects(terminalizeRalplanAdvisory({
       cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-close', iteration: 1,
@@ -856,11 +999,11 @@ describe('ralplan advisory release classifier', () => {
       failpoint: (name) => { if (name === 'journal_commit') throw new Error('crash-after-commit'); },
     }), /crash-after-commit/);
     await reconcileRalplanAdvisory(cwd, sessionId);
-    await releaseAdvisoryFence({
+    await observeRalplanAdvisoryPrompt({
       cwd, sessionId, turnId: 'turn-question', threadId: 'root-a', prompt: '¿podés implementarlo?',
       producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
     });
-    await releaseAdvisoryFence({
+    await observeRalplanAdvisoryPrompt({
       cwd, sessionId, turnId: 'turn-execute', threadId: 'root-a', prompt: 'implementá el plan .omx/plans/plan.md',
       producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
     });
@@ -870,9 +1013,9 @@ describe('ralplan advisory release classifier', () => {
     for (const type of [
       'ralplan_advisory_fence_created', 'ralplan_advisory_closeout_step',
       'ralplan_advisory_closeout_committed', 'ralplan_advisory_fence_closed',
-      'ralplan_advisory_closeout_reconciled', 'ralplan_advisory_release_denied',
-      'ralplan_advisory_fence_released',
+      'ralplan_advisory_closeout_reconciled',
     ]) assert.equal(types.has(type), true, type);
+    assert.equal(types.has('ralplan_advisory_routing_observed'), false);
     for (const event of events) {
       assert.equal(event.generation_id, 'generation-a');
       assert.equal(typeof event.state_transition, 'string');

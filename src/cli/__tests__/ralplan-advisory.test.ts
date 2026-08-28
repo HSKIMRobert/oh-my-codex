@@ -83,6 +83,9 @@ describe('ralplan advisory CLI', () => {
     });
     assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.fence?.state, 'closed');
     assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.fence?.closing_turn_id, 'turn-closeout-original');
+    output.length = 0;
+    await ralplanCommand(['advisory', 'complete'], { cwd: () => cwd, stdout: (line) => output.push(line) });
+    assert.equal(output.at(-1), 'Ralplan Advisory complete. Control returned to the caller without an automatic execution handoff; later user instructions follow normal host rules.');
   });
 
   it('rejects all evidence and path arguments', async () => {

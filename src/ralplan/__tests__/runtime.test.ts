@@ -294,6 +294,7 @@ describe('ralplan advisory runtime', () => {
       assert.equal(state.active, false);
       assert.equal(state.workflow_variant, 'advisory');
       assert.equal(state.execution_handoff_authorized, false);
+      assert.equal(state.status_message, 'Status: advisory complete — local review lifecycle approved; control returned to the caller without an automatic execution handoff. Later user instructions follow normal host rules.');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

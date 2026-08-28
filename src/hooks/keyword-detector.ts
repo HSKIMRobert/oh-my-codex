@@ -768,7 +768,9 @@ async function persistStatefulSkillSeedState(
       })
       : null;
     if (prior?.corruption && !pendingRecovery) throw new Error(`ralplan_advisory_${prior.corruption}`);
-    if (!pendingRecovery && prior && prior.fence?.state !== 'released') throw new Error('ralplan_advisory_existing_generation_not_released');
+    if (!pendingRecovery && prior && (!prior.fence || !['closed', 'abandoned', 'recovery_required'].includes(prior.fence.state))) {
+      throw new Error('ralplan_advisory_existing_generation_not_terminal');
+    }
     const activation = pendingRecovery ?? await activateRalplanAdvisory({
       cwd: sourceCwd, sessionId, rootThreadId, activationTurnId,
       ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),

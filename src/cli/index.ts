@@ -6,6 +6,7 @@
 import { execFileSync, spawn } from "child_process";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "path";
 import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
+import type { BigIntStats } from "fs";
 import { access, chmod, copyFile, cp, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash, randomUUID } from "crypto";
@@ -9783,8 +9784,83 @@ interface AuthorizedRunStateSelection {
   refs: ModeStateFileRef[];
   sessionId: string;
   sessionDir: string;
-
+  runCwd: string;
+  treeDirectories: Map<string, DetachedBigintIdentity>;
+  protectedFiles: Map<string, DetachedPinnedFile>;
+  advisoryGenerationDir?: string;
+  advisoryGenerationEntries?: Set<string>;
   record: MadmaxDetachedActiveRecord;
+}
+
+interface DetachedBigintIdentity {
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  nlink: bigint;
+  kind: "directory" | "file";
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+interface DetachedPinnedFile {
+  identity: DetachedBigintIdentity;
+  content: string;
+}
+
+function detachedIdentity(stat: BigIntStats): DetachedBigintIdentity {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    mode: stat.mode,
+    nlink: stat.nlink,
+    kind: stat.isDirectory() ? "directory" : "file",
+    size: stat.size,
+    mtimeNs: stat.mtimeNs,
+    ctimeNs: stat.ctimeNs,
+  };
+}
+
+function detachedIdentityMatches(left: DetachedBigintIdentity, right: DetachedBigintIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+    && left.nlink === right.nlink && left.kind === right.kind && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function detachedDirectoryIdentityMatches(left: DetachedBigintIdentity, right: DetachedBigintIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
+    && left.nlink === right.nlink && left.kind === "directory" && right.kind === "directory";
+}
+
+async function captureDetachedDirectory(path: string): Promise<DetachedBigintIdentity> {
+  const before = await lstat(path, { bigint: true });
+  if (!before.isDirectory() || before.isSymbolicLink() || await realpath(path) !== path) {
+    throw new Error(`detached authority directory is not canonical: ${path}`);
+  }
+  return detachedIdentity(before);
+}
+
+async function readDetachedPinnedFile(path: string): Promise<DetachedPinnedFile> {
+  const before = await lstat(path, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error(`detached authority file is not regular: ${path}`);
+  const handle = await open(path, fsConstants.O_RDONLY | historyNoFollowFlag());
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || !detachedIdentityMatches(detachedIdentity(before), detachedIdentity(opened))) {
+      throw new Error(`detached authority file changed before open: ${path}`);
+    }
+    const content = (await handle.readFile()).toString("utf8");
+    const afterHandle = await handle.stat({ bigint: true });
+    const afterPath = await lstat(path, { bigint: true });
+    const frozen = detachedIdentity(before);
+    if (!detachedIdentityMatches(frozen, detachedIdentity(afterHandle))
+      || !detachedIdentityMatches(frozen, detachedIdentity(afterPath))) {
+      throw new Error(`detached authority file changed during read: ${path}`);
+    }
+    return { identity: frozen, content };
+  } finally {
+    await handle.close();
+  }
 }
 
 function isCanonicalPathWithin(parent: string, child: string, allowEqual = false): boolean {
@@ -9804,7 +9880,7 @@ async function selectAuthorizedHookVisibleRunDirState(cwd: string): Promise<Auth
     return null;
   }
 
-  const candidates: Array<{ sessionDir: string; sessionId: string; record: MadmaxDetachedActiveRecord }> = [];
+  const candidates: AuthorizedRunStateSelection[] = [];
 
   const files = await readdir(activeDir).catch(() => [] as string[]);
   for (const file of files) {
@@ -9823,17 +9899,73 @@ async function selectAuthorizedHookVisibleRunDirState(cwd: string): Promise<Auth
       if (!isCanonicalPathWithin(canonicalRunsRoot, canonicalRunDir)) {
         throw new Error("run directory escapes the authorized runs root");
       }
-      const stateDir = realpathSync(join(canonicalRunDir, ".omx", "state"));
+      const omxDir = join(canonicalRunDir, ".omx");
+      const stateDir = join(omxDir, "state");
+      const sessionsDir = join(stateDir, "sessions");
+      const treeDirectories = new Map<string, DetachedBigintIdentity>();
+      for (const path of [canonicalRunDir, omxDir, stateDir, sessionsDir]) {
+        treeDirectories.set(path, await captureDetachedDirectory(path));
+      }
       if (!isCanonicalPathWithin(canonicalRunDir, stateDir)) {
         throw new Error("state directory escapes the authorized run directory");
       }
-      const session = JSON.parse(await readFile(join(stateDir, "session.json"), "utf-8")) as Record<string, unknown>;
+      const protectedFiles = new Map<string, DetachedPinnedFile>();
+      const pointerPath = join(stateDir, "session.json");
+      const pointer = await readDetachedPinnedFile(pointerPath);
+      protectedFiles.set(pointerPath, pointer);
+      const session = JSON.parse(pointer.content) as Record<string, unknown>;
       if (session.session_id !== record.session_id) throw new Error("run session pointer changed");
-      const sessionDir = realpathSync(join(stateDir, "sessions", record.session_id));
+      const sessionDir = join(sessionsDir, record.session_id);
+      treeDirectories.set(sessionDir, await captureDetachedDirectory(sessionDir));
       if (!isCanonicalPathWithin(stateDir, sessionDir)) {
         throw new Error("session directory escapes the authorized state directory");
       }
-      candidates.push({ sessionDir, sessionId: record.session_id, record });
+      const refs: ModeStateFileRef[] = [];
+      const stateFiles = await readdir(sessionDir).catch(() => [] as string[]);
+      for (const stateFile of stateFiles) {
+        if (!isModeStateFilename(stateFile)) continue;
+        const path = join(sessionDir, stateFile);
+        const snapshot = await readDetachedPinnedFile(path);
+        protectedFiles.set(path, snapshot);
+        refs.push({ mode: stateFile.slice(0, -"-state.json".length), path, scope: "session" });
+      }
+      const advisoryRootPath = join(sessionDir, "ralplan-advisory");
+      let advisoryGenerationDir: string | undefined;
+      let advisoryGenerationEntries: Set<string> | undefined;
+      try {
+        treeDirectories.set(advisoryRootPath, await captureDetachedDirectory(advisoryRootPath));
+        const currentPath = join(advisoryRootPath, "current.json");
+        const current = await readDetachedPinnedFile(currentPath);
+        protectedFiles.set(currentPath, current);
+        const generationId = (JSON.parse(current.content) as Record<string, unknown>).generation_id;
+        if (typeof generationId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(generationId)) {
+          throw new Error("detached Advisory current generation is invalid");
+        }
+        const generationPath = join(advisoryRootPath, generationId);
+        advisoryGenerationDir = generationPath;
+        treeDirectories.set(generationPath, await captureDetachedDirectory(generationPath));
+        advisoryGenerationEntries = new Set(await readdir(generationPath));
+        for (const name of ["fence.json", "closeout-journal.json"] as const) {
+          const path = join(generationPath, name);
+          try { protectedFiles.set(path, await readDetachedPinnedFile(path)); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      candidates.push({
+        refs: refs.sort((a, b) => a.mode.localeCompare(b.mode)),
+        sessionDir,
+        sessionId: record.session_id,
+        runCwd: canonicalRunDir,
+        treeDirectories,
+        protectedFiles,
+        ...(advisoryGenerationDir ? { advisoryGenerationDir } : {}),
+        ...(advisoryGenerationEntries ? { advisoryGenerationEntries } : {}),
+        record,
+      });
     } catch (err) {
       throw new Error(`Refusing cancellation because detached run authority is invalid: ${record.run_dir}.`, { cause: err });
     }
@@ -9841,31 +9973,7 @@ async function selectAuthorizedHookVisibleRunDirState(cwd: string): Promise<Auth
 
   if (candidates.length > 1) throw new Error("Refusing cancellation because multiple detached run authorities match.");
   if (candidates.length === 0) return null;
-  const [{ sessionDir, sessionId, record }] = candidates;
-  const refs: ModeStateFileRef[] = [];
-  const stateFiles = await readdir(sessionDir).catch(() => [] as string[]);
-  for (const file of stateFiles) {
-    if (!isModeStateFilename(file)) continue;
-    const path = join(sessionDir, file);
-    try {
-      const fileStat = lstatSync(path);
-      if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
-        throw new Error(`Refusing cancellation through non-regular run state target: ${path}.`);
-      }
-      const canonicalFile = realpathSync(path);
-      if (!isCanonicalPathWithin(sessionDir, canonicalFile)) {
-        throw new Error(`Refusing cancellation outside authorized run session: ${path}.`);
-      }
-      refs.push({
-        mode: file.slice(0, -"-state.json".length),
-        path: canonicalFile,
-        scope: "session",
-      });
-    } catch (err) {
-      throw new Error(`Refusing cancellation because detached run state authority is invalid: ${path}.`, { cause: err });
-    }
-  }
-  return { refs: refs.sort((a, b) => a.mode.localeCompare(b.mode)), sessionId, sessionDir, record };
+  return candidates[0];
 }
 
 function assertCancellationAuthorityPath(baseStateDir: string, authorityRoot: string): string {
@@ -10074,6 +10182,7 @@ async function cancelModes(
       refs: ModeStateFileRef[],
       authorityRoot: string,
       ownerIds: Set<string> = expectedOwnerIds,
+      pinnedFiles?: Map<string, DetachedPinnedFile>,
     ) => {
       const loaded = new Map<
         string,
@@ -10092,17 +10201,18 @@ async function cancelModes(
         authorityRoot,
       );
       for (const ref of refs) {
-        const fileStat = lstatSync(ref.path);
-        if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+        const pinned = pinnedFiles?.get(ref.path);
+        const fileStat = pinned ? null : lstatSync(ref.path);
+        if (fileStat && (!fileStat.isFile() || fileStat.isSymbolicLink())) {
           throw new Error(`Refusing cancellation through non-regular state target ${ref.path}.`);
         }
-        const canonicalPath = realpathSync(ref.path);
+        const canonicalPath = pinned ? ref.path : realpathSync(ref.path);
         const canonicalParent = realpathSync(dirname(ref.path));
         if (!isCanonicalPathWithin(canonicalAuthorityRoot, canonicalParent, true)
           || !isCanonicalPathWithin(canonicalAuthorityRoot, canonicalPath)) {
           throw new Error(`Refusing cancellation outside authorized state root: ${ref.path}.`);
         }
-        const content = await readFile(canonicalPath, "utf-8");
+        const content = pinned?.content ?? await readFile(canonicalPath, "utf-8");
         let parsedState: Record<string, unknown>;
         try {
           const parsed = JSON.parse(content) as unknown;
@@ -10160,8 +10270,8 @@ async function cancelModes(
           scope: ref.scope,
           state: parsedState,
           originalContent: content,
-          dev: fileStat.dev,
-          ino: fileStat.ino,
+          dev: pinned ? Number(pinned.identity.dev) : fileStat!.dev,
+          ino: pinned ? Number(pinned.identity.ino) : fileStat!.ino,
         });
       }
       return loaded;
@@ -10198,12 +10308,22 @@ async function cancelModes(
       runSelection = await selectAuthorizedHookVisibleRunDirState(cwd);
       if (runSelection) {
         const runOwnerIds = new Set([runSelection.sessionId]);
-        const runDirStates = await loadStates(runSelection.refs, runSelection.sessionDir, runOwnerIds);
+        const runDirStates = await loadStates(
+          runSelection.refs,
+          runSelection.sessionDir,
+          runOwnerIds,
+          runSelection.protectedFiles,
+        );
         if (hasActiveWorkflowMode(runDirStates)) states = runDirStates;
         else runSelection = null;
       }
     }
 
+    const assertRunAuthority = (): void => {
+      if (runSelection && !hasMatchingMadmaxDetachedRuntimeBinding(runSelection.record)) {
+        throw new Error("Refusing cancellation because detached run authority changed.");
+      }
+    };
 
     const currentSessionId = writableScope.sessionId ?? runSelection?.sessionId ?? "";
 
@@ -10211,19 +10331,118 @@ async function cancelModes(
     if (activeAdvisory?.state.active === true && activeAdvisory.state.workflow_variant === "advisory") {
       if (!currentSessionId) throw new Error("Refusing Advisory cancellation without an authoritative session scope.");
       const { cancelRalplanConsensus } = await import("../ralplan/runtime.js");
-      // A detached selection owns a different state root than the source cwd.
-      // Preserve both identities through the runtime cancellation path; using
-      // the implicit source scope can report success while leaving the fence
-      // and detached state untouched.
-      const cancellationCwd = runSelection?.record.run_dir ?? cwd;
-      await cancelRalplanConsensus(cancellationCwd, currentSessionId);
-      const cancelledState = JSON.parse(await readFile(activeAdvisory.path, "utf-8")) as Record<string, unknown>;
-      const { readCurrentRalplanAdvisory } = await import("../ralplan/advisory.js");
-      const cancelledProjection = await readCurrentRalplanAdvisory(cancellationCwd, currentSessionId);
-      if (cancelledState.active === true || cancelledProjection?.fence?.state !== "abandoned"
-        || cancelledProjection.denyProductWrites !== true) {
-        throw new Error("Refusing false-success Advisory cancellation: selected fence remains active or unverifiable.");
-      }
+      const cancellationCwd = runSelection ? runSelection.runCwd : cwd;
+      let expectedModeIdentity = runSelection?.protectedFiles.get(activeAdvisory.path)?.identity;
+      let expectedModeContent = activeAdvisory.originalContent;
+      let sessionModeMutationPending = false;
+      const pendingProtectedMutations = new Set<string>();
+      const revalidateDetachedAdvisoryAuthority = runSelection
+          ? async (checkpoint: string): Promise<void> => {
+            if (checkpoint === "mirror_session_mode" || checkpoint === "cancel_mode_update"
+              || checkpoint === "mode_update_complete") {
+              sessionModeMutationPending = true;
+            }
+            assertRunAuthority();
+            const stateDir = dirname(dirname(runSelection!.sessionDir));
+            for (const [path, frozen] of runSelection!.treeDirectories) {
+              let current: DetachedBigintIdentity;
+              try { current = await captureDetachedDirectory(path); }
+              catch (error) {
+                throw new Error(`Refusing cancellation because detached directory is no longer canonical: ${path}.`, { cause: error });
+              }
+              if (!detachedDirectoryIdentityMatches(frozen, current)) {
+                const isGeneration = path === runSelection!.advisoryGenerationDir;
+                const stableObject = frozen.dev === current.dev && frozen.ino === current.ino
+                  && frozen.mode === current.mode && frozen.kind === current.kind;
+                if (isGeneration && stableObject && runSelection!.advisoryGenerationEntries) {
+                  const entries = new Set(await readdir(path));
+                  const allowed = [...entries].every((entry) => runSelection!.advisoryGenerationEntries!.has(entry)
+                    || entry === "generation.lock" || entry === "fence.json" || entry === "closeout-journal.json"
+                    || entry === "admin-event-0001.json"
+                    || /^fence-event-[0-9]{4}\.json$/.test(entry));
+                  if (allowed) {
+                    runSelection!.advisoryGenerationEntries = entries;
+                    runSelection!.treeDirectories.set(path, current);
+                    continue;
+                  }
+                }
+                if (stableObject) {
+                  runSelection!.treeDirectories.set(path, current);
+                  continue;
+                }
+                throw new Error(`Refusing cancellation because detached directory identity changed at ${checkpoint}: ${path}.`);
+              }
+            }
+            const pointerPath = join(stateDir, "session.json");
+            const pointerSnapshot = await readDetachedPinnedFile(pointerPath);
+            const frozenPointer = runSelection!.protectedFiles.get(pointerPath);
+            if (!frozenPointer || !detachedIdentityMatches(frozenPointer.identity, pointerSnapshot.identity)
+              || frozenPointer.content !== pointerSnapshot.content) {
+              throw new Error("Refusing cancellation because detached session pointer changed.");
+            }
+            const pointer = JSON.parse(pointerSnapshot.content) as Record<string, unknown>;
+            if (pointer.session_id !== currentSessionId) {
+              throw new Error("Refusing cancellation because detached session authority changed.");
+            }
+            for (const [path, frozen] of [...runSelection!.protectedFiles]) {
+              if (path === pointerPath || path === activeAdvisory.path) continue;
+              const snapshot = await readDetachedPinnedFile(path);
+              if (!detachedIdentityMatches(frozen.identity, snapshot.identity) || frozen.content !== snapshot.content) {
+                if (!pendingProtectedMutations.delete(path)) {
+                  throw new Error(`Refusing cancellation because detached protected state changed: ${path}.`);
+                }
+                runSelection!.protectedFiles.set(path, snapshot);
+              }
+            }
+            if (runSelection!.advisoryGenerationDir) {
+              for (const name of ["fence.json", "closeout-journal.json"] as const) {
+                const path = join(runSelection!.advisoryGenerationDir, name);
+                if (runSelection!.protectedFiles.has(path) || !pendingProtectedMutations.has(path)) continue;
+                try {
+                  runSelection!.protectedFiles.set(path, await readDetachedPinnedFile(path));
+                  pendingProtectedMutations.delete(path);
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                }
+              }
+            }
+            const modeSnapshot = await readDetachedPinnedFile(activeAdvisory.path);
+            const content = modeSnapshot.content;
+            if (!expectedModeIdentity) throw new Error("Refusing cancellation without a pinned detached Ralplan state.");
+            if (sessionModeMutationPending) {
+              const stillOriginal = detachedIdentityMatches(modeSnapshot.identity, expectedModeIdentity)
+                && content === expectedModeContent;
+              if (!stillOriginal) {
+                const parsed = JSON.parse(content) as Record<string, unknown>;
+                if (parsed.mode !== "ralplan" || parsed.workflow_variant !== "advisory"
+                  || parsed.advisory_generation_id !== activeAdvisory.state.advisory_generation_id
+                  || parsed.session_id !== currentSessionId || parsed.active !== false) {
+                  throw new Error("Refusing cancellation because detached Advisory mode mutation was not canonical.");
+                }
+                expectedModeIdentity = modeSnapshot.identity;
+                expectedModeContent = content;
+                sessionModeMutationPending = false;
+              }
+            } else if (!detachedIdentityMatches(modeSnapshot.identity, expectedModeIdentity) || content !== expectedModeContent) {
+              throw new Error(`Refusing cancellation because detached Ralplan state changed at ${checkpoint}.`);
+            }
+            if (runSelection!.advisoryGenerationDir) {
+              const fencePath = join(runSelection!.advisoryGenerationDir, "fence.json");
+              const journalPath = join(runSelection!.advisoryGenerationDir, "closeout-journal.json");
+              if (["fence_create", "fence_recovery_required", "fence_terminal", "admin_fence_event"].includes(checkpoint)) {
+                pendingProtectedMutations.add(fencePath);
+              }
+              if (checkpoint === "journal_prepare" || checkpoint.startsWith("journal_step_")
+                || checkpoint === "journal_commit" || checkpoint === "journal_fence_terminal") {
+                pendingProtectedMutations.add(journalPath);
+              }
+            }
+          }
+        : undefined;
+      const cancelled = await cancelRalplanConsensus(cancellationCwd, currentSessionId, {
+        revalidateAuthority: revalidateDetachedAdvisoryAuthority,
+      });
+      if (!cancelled) throw new Error("Refusing false Advisory cancellation success: the selected generation was not terminalized.");
       console.log("Cancelled: ralplan");
       return;
     }
@@ -10334,12 +10553,6 @@ async function cancelModes(
         if (entry.state.active === true) cancelMode(mode, "cancelled", true);
       }
     }
-
-    const assertRunAuthority = (): void => {
-      if (runSelection && !hasMatchingMadmaxDetachedRuntimeBinding(runSelection.record)) {
-        throw new Error("Refusing cancellation because detached run authority changed.");
-      }
-    };
 
     if (force && currentSessionId) {
       const stopStateEntries = [...states.entries()].filter(([mode]) => mode === "native-stop");
