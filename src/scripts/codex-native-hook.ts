@@ -22550,13 +22550,27 @@ export async function dispatchCodexNativeHook(
     ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects && allowGlobalSideEffects
       ? await applyUserPromptUltragoalSteering(cwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
-    let suppressActivationSeeding = !allowImplicitSessionSideEffects || !allowGlobalSideEffects;
+    // An explicit independent payload session is safe to seed in its own
+    // session-scoped state even when global side effects (HUD/root mirrors) are
+    // suppressed because a stale selected pointer exists.
+    let suppressActivationSeeding = !allowImplicitSessionSideEffects
+      || (promptTurnContext?.status === "authorized"
+        && promptTurnContext.authorization.targetRelation !== "explicit-independent"
+        && !allowGlobalSideEffects);
     if (promptTurnContext?.status === "authorized") {
       sessionIdForState = promptTurnContext.authorization.targetSessionId;
     } else if (prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects) {
       const rawHookSessionId = canonicalSessionId || nativeSessionId;
       const normalizedHookSessionId = normalizeSessionId(rawHookSessionId);
-      const explicitHookSessionId = currentSessionState ? undefined : normalizedHookSessionId;
+      // An explicit payload session must win over a stale selected pointer.
+      // Preserve the pointer only for its authenticated session/native alias;
+      // otherwise seed state in the payload's session rather than silently
+      // mutating the selected session.
+      const explicitHookSessionId = currentSessionState
+        && normalizedHookSessionId
+        && payloadMatchesSessionPointer(normalizedHookSessionId, currentSessionState)
+        ? undefined
+        : normalizedHookSessionId;
       if (rawHookSessionId && !normalizedHookSessionId) {
         suppressActivationSeeding = true;
       } else {
