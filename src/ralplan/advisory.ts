@@ -296,6 +296,41 @@ function completeLifecycleBinding(lifecycle: AdvisoryReviewLifecycle | undefined
       .every((value) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value)));
 }
 
+const RELEASE_BOUND_FIELDS = [
+  'iteration_id', 'plan_manifest_sha256', 'architect_review_sha256',
+  'critic_review_sha256', 'evidence_bundle_sha256', 'outcome', 'integrity_status',
+] as const;
+
+function validProvenClosedBinding(fence: Record<string, unknown>, journal: Record<string, unknown> | null): boolean {
+  return fence.state === 'closed'
+    && fence.outcome === 'approved'
+    && fence.integrity_status === 'proven'
+    && Boolean(journal && journalValid(journal, String(fence.generation_id)))
+    && journal?.phase === 'committed'
+    && journal.outcome === 'approved'
+    && journal.integrity_status === 'proven'
+    && typeof journal.evidence_bundle_sha256 === 'string'
+    && journal.evidence_bundle_sha256 === fence.evidence_bundle_sha256
+    && RELEASE_BOUND_FIELDS.slice(0, 5).every((field) => typeof fence[field] === 'string' && /^[a-f0-9]{64}$/i.test(fence[field] as string));
+}
+
+function validReleaseEvent(
+  event: Record<string, unknown>,
+  predecessor: Record<string, unknown>,
+  journal: Record<string, unknown> | null,
+): boolean {
+  if (event.state !== 'released' || !['closed', 'abandoned'].includes(String(predecessor.state))) return false;
+  if (typeof event.release_turn_id !== 'string' || !safeId(event.release_turn_id)
+    || typeof event.release_thread_id !== 'string' || !safeId(event.release_thread_id)
+    || typeof event.release_prompt_sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(event.release_prompt_sha256)
+    || typeof event.requested_lane !== 'string' || event.requested_lane.trim() === '') return false;
+  if (!RELEASE_BOUND_FIELDS.slice(0, 5).every((field) => event[field] === undefined
+    || (typeof event[field] === 'string' && /^[a-f0-9]{64}$/i.test(event[field] as string)))) return false;
+  if (!RELEASE_BOUND_FIELDS.every((field) => event[field] === predecessor[field])) return false;
+  if (predecessor.state === 'closed') return validProvenClosedBinding(predecessor as unknown as Record<string, unknown>, journal);
+  return predecessor.outcome === 'abandoned' && predecessor.integrity_status === 'unproven';
+}
+
 async function canonicalCwd(cwd: string): Promise<string> {
   return realpath(cwd);
 }
@@ -334,6 +369,15 @@ async function withCurrentLock<T>(root: string, work: () => Promise<T>): Promise
   const lock = await acquireAdvisoryLock(lockPath, root, 'ralplan_advisory_current_lock_held');
   try { return await work(); }
   finally { await lock.close().catch(() => {}); await rm(lockPath, { force: true }); await syncDirectory(root).catch(() => {}); }
+}
+
+export async function withRalplanAdvisoryCurrentLock<T>(
+  cwd: string,
+  sessionId: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const canonical = await canonicalCwd(cwd);
+  return withCurrentLock(advisoryRoot(canonical, sessionId), work);
 }
 
 async function withGenerationLock<T>(cwd: string, sessionId: string, generationId: string, work: () => Promise<T>): Promise<T> {
@@ -507,6 +551,7 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
   }
   let sequence = fence?.sequence ?? -1;
   let priorDigest = fence ? sha256(`${JSON.stringify(fence)}\n`) : undefined;
+  let abandonedPredecessorBytes: Buffer | null = null;
   for (let index = 1; ; index += 1) {
     let event: Record<string, unknown> | null;
     try { event = await readStrictJson(join(dir, `fence-event-${String(index).padStart(4, '0')}.json`)); }
@@ -514,10 +559,12 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
     if (!event) break;
     if (!fence || !fenceValid(event, activation) || event.sequence !== sequence + 1 || event.previous_event_sha256 !== priorDigest
       || !transitionAllowed(fence.state, event.state as AdvisoryFenceState)
-      || (event.state === 'released' && (event.authority_kind !== 'new_root_user_execution_request'
-        || typeof event.release_turn_id !== 'string' || typeof event.release_thread_id !== 'string'
-        || typeof event.release_prompt_sha256 !== 'string' || typeof event.requested_lane !== 'string'))) {
+      || (event.state === 'released' && !validReleaseEvent(event, fence as unknown as Record<string, unknown>, journalRaw))) {
       return { activation, fence, journal: null, denyProductWrites: true, corruption: 'fence_event_chain_invalid' };
+    }
+    if (event.state === 'abandoned') {
+      const predecessorPath = index === 1 ? join(dir, 'fence.json') : join(dir, `fence-event-${String(index - 1).padStart(4, '0')}.json`);
+      abandonedPredecessorBytes = await readFile(predecessorPath).catch(() => null);
     }
     fence = event as unknown as AdvisoryFence;
     sequence = fence.sequence;
@@ -529,9 +576,7 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
   try { adminRaw = await readStrictJson(join(dir, 'admin-event-0001.json')); }
   catch { return { activation, fence, journal, denyProductWrites: true, corruption: 'admin_event_corrupt' }; }
   const adminEvent = adminRaw as unknown as AdvisoryAdminEvent | null;
-  const priorFenceBytes = adminRaw && fence
-    ? await readFile(join(dir, fence.sequence === 1 ? 'fence.json' : `fence-event-${String(fence.sequence - 1).padStart(4, '0')}.json`)).catch(() => null)
-    : null;
+  const priorFenceBytes = adminRaw ? abandonedPredecessorBytes : null;
   const journalBytes = adminRaw && journal ? await readFile(join(dir, 'closeout-journal.json')).catch(() => null) : null;
   if (adminRaw && (adminRaw.schema_version !== 1 || adminRaw.action !== 'abandon'
     || adminRaw.generation_id !== generationId || adminRaw.session_id !== sessionId
@@ -539,7 +584,7 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
     || typeof adminRaw.turn_id !== 'string' || !safeId(adminRaw.turn_id)
     || typeof adminRaw.created_at !== 'string' || typeof adminRaw.prior_fence_sha256 !== 'string'
     || (adminRaw.prior_journal_sha256 !== undefined && typeof adminRaw.prior_journal_sha256 !== 'string')
-    || fence?.state !== 'abandoned' || !priorFenceBytes || sha256(priorFenceBytes) !== adminRaw.prior_fence_sha256
+    || !['abandoned', 'released'].includes(String(fence?.state)) || !priorFenceBytes || sha256(priorFenceBytes) !== adminRaw.prior_fence_sha256
     || (journalBytes ? sha256(journalBytes) : undefined) !== adminRaw.prior_journal_sha256)) {
     return { activation, fence, journal, admin_event: null, denyProductWrites: true, corruption: 'admin_event_invalid' };
   }
@@ -595,14 +640,27 @@ export async function readCurrentRalplanAdvisory(cwdInput: string, sessionId: st
     }
     const canonicalBinding = Boolean(bound && bound.workflow_variant === 'advisory'
       && bound.advisory_generation_id === projection.activation.generation_id);
+    if (bound?.workflow_variant === 'advisory' && bound.active === false && projection.fence?.state === 'released') {
+      const inactiveError = validateAdvisoryInactiveState(bound, projection);
+      if (inactiveError) return { ...projection, denyProductWrites: true, corruption: inactiveError };
+    }
     if (!projection.fence && (!canonicalBinding || bound?.active !== true)) {
       return { ...projection, denyProductWrites: true, corruption: 'inactive_without_closeout' };
     }
-    // A released generation is historical evidence, not an active execution
-    // fence. Normal Ralplan is allowed to replace the mode state after release;
-    // requiring the old advisory binding here would poison every later run with
-    // generation_mode_binding_missing. Active and otherwise terminal-but-not-
-    // released generations remain bound fail-closed.
+    const hasAdvisoryMarkers = Boolean(bound && (
+      bound.workflow_variant === 'advisory'
+      || Object.prototype.hasOwnProperty.call(bound, 'advisory_generation_id')
+      || Object.prototype.hasOwnProperty.call(bound, 'execution_handoff_authorized')
+      || Object.prototype.hasOwnProperty.call(bound, 'host_verified')
+    ));
+    const genuineStandardRalplan = Boolean(bound && bound.mode === 'ralplan'
+      && !hasAdvisoryMarkers);
+    // A released generation is historical evidence only when the current mode
+    // is provably a standard non-Advisory Ralplan state. Missing, malformed, or
+    // inactive Advisory-marked state remains fail-closed.
+    if (projection.fence && projection.fence.state === 'released' && !canonicalBinding && !genuineStandardRalplan) {
+      return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_missing' };
+    }
     if (projection.fence && projection.fence.state !== 'released' && !canonicalBinding) {
       return { ...projection, denyProductWrites: true, corruption: 'generation_mode_binding_missing' };
     }
@@ -713,6 +771,14 @@ export interface TerminalizeAdvisoryOptions {
 
 async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOptions): Promise<AdvisoryProjection> {
   const now = options.nowIso ?? new Date().toISOString();
+  const currentMode = await readStrictJson(join(
+    getBaseStateDir(await canonicalCwd(options.cwd)), 'sessions', options.sessionId, 'ralplan-state.json',
+  ));
+  if (!currentMode || currentMode.active !== true
+    || currentMode.workflow_variant !== 'advisory'
+    || currentMode.advisory_generation_id !== options.generationId) {
+    throw new Error('ralplan_advisory_current_generation_changed');
+  }
   if (options.outcome === 'approved' && options.integrityStatus === 'proven'
     && (!completeLifecycleBinding(options.lifecycle) || !options.revalidateEvidence)) {
     throw new Error('ralplan_advisory_approved_proven_requires_complete_lifecycle_and_revalidation');
@@ -831,7 +897,14 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
 }
 
 export async function terminalizeRalplanAdvisory(options: TerminalizeAdvisoryOptions): Promise<AdvisoryProjection> {
-  return withGenerationLock(options.cwd, options.sessionId, options.generationId, () => terminalizeRalplanAdvisoryUnlocked(options));
+  return withRalplanAdvisoryCurrentLock(options.cwd, options.sessionId, () =>
+    withGenerationLock(options.cwd, options.sessionId, options.generationId, async () => {
+      const current = await readCurrentRalplanAdvisory(options.cwd, options.sessionId);
+      if (!current?.activation || current.activation.generation_id !== options.generationId) {
+        throw new Error('ralplan_advisory_current_generation_changed');
+      }
+      return terminalizeRalplanAdvisoryUnlocked(options);
+    }));
 }
 
 /** Replays the stored terminal mode patch after a crash, then completes the
@@ -841,6 +914,11 @@ async function reconcileRalplanAdvisoryUnlocked(cwd: string, sessionId: string):
   if (!projection || projection.corruption || !projection.fence || !projection.journal) return projection;
   const { fence, journal } = projection;
   if (fence.state === 'released' || fence.state === 'recovery_required') return projection;
+  // Administrative abandonment is an immutable terminal decision. Its
+  // original closeout journal may still describe the predecessor's approved
+  // outcome; replaying that journal would attempt the invalid abandoned->closed
+  // transition and strand a legitimately releasable history.
+  if (fence.state === 'abandoned' && projection.admin_event) return projection;
   const immutableAdminRecovery = Boolean(projection.admin_event);
   const journalPath = join(generationDir(fence.canonical_cwd, sessionId, fence.generation_id), 'closeout-journal.json');
   let reconciled = false;
@@ -1067,21 +1145,39 @@ export async function releaseAdvisoryFence(input: {
     return { intent: 'unrelated', released: false, projection };
   }
   const intent = classifyAdvisoryPrompt(input.prompt);
+  if (input.threadId !== projection.activation.root_thread_id) {
+    await emitDenied('root_thread_identity_mismatch');
+    return { intent: 'unrelated', released: false, projection };
+  }
   if (intent === 'execute' && (projection.fence.state === 'closed' || projection.fence.state === 'abandoned')) {
-    const releasedFence = await appendFenceEvent(projection.activation.canonical_cwd, projection.fence, {
-      state: 'released', closing_turn_id: projection.fence.closing_turn_id, iteration: projection.fence.iteration,
-      release_turn_id: input.turnId, release_thread_id: input.threadId,
-      release_prompt_sha256: sha256(input.prompt), requested_lane: input.requestedLane ?? 'execution',
-      authority_kind: 'new_root_user_execution_request', updated_at: new Date().toISOString(),
-    });
-    await emitAdvisoryEvent(projection.activation.canonical_cwd, {
-      type: 'ralplan_advisory_fence_released', generationId: projection.activation.generation_id,
-      iteration: projection.fence.iteration, transition: `${projection.fence.state}->released`, checkpoint: 'release',
-      reason: 'authenticated_root_execution_directive',
-      path: join(dirname(fencePath), `fence-event-${String(releasedFence.sequence).padStart(4, '0')}.json`),
-      digest: projection.fence.evidence_bundle_sha256,
-    });
-    return { intent, released: true, projection: await readCurrentRalplanAdvisory(input.cwd, input.sessionId) };
+    return withRalplanAdvisoryCurrentLock(input.cwd, input.sessionId, () =>
+      withGenerationLock(input.cwd, input.sessionId, projection.activation.generation_id, async () => {
+      const latest = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
+      if (!latest?.activation || latest.activation.generation_id !== projection.activation.generation_id
+        || latest.activation.root_thread_id !== input.threadId
+        || !latest.fence || !['closed', 'abandoned'].includes(latest.fence.state)) {
+        throw new Error('ralplan_advisory_release_generation_changed');
+      }
+      const releasedFence = await appendFenceEvent(latest.activation.canonical_cwd, latest.fence, {
+        state: 'released', closing_turn_id: latest.fence.closing_turn_id, iteration: latest.fence.iteration,
+        release_turn_id: input.turnId, release_thread_id: input.threadId,
+        release_prompt_sha256: sha256(input.prompt), requested_lane: input.requestedLane ?? 'execution',
+        authority_kind: 'new_root_user_execution_request', updated_at: new Date().toISOString(),
+      });
+      await emitAdvisoryEvent(latest.activation.canonical_cwd, {
+        type: 'ralplan_advisory_fence_released', generationId: latest.activation.generation_id,
+        iteration: latest.fence.iteration, transition: `${latest.fence.state}->released`, checkpoint: 'release',
+        reason: 'authenticated_root_execution_directive',
+        path: join(dirname(fencePath), `fence-event-${String(releasedFence.sequence).padStart(4, '0')}.json`),
+        digest: latest.fence.evidence_bundle_sha256,
+      });
+      const verified = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
+      if (!verified || verified.corruption || verified.activation.generation_id !== latest.activation.generation_id
+        || verified.fence?.state !== 'released' || verified.denyProductWrites !== false) {
+        throw new Error(`ralplan_advisory_release_projection_invalid:${verified?.corruption ?? 'missing_or_mismatched'}`);
+      }
+      return { intent, released: true, projection: verified };
+    }));
   }
   if (intent === 'abandon' && ['recovery_required', 'closed'].includes(projection.fence.state)) {
     await emitDenied('administrative_abandon_is_not_execution_release');

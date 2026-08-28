@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, open, readFile, realpath } from 'node:fs/promises';
+import { lstat, open, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { readSubagentTrackingStateStrict } from '../subagents/tracker.js';
 import { pinDirectory as pinPlatformDirectory } from './documented-leader-preflight.js';
@@ -16,6 +16,20 @@ export interface PinnedDirectory {
   readonly identity: { dev: number; ino: number };
   readFile(name: string, maxBytes?: number): Promise<Buffer>;
   close(): Promise<void>;
+}
+
+async function readBoundedHandle(handle: Awaited<ReturnType<typeof open>>, size: bigint): Promise<Buffer> {
+  if (size < 0n || size > BigInt(MAX_ARTIFACT_BYTES) || size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('ralplan_advisory_artifact_not_regular');
+  }
+  const bytes = Buffer.alloc(Number(size));
+  let offset = 0;
+  while (offset < bytes.length) {
+    const result = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (result.bytesRead === 0) throw new Error('ralplan_advisory_artifact_changed_during_read');
+    offset += result.bytesRead;
+  }
+  return bytes;
 }
 
 export interface DigestAdvisoryArtifactsDependencies {
@@ -73,7 +87,7 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
       canonicalPath,
       identity: { dev: before.dev, ino: before.ino },
       async readFile(name, maxBytes = MAX_ARTIFACT_BYTES) {
-        if (maxBytes > 128 * 1024) throw new Error('ralplan_advisory_artifact_limit_unsupported');
+      if (maxBytes > MAX_ARTIFACT_BYTES) throw new Error('ralplan_advisory_artifact_limit_unsupported');
         const bytes = await pinned.read(name, maxBytes);
         if (!bytes) throw new Error('ralplan_advisory_artifact_read_failed');
         return bytes;
@@ -93,13 +107,16 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
       if (!descriptorPath) throw new Error('ralplan_advisory_descriptor_relative_open_unsupported');
       const directoryBefore = await handle.stat();
       if (!sameIdentity(opened, directoryBefore)) throw new Error('ralplan_advisory_directory_identity_changed');
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_ARTIFACT_BYTES) {
+        throw new Error('ralplan_advisory_artifact_limit_unsupported');
+      }
       const file = await open(join(descriptorPath, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const first = await file.stat({ bigint: true });
         if (!first.isFile() || first.nlink !== 1n || first.size > BigInt(maxBytes)) {
           throw new Error('ralplan_advisory_artifact_not_regular');
         }
-        const bytes = await file.readFile();
+        const bytes = await readBoundedHandle(file, first.size);
         const second = await file.stat({ bigint: true });
         if (!sameArtifactFileIdentity(first, second)
           || BigInt(bytes.length) !== first.size) {
@@ -147,7 +164,7 @@ interface CanonicalArtifactPath {
   relative: string;
   ancestry: Array<{ path: string; dev: number; ino: number }>;
   fileIdentity: ArtifactFileIdentity;
-  initialBytes: Buffer;
+  initialBytes: Buffer<ArrayBufferLike>;
   initialBytesCaptured: boolean;
 }
 
@@ -216,9 +233,22 @@ async function canonicalArtifactPath(cwd: string, input: string): Promise<Canoni
   // filesystems can preserve nanosecond timestamps across two same-size writes;
   // identity metadata alone therefore cannot detect that overwrite. The later
   // descriptor read must match these bytes as well as the pinned identities.
-  const initialBytes = fileIdentity.size <= BigInt(MAX_ARTIFACT_BYTES)
-    ? await readFile(canonical)
-    : Buffer.alloc(0);
+  let initialBytes: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  const initialBytesCaptured = fileIdentity.size <= BigInt(MAX_ARTIFACT_BYTES);
+  if (initialBytesCaptured) {
+    const handle = await open(canonical, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const opened = await handle.stat({ bigint: true });
+      if (!sameArtifactFileIdentity(fileIdentity, opened)) {
+        throw new Error('ralplan_advisory_artifact_identity_changed');
+      }
+      initialBytes = await readBoundedHandle(handle, opened.size);
+      const closed = await handle.stat({ bigint: true });
+      if (!sameArtifactFileIdentity(fileIdentity, closed)) {
+        throw new Error('ralplan_advisory_artifact_identity_changed');
+      }
+    } finally { await handle.close(); }
+  }
   await assertFileIdentity(canonical, fileIdentity);
   return {
     absolute: canonical,
@@ -226,7 +256,7 @@ async function canonicalArtifactPath(cwd: string, input: string): Promise<Canoni
     ancestry,
     fileIdentity,
     initialBytes,
-    initialBytesCaptured: fileIdentity.size <= BigInt(MAX_ARTIFACT_BYTES),
+    initialBytesCaptured,
   };
 }
 

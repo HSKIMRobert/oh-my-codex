@@ -105,7 +105,13 @@ describe('ralplan advisory evidence', () => {
   it('rejects symlinks and traversal and reads through a pinned directory descriptor', async () => {
     const { cwd } = await fixture();
     const pinned = await pinDirectory(join(cwd, '.omx', 'plans'));
-    try { assert.equal((await pinned.readFile('plan.md')).toString(), '# exact plan\n'); } finally { await pinned.close(); }
+    try {
+      assert.equal((await pinned.readFile('plan.md')).toString(), '# exact plan\n');
+      await assert.rejects(
+        pinned.readFile('plan.md', (process.platform === 'darwin' ? 128 * 1024 : 8 * 1024 * 1024) + 1),
+        /limit_unsupported/,
+      );
+    } finally { await pinned.close(); }
     await symlink(join(cwd, '.omx', 'plans', 'plan.md'), join(cwd, '.omx', 'plans', 'link.md'));
     await assert.rejects(digestAdvisoryArtifacts(cwd, ['.omx/plans/link.md']), /symlink/);
     await assert.rejects(digestAdvisoryArtifacts(cwd, [join(cwd, '.omx', 'plans', 'link.md')]), /symlink/);
@@ -612,6 +618,74 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(projection?.fence?.state, 'released');
     assert.equal(projection?.corruption, null);
     assert.equal(projection?.denyProductWrites, false);
+
+    // A malformed inactive Advisory-shaped binding is not a standard state and
+    // must not inherit the released-generation bypass.
+    await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), JSON.stringify({
+      active: false, mode: 'ralplan', workflow_variant: 'advisory', advisory_generation_id: 'generation-a',
+    }));
+    const malformedBinding = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.match(malformedBinding?.corruption ?? '', /inactive_/);
+    assert.equal(malformedBinding?.denyProductWrites, true);
+  });
+
+  it('rejects a released event whose inherited evidence bindings were tampered', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    const result = await releaseAdvisoryFence({
+      cwd, sessionId, turnId: 'turn-release', threadId: 'root-a',
+      prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native',
+      threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    assert.equal(result.released, true);
+    const releasePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a', 'fence-event-0002.json');
+    const tampered = JSON.parse(await readFile(releasePath, 'utf8')) as Record<string, unknown>;
+    delete tampered.critic_review_sha256;
+    await writeFile(releasePath, JSON.stringify(tampered));
+    const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.equal(projection?.corruption, 'fence_event_chain_invalid');
+    assert.equal(projection?.denyProductWrites, true);
+  });
+
+  it('rejects release authority from a non-root thread even when classified root-or-drift', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    const result = await releaseAdvisoryFence({
+      cwd, sessionId, turnId: 'turn-release', threadId: 'caller-derived-thread',
+      prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native',
+      threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    assert.equal(result.released, false);
+    assert.equal(result.intent, 'unrelated');
+    assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.fence?.state, 'closed');
+  });
+
+  it('keeps a valid administrative abandonment chain releasable', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    await administrativelyAbandonRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', rootThreadId: 'root-a', turnId: 'turn-abandon',
+    });
+    const released = await releaseAdvisoryFence({
+      cwd, sessionId, turnId: 'turn-release', threadId: 'root-a',
+      prompt: 'implementá el plan .omx/plans/plan.md', producer: 'native',
+      threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    assert.equal(released.released, true);
+    assert.equal(released.projection?.corruption, null);
+    assert.equal(released.projection?.fence?.state, 'released');
   });
 
   it('rolls over with CAS and preserves the predecessor generation', async () => {

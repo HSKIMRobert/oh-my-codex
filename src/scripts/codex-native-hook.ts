@@ -22426,8 +22426,11 @@ export async function dispatchCodexNativeHook(
     && (hookEventName === "SessionStart" || hookEventName === "Stop" || hookEventName === "UserPromptSubmit")
     ? await detectRalplanAdvisoryState(policyCwd, canonicalSessionId)
     : null;
+  let advisoryProjectionPresent = false;
+  let advisoryReleaseVerified = false;
   if (advisoryStateDetection?.status === "missing" || advisoryStateDetection?.status === "unreadable") {
     allowGlobalSideEffects = false;
+    advisoryProjectionPresent = true;
   }
 
   if ((hookEventName === "SessionStart" || hookEventName === "Stop") && canonicalSessionId
@@ -22444,10 +22447,15 @@ export async function dispatchCodexNativeHook(
     const prompt = readPromptText(payload);
     if (!isSubagentPromptSubmit) promptClassification = classifyKeywordInput(prompt);
     if (canonicalSessionId && !isSubagentPromptSubmit && advisoryStateDetection?.status === "normal") {
+      // A canonical Advisory root means a projection must be proven before any
+      // session activation exception can relax stale-pointer suppression.
+      advisoryProjectionPresent = true;
       try {
         const pendingActivation = await readAuthorizedPendingRalplanActivation({
           cwd: policyCwd, sessionId: canonicalSessionId, producer: "native",
-          threadKind: promptTurnContext?.status === "authorized" ? "root-or-drift" : "unknown",
+          threadKind: promptTurnContext?.status === "authorized"
+            && promptTurnContext.authorization.targetRelation !== "explicit-independent"
+            ? "root-or-drift" : "unknown",
           rootThreadId: threadId, activationTurnId: turnId, prompt,
         });
         if (pendingActivation) {
@@ -22463,7 +22471,11 @@ export async function dispatchCodexNativeHook(
           );
           try { await pendingBindingHandle.sync(); } finally { await pendingBindingHandle.close(); }
           const committedPending = await reconcileRalplanAdvisory(policyCwd, canonicalSessionId, {
-            producer: "native", threadKind: "root-or-drift", rootThreadId: threadId, activationTurnId: turnId,
+            producer: "native",
+            threadKind: promptTurnContext?.status === "authorized"
+              && promptTurnContext.authorization.targetRelation !== "explicit-independent"
+              ? "root-or-drift" : "unknown",
+            rootThreadId: threadId, activationTurnId: turnId,
           });
           if (!committedPending || committedPending.corruption) {
             throw new Error(`ralplan_advisory_activation_commit_failed:${committedPending?.corruption ?? "missing"}`);
@@ -22476,7 +22488,9 @@ export async function dispatchCodexNativeHook(
           threadId,
           prompt,
           producer: "native",
-          threadKind: promptTurnContext?.status === "authorized" ? "root-or-drift" : "unknown",
+          threadKind: promptTurnContext?.status === "authorized"
+            && promptTurnContext.authorization.targetRelation !== "explicit-independent"
+            ? "root-or-drift" : "unknown",
           isSubagentPromptSubmit,
           markedContinuation: payload.continuation === true
             || payload.is_continuation === true
@@ -22491,6 +22505,15 @@ export async function dispatchCodexNativeHook(
             }
           },
         });
+        advisoryReleaseVerified = Boolean(
+          advisory.released
+          && advisory.projection
+          && advisory.projection.corruption === null
+          && advisory.projection.denyProductWrites === false
+          && advisory.projection.fence?.state === "released"
+          && advisory.projection.activation.session_id === canonicalSessionId
+          && advisory.projection.activation.canonical_cwd === policyCwd,
+        );
         if (
           advisory.projection
           && (advisory.intent === "replan" || advisory.intent === "new_advisory")
@@ -22516,13 +22539,17 @@ export async function dispatchCodexNativeHook(
           );
           try { await bindingHandle.sync(); } finally { await bindingHandle.close(); }
           const committed = await reconcileRalplanAdvisory(policyCwd, canonicalSessionId, {
-            producer: "native", threadKind: "root-or-drift", rootThreadId: threadId, activationTurnId: turnId,
+            producer: "native",
+            threadKind: promptTurnContext?.status === "authorized"
+              && promptTurnContext.authorization.targetRelation !== "explicit-independent"
+              ? "root-or-drift" : "unknown",
+            rootThreadId: threadId, activationTurnId: turnId,
           });
           if (!committed || committed.corruption) {
             throw new Error(`ralplan_advisory_activation_commit_failed:${committed?.corruption ?? "missing"}`);
           }
         }
-        if (advisory.projection && !advisory.released) {
+        if (advisoryProjectionPresent && !advisoryReleaseVerified) {
           allowGlobalSideEffects = false;
         }
       } catch (error) {
@@ -22554,9 +22581,9 @@ export async function dispatchCodexNativeHook(
     // session-scoped state even when global side effects (HUD/root mirrors) are
     // suppressed because a stale selected pointer exists.
     let suppressActivationSeeding = !allowImplicitSessionSideEffects
-      || (promptTurnContext?.status === "authorized"
-        && promptTurnContext.authorization.targetRelation !== "explicit-independent"
-        && !allowGlobalSideEffects);
+      || (advisoryProjectionPresent && !advisoryReleaseVerified)
+      || (!advisoryProjectionPresent && !allowGlobalSideEffects
+        && promptTurnContext?.status !== "authorized");
     if (promptTurnContext?.status === "authorized") {
       sessionIdForState = promptTurnContext.authorization.targetSessionId;
     } else if (prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects) {
