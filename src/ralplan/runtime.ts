@@ -450,7 +450,10 @@ async function terminalizeRuntimeAdvisory(input: {
       }
     },
   });
-  if (projection.corruption || !projection.fence || !['closed', 'abandoned', 'recovery_required'].includes(projection.fence.state)) {
+  const terminalStateValid = input.outcome === 'approved'
+    ? projection.fence?.state === 'closed'
+    : Boolean(projection.fence && ['closed', 'abandoned', 'recovery_required'].includes(projection.fence.state));
+  if (projection.corruption || !terminalStateValid) {
     throw new Error(`ralplan_advisory_terminalization_unproven:${projection.corruption ?? projection.fence?.state ?? 'missing'}`);
   }
 }
@@ -506,12 +509,19 @@ export async function runRalplanConsensus(
     if (existing?.active && existing.workflow_variant === 'advisory') {
       advisoryGenerationId = requiredAdvisoryIdentity(String(existing.advisory_generation_id ?? ''), 'generation_id');
     } else {
-      await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId);
-      const prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
+      let prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
+      if (prior?.corruption) {
+        prior = await reconcileRalplanAdvisory(cwd, advisorySessionId);
+      }
       if (prior?.corruption) throw new Error(`ralplan_advisory_${prior.corruption}`);
       if (prior && (!prior.fence || !['closed', 'abandoned', 'recovery_required'].includes(prior.fence.state))) {
         throw new Error('ralplan_advisory_existing_generation_not_terminal');
       }
+      // Reconcile/read the previous generation before replacing its mode
+      // binding. A crash can leave a pending journal while the mode is already
+      // inactive; startMode first would poison the generation binding and
+      // strand the closeout forever.
+      await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId);
       const activation = await activateRalplanAdvisory({
         cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId,
         ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),
