@@ -13,8 +13,14 @@ const ALLOWED_ROOTS = ['.omx/plans', '.omx/specs', '.omx/artifacts', '.omx/conte
 
 export interface PinnedDirectory {
   readonly canonicalPath: string;
+  readonly identity: { dev: number; ino: number };
   readFile(name: string, maxBytes?: number): Promise<Buffer>;
   close(): Promise<void>;
+}
+
+export interface DigestAdvisoryArtifactsDependencies {
+  afterCanonicalArtifactPath?: (artifact: { absolute: string; relative: string }) => void | Promise<void>;
+  beforePinnedRead?: (artifact: { absolute: string; relative: string }) => void | Promise<void>;
 }
 
 function safeBasename(name: string): boolean {
@@ -23,6 +29,22 @@ function safeBasename(name: string): boolean {
 
 function sameIdentity(left: { dev: number; ino: number }, right: { dev: number; ino: number }): boolean {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+interface ArtifactFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+function sameArtifactFileIdentity(left: ArtifactFileIdentity, right: ArtifactFileIdentity): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
 }
 
 /** Pin a directory descriptor and address children through it on Linux. On
@@ -42,8 +64,14 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
     await handle.close();
     const pinned = await pinPlatformDirectory(canonicalPath);
     if (!pinned) throw new Error('ralplan_advisory_directory_pin_failed');
+    const current = await lstat(canonicalPath);
+    if (!current.isDirectory() || current.isSymbolicLink() || !sameIdentity(before, current)) {
+      await pinned.close();
+      throw new Error('ralplan_advisory_directory_identity_changed');
+    }
     return {
       canonicalPath,
+      identity: { dev: before.dev, ino: before.ino },
       async readFile(name, maxBytes = MAX_ARTIFACT_BYTES) {
         if (maxBytes > 128 * 1024) throw new Error('ralplan_advisory_artifact_limit_unsupported');
         const bytes = await pinned.read(name, maxBytes);
@@ -57,6 +85,7 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
   let closed = false;
   return {
     canonicalPath,
+    identity: { dev: opened.dev, ino: opened.ino },
     async readFile(name, maxBytes = MAX_ARTIFACT_BYTES) {
       if (closed || !safeBasename(name) || !Number.isSafeInteger(maxBytes) || maxBytes < 0) {
         throw new Error('ralplan_advisory_artifact_name_invalid');
@@ -66,17 +95,14 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
       if (!sameIdentity(opened, directoryBefore)) throw new Error('ralplan_advisory_directory_identity_changed');
       const file = await open(join(descriptorPath, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
-        const first = await file.stat();
-        if (!first.isFile() || first.nlink !== 1 || first.size > maxBytes) {
+        const first = await file.stat({ bigint: true });
+        if (!first.isFile() || first.nlink !== 1n || first.size > BigInt(maxBytes)) {
           throw new Error('ralplan_advisory_artifact_not_regular');
         }
         const bytes = await file.readFile();
-        const second = await file.stat();
-        if (!sameIdentity(first, second)
-          || first.size !== second.size
-          || first.mtimeMs !== second.mtimeMs
-          || first.ctimeMs !== second.ctimeMs
-          || bytes.length !== first.size) {
+        const second = await file.stat({ bigint: true });
+        if (!sameArtifactFileIdentity(first, second)
+          || BigInt(bytes.length) !== first.size) {
           throw new Error('ralplan_advisory_artifact_changed_during_read');
         }
         const directoryAfter = await handle.stat();
@@ -116,7 +142,48 @@ function hashParts(domain: string, parts: Array<string | Buffer>): string {
   return hash.digest('hex');
 }
 
-async function canonicalArtifactPath(cwd: string, input: string): Promise<{ absolute: string; relative: string }> {
+interface CanonicalArtifactPath {
+  absolute: string;
+  relative: string;
+  ancestry: Array<{ path: string; dev: number; ino: number }>;
+  fileIdentity: ArtifactFileIdentity;
+}
+
+async function canonicalDirectoryIdentity(path: string): Promise<{ path: string; dev: number; ino: number }> {
+  const [canonical, info] = await Promise.all([realpath(path), lstat(path)]);
+  if (canonical !== path || !info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error('ralplan_advisory_directory_not_canonical');
+  }
+  return { path, dev: info.dev, ino: info.ino };
+}
+
+async function assertDirectoryIdentity(expected: { path: string; dev: number; ino: number }): Promise<void> {
+  const current = await canonicalDirectoryIdentity(expected.path);
+  if (!sameIdentity(expected, current)) throw new Error('ralplan_advisory_directory_identity_changed');
+}
+
+async function readArtifactFileIdentity(path: string): Promise<ArtifactFileIdentity> {
+  const info = await lstat(path, { bigint: true });
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n) {
+    throw new Error('ralplan_advisory_artifact_identity_changed');
+  }
+  return {
+    dev: info.dev,
+    ino: info.ino,
+    size: info.size,
+    mtimeNs: info.mtimeNs,
+    ctimeNs: info.ctimeNs,
+  };
+}
+
+async function assertFileIdentity(path: string, expected: ArtifactFileIdentity): Promise<void> {
+  const info = await readArtifactFileIdentity(path);
+  if (!sameArtifactFileIdentity(expected, info)) {
+    throw new Error('ralplan_advisory_artifact_identity_changed');
+  }
+}
+
+async function canonicalArtifactPath(cwd: string, input: string): Promise<CanonicalArtifactPath> {
   const canonicalCwd = await realpath(cwd);
   const lexicalCwd = resolve(cwd);
   const lexical = isAbsolute(input) ? resolve(input) : resolve(canonicalCwd, input);
@@ -135,32 +202,58 @@ async function canonicalArtifactPath(cwd: string, input: string): Promise<{ abso
   } else if (canonical !== lexical) {
     throw new Error('ralplan_advisory_artifact_symlink_denied');
   }
-  return { absolute: canonical, relative: rel };
+  const ancestry: CanonicalArtifactPath['ancestry'] = [];
+  let cursor = canonicalCwd;
+  ancestry.push(await canonicalDirectoryIdentity(cursor));
+  for (const part of dirname(rel).split('/').filter(Boolean)) {
+    cursor = join(cursor, part);
+    ancestry.push(await canonicalDirectoryIdentity(cursor));
+  }
+  const fileIdentity = await readArtifactFileIdentity(canonical);
+  return {
+    absolute: canonical,
+    relative: rel,
+    ancestry,
+    fileIdentity,
+  };
 }
 
-export async function digestAdvisoryArtifacts(cwd: string, paths: readonly string[]): Promise<AdvisoryManifest> {
+export async function digestAdvisoryArtifacts(
+  cwd: string,
+  paths: readonly string[],
+  dependencies: DigestAdvisoryArtifactsDependencies = {},
+): Promise<AdvisoryManifest> {
   if (paths.length === 0) throw new Error('ralplan_advisory_artifacts_missing');
   const entries: AdvisoryArtifactDigest[] = [];
   const seen = new Set<string>();
   const folded = new Set<string>();
   for (const input of paths) {
     const canonical = await canonicalArtifactPath(cwd, input);
+    await dependencies.afterCanonicalArtifactPath?.({
+      absolute: canonical.absolute,
+      relative: canonical.relative,
+    });
     if (seen.has(canonical.relative) || folded.has(canonical.relative.toLocaleLowerCase('en-US'))) {
       throw new Error('ralplan_advisory_artifact_duplicate');
     }
     seen.add(canonical.relative);
     folded.add(canonical.relative.toLocaleLowerCase('en-US'));
-    const canonicalCwd = await realpath(cwd);
-    const containingParts = dirname(canonical.relative).split('/').filter(Boolean);
     const pinned: PinnedDirectory[] = [];
     try {
-      let cursor = canonicalCwd;
-      pinned.push(await pinDirectory(cursor));
-      for (const part of containingParts) {
-        cursor = join(cursor, part);
-        pinned.push(await pinDirectory(cursor));
+      for (const expected of canonical.ancestry) {
+        const directory = await pinDirectory(expected.path);
+        if (directory.canonicalPath !== expected.path || !sameIdentity(directory.identity, expected)) {
+          await directory.close();
+          throw new Error('ralplan_advisory_directory_identity_changed');
+        }
+        pinned.push(directory);
       }
+      await Promise.all(canonical.ancestry.map(assertDirectoryIdentity));
+      await assertFileIdentity(canonical.absolute, canonical.fileIdentity);
+      await dependencies.beforePinnedRead?.({ absolute: canonical.absolute, relative: canonical.relative });
       const bytes = await pinned.at(-1)!.readFile(canonical.absolute.slice(dirname(canonical.absolute).length + 1));
+      await assertFileIdentity(canonical.absolute, canonical.fileIdentity);
+      await Promise.all(canonical.ancestry.map(assertDirectoryIdentity));
       entries.push({
         path: canonical.relative,
         byte_length: bytes.length,

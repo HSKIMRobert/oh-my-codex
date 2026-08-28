@@ -5653,6 +5653,26 @@ function classifyPreToolUseMutationTransport(
   return "unknown";
 }
 
+/** Advisory grants read passage only to MCP methods whose exact handler has
+ * been audited above. The global classifier intentionally remains permissive
+ * for third-party MCPs outside Advisory, but an active fence cannot infer
+ * non-mutation from an unknown server or method name. */
+function classifyRalplanAdvisoryTransport(
+  payload: CodexHookPayload,
+  rawToolName: string,
+  canonicalToolName: string,
+  cwd: string,
+): PreToolUseMutationTransport {
+  if (rawToolName !== canonicalToolName && canonicalToolName.startsWith("mcp__")) return "unknown";
+  const classified = classifyPreToolUseMutationTransport(payload, canonicalToolName, cwd);
+  if (!rawToolName.startsWith("mcp__")) return classified;
+  if (
+    READ_ONLY_PRETOOLUSE_MCP_TOOL_NAMES.has(rawToolName)
+    || NATIVE_CODEX_GOAL_READ_TOOL_NAMES.has(rawToolName)
+  ) return "read-only";
+  return classified === "read-only" ? "unknown" : classified;
+}
+
 function extractDeepInterviewCommandWriteTargets(command: string, cwd = process.cwd(), rootCwd = cwd): string[] {
   const assignments = new Map<string, string>();
   const targets = extractDeepInterviewCommandRedirectTargets(command)
@@ -10226,7 +10246,8 @@ export async function buildRalplanAdvisoryFenceGuardOutput(
   dependencies: { afterDetection?: (detection: RalplanAdvisoryStateDetection) => void | Promise<void> } = {},
 ): Promise<Record<string, unknown> | null> {
   if (!sessionId) return null;
-  const mutationTransport = classifyPreToolUseMutationTransport(payload, safeString(payload.tool_name).trim(), cwd);
+  const rawToolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
+  const mutationTransport = classifyRalplanAdvisoryTransport(payload, rawToolName, rawToolName.trim(), cwd);
   const readOnly = mutationTransport === "read-only";
   const detection = await detectRalplanAdvisoryState(cwd, sessionId);
   if (detection.status === "none") return null;

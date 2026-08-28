@@ -33,7 +33,65 @@ function regularSingleLink(stat: Awaited<ReturnType<typeof lstat>>, max = MAX_BY
 function validName(name: string): boolean { return /^[A-Za-z0-9.][A-Za-z0-9._-]{0,255}$/.test(name) && name !== '.' && name !== '..'; }
 export interface PinnedDirectory { read(name: string, max?: number): Promise<Buffer | null>; list(): Promise<string[]>; writeExclusive(name: string, bytes: Buffer): Promise<void>; sync(): Promise<void>; close(): Promise<void>; }
 async function readPinnedPath(path: string, max = MAX_BYTES): Promise<Buffer | null> { try { const before = await lstat(path); if (!regularSingleLink(before, max)) return null; const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); try { const opened = await handle.stat(); const bytes = await handle.readFile(); const after = await lstat(path); return regularSingleLink(after, max) && opened.dev === before.dev && opened.ino === before.ino && after.dev === before.dev && after.ino === before.ino && before.size === after.size && bytes.length === before.size ? bytes : null; } finally { await handle.close(); } } catch { return null; } }
-const DARWIN_HELPER = String.raw`const fs=require('fs/promises'),c=require('fs').constants,rl=require('readline');const max=131072,ok=n=>/^[A-Za-z0-9.][A-Za-z0-9._-]{0,255}$/.test(n)&&n!=='.'&&n!=='..';const out=x=>process.stdout.write(JSON.stringify(x)+'\n');const fail=()=>out({ok:false});(async()=>{const [dev,ino,mode]=process.argv.slice(1);if(mode==='failure')process.exit(1);const a=await fs.lstat('.'),b=await fs.stat('.');if(!a.isDirectory()||a.isSymbolicLink()||String(a.dev)!==dev||String(a.ino)!==ino||a.dev!==b.dev||a.ino!==b.ino)process.exit(1);if(mode==='malformed'){process.stdout.write('{\n');return}const read=async(n,max)=>{if(!ok(n)||!Number.isInteger(max)||max<0||max>131072)return null;try{const a=await fs.lstat(n);if(!a.isFile()||a.isSymbolicLink()||a.nlink!==1||a.size>max)return null;const h=await fs.open(n,c.O_RDONLY|c.O_NOFOLLOW);try{const b=await h.stat(),v=await h.readFile(),z=await fs.lstat(n);return b.dev===a.dev&&b.ino===a.ino&&z.dev===a.dev&&z.ino===a.ino&&z.size===a.size&&v.length===a.size?v:null}finally{await h.close()}}catch{return null}};const q=rl.createInterface({input:process.stdin,crlfDelay:Infinity});for await(const line of q){try{const x=JSON.parse(line);if(!x||typeof x!=='object')return fail();if(x.op==='read'){const v=await read(x.name,x.max);out({ok:true,data:v&&v.toString('base64')})}else if(x.op==='list'){const v=await fs.readdir('.');out({ok:true,names:v.length<=256?v:null})}else if(x.op==='write'&&ok(x.name)&&typeof x.data==='string'&&x.data.length<=174764){const v=Buffer.from(x.data,'base64');if(v.length>max)return fail();const h=await fs.open(x.name,c.O_WRONLY|c.O_CREAT|c.O_EXCL|c.O_NOFOLLOW,0o600);try{await h.writeFile(v);await h.sync()}finally{await h.close()}out({ok:true})}else if(x.op==='sync'){const h=await fs.open('.',c.O_RDONLY|c.O_DIRECTORY);try{await h.sync()}finally{await h.close()}out({ok:true})}else fail()}catch{fail()}}})().catch(()=>process.exit(1));`;
+const DARWIN_HELPER = String.raw`
+const fs = require('fs/promises');
+const c = require('fs').constants;
+const rl = require('readline');
+const max = 131072;
+const ok = n => /^[A-Za-z0-9.][A-Za-z0-9._-]{0,255}$/.test(n) && n !== '.' && n !== '..';
+const out = x => process.stdout.write(JSON.stringify(x) + '\n');
+const fail = () => out({ ok: false });
+const same = (a, b) => a.dev === b.dev && a.ino === b.ino && a.size === b.size
+  && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+(async () => {
+  const [dev, ino, mode] = process.argv.slice(1);
+  if (mode === 'failure') process.exit(1);
+  const a = await fs.lstat('.');
+  const b = await fs.stat('.');
+  if (!a.isDirectory() || a.isSymbolicLink() || String(a.dev) !== dev || String(a.ino) !== ino || a.dev !== b.dev || a.ino !== b.ino) process.exit(1);
+  if (mode === 'malformed') { process.stdout.write('{\n'); return; }
+  const read = async (n, limit) => {
+    if (!ok(n) || !Number.isInteger(limit) || limit < 0 || limit > max) return null;
+    try {
+      const before = await fs.lstat(n, { bigint: true });
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.size > BigInt(limit)) return null;
+      const h = await fs.open(n, c.O_RDONLY | c.O_NOFOLLOW);
+      try {
+        const opened = await h.stat({ bigint: true });
+        const value = await h.readFile();
+        const afterOpen = await h.stat({ bigint: true });
+        const afterPath = await fs.lstat(n, { bigint: true });
+        return same(before, opened) && same(opened, afterOpen) && same(before, afterPath)
+          && BigInt(value.length) === before.size ? value : null;
+      } finally { await h.close(); }
+    } catch { return null; }
+  };
+  const q = rl.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of q) {
+    try {
+      const x = JSON.parse(line);
+      if (!x || typeof x !== 'object') return fail();
+      if (x.op === 'read') {
+        const v = await read(x.name, x.max);
+        out({ ok: true, data: v && v.toString('base64') });
+      } else if (x.op === 'list') {
+        const v = await fs.readdir('.');
+        out({ ok: true, names: v.length <= 256 ? v : null });
+      } else if (x.op === 'write' && ok(x.name) && typeof x.data === 'string' && x.data.length <= 174764) {
+        const v = Buffer.from(x.data, 'base64');
+        if (v.length > max) return fail();
+        const h = await fs.open(x.name, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_NOFOLLOW, 0o600);
+        try { await h.writeFile(v); await h.sync(); } finally { await h.close(); }
+        out({ ok: true });
+      } else if (x.op === 'sync') {
+        const h = await fs.open('.', c.O_RDONLY | c.O_DIRECTORY);
+        try { await h.sync(); } finally { await h.close(); }
+        out({ ok: true });
+      } else fail();
+    } catch { fail(); }
+  }
+})().catch(() => process.exit(1));
+`;
 function linuxPinned(path: string, handle: Awaited<ReturnType<typeof open>>): PinnedDirectory { return { read: (name, max = MAX_BYTES) => validName(name) ? readPinnedPath(join(path, name), max) : Promise.resolve(null), list: () => readdir(path).catch(() => []), async writeExclusive(name, bytes) { if (!validName(name) || bytes.length > MAX_GENERATION_BYTES) throw new Error('invalid pinned write'); const file = await open(join(path, name), fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600); try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); } }, async sync() { await handle.sync(); }, close: () => handle.close() }; }
 function darwinPinned(directory: string, expected: { dev: number; ino: number }): Promise<PinnedDirectory | null> {
   return new Promise((resolve) => {

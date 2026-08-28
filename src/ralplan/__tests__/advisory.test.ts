@@ -1,6 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -110,6 +110,46 @@ describe('ralplan advisory evidence', () => {
     await assert.rejects(digestAdvisoryArtifacts(cwd, ['.omx/plans/link.md']), /symlink/);
     await assert.rejects(digestAdvisoryArtifacts(cwd, [join(cwd, '.omx', 'plans', 'link.md')]), /symlink/);
     await assert.rejects(digestAdvisoryArtifacts(cwd, ['../outside']), /outside/);
+  });
+
+  it('fails closed when an allowed directory is swapped after canonical validation', async () => {
+    const { cwd } = await fixture();
+    const plans = join(cwd, '.omx', 'plans');
+    const originalPlans = join(cwd, '.omx', 'plans-original');
+    const outside = join(cwd, 'outside-plans');
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'plan.md'), '# outside attacker bytes\n');
+    let swaps = 0;
+    await assert.rejects(
+      digestAdvisoryArtifacts(cwd, ['.omx/plans/plan.md'], {
+        afterCanonicalArtifactPath: async ({ relative }) => {
+          if (relative !== '.omx/plans/plan.md' || swaps > 0) return;
+          swaps += 1;
+          await rename(plans, originalPlans);
+          await symlink(outside, plans);
+        },
+      }),
+      /directory_(?:not_canonical|identity_changed)/,
+    );
+    assert.equal(swaps, 1);
+  });
+
+  it('rejects same-inode overwrites between the outer snapshot and pinned read', async () => {
+    const { cwd } = await fixture();
+    const plan = join(cwd, '.omx', 'plans', 'plan.md');
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await writeFile(plan, '# exact plan\n');
+      let overwroteSameInode = false;
+      await assert.rejects(digestAdvisoryArtifacts(cwd, ['.omx/plans/plan.md'], {
+        beforePinnedRead: async ({ absolute }) => {
+          const before = await lstat(absolute, { bigint: true });
+          await writeFile(absolute, '# evil plan!\n');
+          const after = await lstat(absolute, { bigint: true });
+          overwroteSameInode = before.dev === after.dev && before.ino === after.ino;
+        },
+      }), /artifact_(?:identity_changed|changed_during_read|read_failed)/);
+      assert.equal(overwroteSameInode, true, `attempt ${attempt}`);
+    }
   });
 
   it('enforces the documented Darwin 128 KiB pinned read ceiling', async () => {

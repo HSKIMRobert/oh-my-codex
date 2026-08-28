@@ -74,6 +74,40 @@ async function bindingWithoutCanonicalAdvisoryRoot(prefix: string, options: { ad
 }
 
 describe('ralplan advisory native hook fence', () => {
+  it('allows only explicitly audited read-only MCP methods through a real PreToolUse dispatch', async () => {
+    const { cwd, sessionId } = await closedDispatchFixture('omx-advisory-hook-mcp-policy-');
+    for (const toolName of [
+      'mcp__filesystem__read_file',
+      'mcp__omx_state__state_read',
+      'mcp__omx_goal__get_goal',
+    ]) {
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
+        tool_name: toolName, tool_input: {},
+      } as never, { cwd });
+      assert.equal(result.outputJson, null, toolName);
+    }
+    for (const toolName of [
+      'mcp__thirdparty__lookup',
+      'mcp__thirdparty__commit',
+      'mcp__thirdparty__write',
+      'mcp__thirdparty__update',
+      'mcp__thirdparty__create',
+      'mcp__thirdparty__delete',
+      ' mcp__omx_state__state_read',
+      'mcp__omx_state__state_read ',
+      '\u00a0mcp__omx_state__state_read',
+      'mcp__omx_state__state_read\u2003',
+      'MCP__omx_state__state_read',
+    ]) {
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
+        tool_name: toolName, tool_input: {},
+      } as never, { cwd });
+      assert.equal(result.outputJson?.decision, 'block', toolName);
+    }
+  });
+
   it('keeps inactive Advisory product writes and orchestration blocked while allowing reads', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-'));
     roots.push(cwd);
