@@ -4,8 +4,11 @@ import {
 } from './codex-feature-probe.js';
 
 import { resolveInstalledRoleName } from '../subagents/tracker.js';
-import { readModeState, readModeStateForExplicitSession, startMode } from '../modes/base.js';
+import { readModeState, readModeStateForExplicitSession, startMode, updateModeState } from '../modes/base.js';
 import { runRalplanConsensus, type RalplanConsensusExecutor } from '../ralplan/runtime.js';
+import { resolveWritableStateScope } from '../mcp/state-paths.js';
+import { projectAdvisoryReviewLifecycle } from '../ralplan/advisory-evidence.js';
+import { readCurrentRalplanAdvisory, terminalizeRalplanAdvisory } from '../ralplan/advisory.js';
 
 export const RALPLAN_HELP = `omx ralplan - consensus planning runtime and adapted-authority diagnostics
 
@@ -20,6 +23,8 @@ Usage:
                 State-preserving diagnostic only. Ordinary work remains under its own workflow gates.
   omx ralplan role-intent write --role <role> --parent-thread <id> [--session <id>] [--ttl-ms <n>] [--json]
                 Compatibility diagnostic only: installed roles are denied with unsupported_documented_leader_proof.
+  omx ralplan advisory complete [--json]
+                Close a standalone Advisory generation. Reconstructs canonical review evidence; accepts no evidence input.
 `;
 
 type RoleIntentFailureReason = 'unknown_role' | 'unsupported_documented_leader_proof';
@@ -167,6 +172,87 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     process.exitCode = 1;
     return;
   }
+  if (args[0] === 'advisory' && args[1] === 'complete') {
+    const json = args.length === 3 && args[2] === '--json';
+    if (args.length !== 2 && !json) throw new Error(`Unknown ralplan advisory complete argument: ${args.slice(2).join(' ')}`);
+    const cwd = (deps.cwd ?? process.cwd)();
+    const scope = await resolveWritableStateScope(cwd);
+    if (!scope.sessionId) throw new Error('ralplan_advisory_session_scope_required');
+    const state = await readModeStateForExplicitSession('ralplan', scope.sessionId, cwd);
+    if (!state || state.workflow_variant !== 'advisory') throw new Error('ralplan_advisory_not_active');
+    const sessionId = requiredStateString(state.session_id, 'session_id');
+    const generationId = requiredStateString(state.advisory_generation_id, 'advisory_generation_id');
+    const current = await readCurrentRalplanAdvisory(cwd, sessionId);
+    if (!current || current.corruption || current.activation.generation_id !== generationId) {
+      throw new Error(`ralplan_advisory_current_invalid:${current?.corruption ?? 'missing_or_mismatched'}`);
+    }
+    const activationTurnId = current.activation.activation_turn_id;
+    const closingTurnId = requiredStateString(current.fence?.closing_turn_id ?? state.advisory_closing_turn_id ?? state.turn_id, 'closing_turn_id');
+    const iteration = typeof state.iteration === 'number' && state.iteration > 0 ? state.iteration : 1;
+    const history = Array.isArray(state.review_history) ? state.review_history : [];
+    const item = history[iteration - 1] as Record<string, unknown> | undefined;
+    const draft = objectState(item?.draft);
+    const architect = objectState(item?.architect_review);
+    const critic = objectState(item?.critic_review);
+    const lifecycle = await projectAdvisoryReviewLifecycle({
+      cwd, sessionId, generationId,
+      activationTurnId, activationCreatedAt: current.activation.created_at, rootThreadId: current.activation.root_thread_id, iteration,
+      planPaths: [requiredStateString(draft?.planPath ?? state.latest_plan_path, 'plan_path')],
+      architect: {
+        threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'),
+        artifactPath: requiredStateString(architect?.artifact_path, 'architect_artifact_path'),
+        verdict: requiredStateString(architect?.verdict, 'architect_verdict'),
+        sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
+      },
+      critic: {
+        threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'),
+        artifactPath: requiredStateString(critic?.artifact_path, 'critic_artifact_path'),
+        verdict: requiredStateString(critic?.verdict, 'critic_verdict'),
+        sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
+      },
+    });
+    let updated = false;
+    const terminalModeUpdates = {
+      active: false, current_phase: 'complete', planning_complete: true, completed_at: new Date().toISOString(),
+      workflow_variant: 'advisory' as const, advisory_generation_id: generationId,
+      ralplan_review_lifecycle: lifecycle, execution_handoff_authorized: false, host_verified: false,
+      ralplan_consensus_gate: { complete: false },
+    };
+    const result = await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId, closingTurnId, iteration, outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      terminalModeUpdates,
+      revalidateEvidence: async () => (await projectAdvisoryReviewLifecycle({
+        cwd, sessionId, generationId, activationTurnId, activationCreatedAt: current.activation.created_at,
+        rootThreadId: current.activation.root_thread_id, iteration,
+        planPaths: [requiredStateString(draft?.planPath ?? state.latest_plan_path, 'plan_path')],
+        architect: {
+          threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'), artifactPath: requiredStateString(architect?.artifact_path, 'architect_artifact_path'),
+          verdict: requiredStateString(architect?.verdict, 'architect_verdict'), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
+        },
+        critic: {
+          threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'), artifactPath: requiredStateString(critic?.artifact_path, 'critic_artifact_path'),
+          verdict: requiredStateString(critic?.verdict, 'critic_verdict'), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
+        },
+      })).evidence_bundle_sha256,
+      applyStep: async (step, storedPatch) => {
+        if (step === 'session_mode' && !updated) {
+          await updateModeState('ralplan', storedPatch ?? terminalModeUpdates, cwd, sessionId);
+          updated = true;
+        }
+      },
+    });
+    if (result.corruption || result.fence?.state !== 'closed') throw new Error(`ralplan_advisory_closeout_failed:${result.corruption ?? result.fence?.state ?? 'missing'}`);
+    const output = {
+      ok: true,
+      status: result.fence.state,
+      host_verified: false,
+      consensus_gate_complete: false,
+      execution_handoff_authorized: false,
+      return_to_caller: true,
+    };
+    stdout(json ? JSON.stringify(output) : 'Ralplan Advisory complete. Return to caller; execution remains fenced.');
+    return;
+  }
   if (args[0] !== 'role-intent' || args[1] !== 'write') throw new Error(`Unknown ralplan command: ${args.join(' ')}\n${RALPLAN_HELP}`);
 
   const parsed = parseRoleIntentWriteArgs(args.slice(2));
@@ -177,6 +263,15 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     return;
   }
   emitRoleIntentFailure('unsupported_documented_leader_proof', parsed.json, stdout, stderr);
+}
+
+function objectState(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function requiredStateString(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`ralplan_advisory_${name}_missing`);
+  return value.trim();
 }
 
 function parseRoleIntentWriteArgs(args: string[]): ParsedRoleIntentWriteArgs {

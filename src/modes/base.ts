@@ -32,6 +32,7 @@ import {
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, writeStateFile } from '../state/operations.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
+import { readCurrentRalplanAdvisory, validateAdvisoryInactiveState, validateAdvisoryPreparedInactiveWrite } from '../ralplan/advisory.js';
 
 
 export interface ModeState {
@@ -373,6 +374,16 @@ async function updateModeStateInternal(
     updatedBase.owner_omx_session_id = scope.sessionId;
   }
   const normalizedBase = normalizeModeStateOrThrow(mode, updatedBase as ModeState);
+  if (mode === 'ralplan' && normalizedBase.workflow_variant === 'advisory' && normalizedBase.active === false) {
+    const advisoryProjection = await readCurrentRalplanAdvisory(
+      projectRoot ?? process.cwd(),
+      scope.sessionId ?? String(normalizedBase.session_id ?? ''),
+    );
+    const validationError = advisoryProjection?.fence?.state === 'pending_closeout'
+      ? validateAdvisoryPreparedInactiveWrite(normalizedBase as Record<string, unknown>, advisoryProjection)
+      : validateAdvisoryInactiveState(normalizedBase as Record<string, unknown>, advisoryProjection);
+    if (validationError) throw new Error(validationError);
+  }
   if (mode === 'autopilot') {
     const completionAdvisory = validateAutopilotCompletionTransition(
       current as Record<string, unknown>,
@@ -392,7 +403,8 @@ async function updateModeStateInternal(
   });
   if (isTrackedWorkflowMode(mode)) {
     const cwd = projectRoot ?? process.cwd();
-    const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({
+    const ralplanCompletionHandled = mode === 'ralplan'
+      && await completeRalplanSession({
       cwd,
       baseStateDir,
       state: updated as Record<string, unknown>,
@@ -422,6 +434,9 @@ async function updateModeStateInternal(
 export async function cancelMode(mode: string, projectRoot?: string): Promise<void> {
   const state = await readModeState(mode, projectRoot);
   if (state && state.active) {
+    if (mode === 'ralplan' && state.workflow_variant === 'advisory') {
+      throw new Error('ralplan_advisory_cancel_requires_terminalizeRalplanAdvisory');
+    }
     await updateModeState(mode, {
       active: false,
       current_phase: 'cancelled',

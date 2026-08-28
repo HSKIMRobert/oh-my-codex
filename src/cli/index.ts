@@ -10207,6 +10207,15 @@ async function cancelModes(
 
     const currentSessionId = writableScope.sessionId ?? runSelection?.sessionId ?? "";
 
+    const activeAdvisory = states.get("ralplan");
+    if (activeAdvisory?.state.active === true && activeAdvisory.state.workflow_variant === "advisory") {
+      if (!currentSessionId) throw new Error("Refusing Advisory cancellation without an authoritative session scope.");
+      const { cancelRalplanConsensus } = await import("../ralplan/runtime.js");
+      await cancelRalplanConsensus(cwd);
+      console.log("Cancelled: ralplan");
+      return;
+    }
+
     const changed = new Set<string>();
     const reported = new Set<string>();
 

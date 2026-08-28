@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { constants as fsConstants, existsSync } from 'node:fs';
+import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
@@ -57,6 +57,7 @@ import {
   type TrackedWorkflowMode,
 } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
+import { readCurrentRalplanAdvisory, validateAdvisoryInactiveState, validateAdvisoryPreparedInactiveWrite } from '../ralplan/advisory.js';
 export const SUPPORTED_STATE_READ_MODES = [
   'autopilot',
   'autoresearch',
@@ -111,6 +112,49 @@ async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promis
  */
 export async function writeStateFile(path: string, data: string): Promise<void> {
   await writeAtomicFile(path, data);
+}
+
+/**
+ * Durably pin a mode projection already published by the canonical workflow
+ * writer. Keeping the path resolution and descriptor validation in the state
+ * owner prevents callers from becoming undeclared mode-state writers merely
+ * to obtain a durable activation boundary.
+ */
+export async function syncExplicitSessionModeState(
+  mode: string,
+  cwd: string,
+  sessionId: string,
+): Promise<void> {
+  validateStateModeSegment(mode);
+  validateSessionId(sessionId);
+  const scope = await resolveWritableStateScope(cwd, sessionId);
+  if (scope.sessionId !== sessionId) throw new Error('mode_state_sync_session_scope_mismatch');
+  const path = join(scope.stateDir, getStateFilename(mode));
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw new Error('mode_state_sync_requires_canonical_regular_file');
+  }
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    const current = await lstat(path);
+    if (
+      !opened.isFile()
+      || opened.nlink !== 1
+      || !current.isFile()
+      || current.isSymbolicLink()
+      || current.nlink !== 1
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || current.dev !== before.dev
+      || current.ino !== before.ino
+    ) {
+      throw new Error('mode_state_sync_identity_changed');
+    }
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -302,6 +346,14 @@ function appendAutopilotCompletionAdvisory(
 
 function isCompleteRalplanTerminalState(state: Record<string, unknown>): boolean {
   const currentPhase = stringValue(state.current_phase).trim().toLowerCase();
+  const gate = objectRecord(state.ralplan_consensus_gate);
+  if (state.workflow_variant === 'advisory') {
+    return state.active === false
+      && ['complete', 'cancelled', 'failed'].includes(currentPhase)
+      && gate.complete === false
+      && state.execution_handoff_authorized === false
+      && state.host_verified === false;
+  }
   return state.active === false
     && currentPhase === 'complete';
 }
@@ -314,16 +366,23 @@ function buildRalplanTerminalState(
 ): Record<string, unknown> {
   const completedAt = stringValue(state.completed_at).trim() || nowIso;
   const terminalReason = stringValue(state.terminal_reason).trim() || 'ralplan consensus complete';
+  const advisory = state.workflow_variant === 'advisory';
+  const terminalPhase = advisory ? stringValue(state.current_phase).trim() || 'complete' : 'complete';
   return withModeRuntimeContext(state, {
     ...state,
     mode: 'ralplan',
     active: false,
-    current_phase: 'complete',
-    status: 'complete',
+    current_phase: terminalPhase,
+    status: terminalPhase,
     updated_at: nowIso,
     completed_at: completedAt,
     terminal_reason: terminalReason,
     session_id: sessionId,
+    ralplan_consensus_gate: {
+      ...objectRecord(state.ralplan_consensus_gate),
+      complete: advisory ? false : true,
+    },
+    ...(advisory ? { execution_handoff_authorized: false, host_verified: false } : {}),
   });
 }
 
@@ -335,13 +394,14 @@ function buildRalplanTerminalSkillState(
 ): SkillActiveStateLike {
   const completedAt = stringValue(terminalState.completed_at).trim() || nowIso;
   const terminalReason = stringValue(terminalState.terminal_reason).trim() || 'ralplan consensus complete';
+  const terminalPhase = stringValue(terminalState.current_phase).trim() || 'complete';
   return {
     ...(base ?? {}),
     version: 1,
     active: false,
     skill: 'ralplan',
     keyword: stringValue(base?.keyword).trim() || 'ralplan',
-    phase: 'complete',
+    phase: terminalPhase,
     activated_at: stringValue(base?.activated_at).trim() || stringValue(terminalState.started_at).trim() || nowIso,
     updated_at: nowIso,
     completed_at: completedAt,
@@ -426,6 +486,30 @@ function collectCompletedRalplanSessionEntries(
   return [...entries.values()];
 }
 
+export function projectRalplanTerminalSkillMirrors(input: {
+  rootSkillState: SkillActiveStateLike | null;
+  sessionSkillState: SkillActiveStateLike | null;
+  terminalState: Record<string, unknown>;
+  sessionId: string;
+  nowIso: string;
+}): { root_skill: SkillActiveStateLike | null; session_skill: SkillActiveStateLike | null } {
+  const rootEntries = filterCompletedRalplanRootEntries(
+    listActiveSkills(input.rootSkillState ?? {}), input.sessionId, false,
+  );
+  const rootSkill = rootEntries.length > 0 || input.rootSkillState !== null
+    ? buildRalplanSkillStateFromEntries(input.rootSkillState, input.terminalState, rootEntries, undefined, input.nowIso)
+    : null;
+  const sessionEntries = collectCompletedRalplanSessionEntries(
+    input.sessionSkillState, input.rootSkillState, input.sessionId,
+  );
+  const sessionSkill = sessionEntries.length > 0
+    ? buildRalplanSkillStateFromEntries(input.sessionSkillState ?? input.rootSkillState, input.terminalState, sessionEntries, input.sessionId, input.nowIso)
+    : input.sessionSkillState !== null
+      ? buildRalplanTerminalSkillState(input.sessionSkillState, input.terminalState, input.sessionId, input.nowIso)
+      : null;
+  return { root_skill: rootSkill, session_skill: sessionSkill };
+}
+
 function serializeAtomicJson(value: unknown): string {
   const serialized = JSON.stringify(value, null, 2);
   JSON.parse(serialized);
@@ -466,6 +550,13 @@ export async function completeRalplanSession(options: {
   const writableScope = options.capturedScope
     ?? await resolveWritableStateScope(options.cwd, options.explicitSessionId);
   const sessionId = writableScope.sessionId;
+  if (options.state.workflow_variant === 'advisory') {
+    const advisoryProjection = await readCurrentRalplanAdvisory(options.cwd, sessionId ?? String(options.state.session_id ?? ''));
+    const validationError = advisoryProjection?.fence?.state === 'pending_closeout'
+      ? validateAdvisoryPreparedInactiveWrite(options.state, advisoryProjection)
+      : validateAdvisoryInactiveState(options.state, advisoryProjection);
+    if (validationError) throw new Error(validationError);
+  }
   const beforeCommit = options.beforeCommit ?? createWritableCommitRevalidator({
     operation: 'completeRalplanSession',
     cwd: options.cwd,
@@ -841,6 +932,13 @@ export async function executeStateOperation(
             normalizeCleanAutopilotCompletionEvidence(mergedRaw);
           }
 
+          if (mode === 'ralplan' && mergedRaw.workflow_variant === 'advisory' && mergedRaw.active === false) {
+            validationError = validateAdvisoryInactiveState(
+              mergedRaw,
+              await readCurrentRalplanAdvisory(cwd, effectiveSessionId ?? String(mergedRaw.session_id ?? '')),
+            );
+            if (validationError) return;
+          }
 
 
           if (mode === 'autopilot') {

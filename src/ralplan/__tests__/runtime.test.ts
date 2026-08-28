@@ -9,6 +9,7 @@ import { getBaseStateDir, getStatePath } from '../../state/paths.js';
 import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { cancelRalplanConsensus, runRalplanConsensus } from '../runtime.js';
+import { readCurrentRalplanAdvisory } from '../advisory.js';
 
 function sessionStatePath(cwd: string, sessionId: string): string {
   return getStatePath('ralplan', cwd, sessionId);
@@ -28,10 +29,10 @@ async function readScopedRalplanState(cwd: string, sessionId: string): Promise<R
   return JSON.parse(await readFile(sessionStatePath(cwd, sessionId), 'utf-8'));
 }
 
-async function writeNativeSubagentTracking(cwd: string, sessionId: string): Promise<void> {
-  const architectCompletedAt = '2026-05-28T00:00:00.000Z';
-  const criticStartedAt = '2026-05-28T00:05:00.000Z';
-  const criticCompletedAt = '2026-05-28T00:10:00.000Z';
+async function writeNativeSubagentTracking(cwd: string, sessionId: string, postActivation = false): Promise<void> {
+  const architectCompletedAt = postActivation ? new Date(Date.now() + 1_000).toISOString() : '2026-05-28T00:00:00.000Z';
+  const criticStartedAt = postActivation ? new Date(Date.now() + 2_000).toISOString() : '2026-05-28T00:05:00.000Z';
+  const criticCompletedAt = postActivation ? new Date(Date.now() + 3_000).toISOString() : '2026-05-28T00:10:00.000Z';
   const trackingPath = subagentTrackingPath(cwd);
   await mkdir(join(trackingPath, '..'), { recursive: true });
   await writeFile(trackingPath, JSON.stringify({
@@ -57,6 +58,9 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
             completed_at: architectCompletedAt,
             turn_count: 1,
             role: 'architect',
+            provenance_kind: 'native_subagent',
+            direct_child_root_id: 'thread-leader',
+            direct_child_parent_id: 'thread-leader',
           },
           'thread-critic': {
             thread_id: 'thread-critic',
@@ -66,6 +70,9 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
             completed_at: criticCompletedAt,
             turn_count: 1,
             role: 'critic',
+            provenance_kind: 'native_subagent',
+            direct_child_root_id: 'thread-leader',
+            direct_child_parent_id: 'thread-leader',
           },
         },
       },
@@ -168,7 +175,7 @@ describe('ralplan runtime', () => {
       assert.equal(result.status, 'failed');
       assert.match(result.error || '', /architect blew up/);
 
-      const finalState = await readModeState('ralplan', cwd);
+      const finalState = await readScopedRalplanState(cwd, sessionId);
       assert.equal(finalState?.active, false);
       assert.equal(finalState?.current_phase, 'failed');
       assert.match(String(finalState?.status_message || ''), /Status: failed/);
@@ -236,6 +243,100 @@ describe('ralplan runtime', () => {
       assert.ok(typeof finalState?.completed_at === 'string' && finalState.completed_at.length > 0);
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'ralplan-state.json')), false);
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ralplan advisory runtime', () => {
+  it('returns completed only after a byte-bound tracker-backed lifecycle closes the durable fence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-runtime-'));
+    const sessionId = 'sess-advisory-runtime';
+    try {
+      await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+      await writeSessionPointer(cwd, sessionId);
+      await writeNativeSubagentTracking(cwd, sessionId, true);
+      await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+      await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+      await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+      const result = await runRalplanConsensus({
+        async draft() {
+          await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+          const planPath = join(cwd, '.omx', 'plans', 'advisory.md');
+          await writeFile(planPath, '# approved plan\n');
+          return { planPath, summary: 'draft' };
+        },
+        async architectReview() {
+          return {
+            verdict: 'approve', agent_role: 'architect', provenance_kind: 'native_subagent',
+            session_id: sessionId, thread_id: 'thread-architect', artifact_path: '.omx/artifacts/architect.md',
+          };
+        },
+        async criticReview() {
+          return {
+            verdict: 'approve', agent_role: 'critic', provenance_kind: 'native_subagent',
+            session_id: sessionId, thread_id: 'thread-critic', artifact_path: '.omx/artifacts/critic.md',
+          };
+        },
+      }, {
+        task: 'produce advisory only', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
+        workflowVariant: 'advisory', rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
+      });
+      assert.equal(result.status, 'completed', result.error ?? 'advisory runtime did not complete');
+      assert.equal(result.planningComplete, true);
+      assert.equal(result.executionHandoffAuthorized, false);
+      assert.equal(result.ralplanConsensusGate.complete, false);
+      assert.equal(result.ralplanReviewLifecycle?.complete, true);
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(projection?.fence?.state, 'closed');
+      assert.equal(projection?.journal?.phase, 'committed');
+      const state = await readScopedRalplanState(cwd, sessionId);
+      assert.equal(state.active, false);
+      assert.equal(state.workflow_variant, 'advisory');
+      assert.equal(state.execution_handoff_authorized, false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a stored approved journal in the runtime catch path', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-runtime-catch-'));
+    const sessionId = 'sess-advisory-runtime-catch';
+    const priorNodeEnv = process.env.NODE_ENV;
+    const priorFailpoint = process.env.OMX_RALPLAN_ADVISORY_FAILPOINT;
+    try {
+      process.env.NODE_ENV = 'test';
+      process.env.OMX_RALPLAN_ADVISORY_FAILPOINT = 'journal-prepare';
+      await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+      await writeSessionPointer(cwd, sessionId);
+      await writeNativeSubagentTracking(cwd, sessionId, true);
+      await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+      await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+      await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+      const result = await runRalplanConsensus({
+        async draft() {
+          await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+          const planPath = join(cwd, '.omx', 'plans', 'advisory.md');
+          await writeFile(planPath, '# approved plan\n');
+          return { planPath, summary: 'draft' };
+        },
+        async architectReview() {
+          return { verdict: 'approve', agent_role: 'architect', provenance_kind: 'native_subagent', session_id: sessionId, thread_id: 'thread-architect', artifact_path: '.omx/artifacts/architect.md' };
+        },
+        async criticReview() {
+          return { verdict: 'approve', agent_role: 'critic', provenance_kind: 'native_subagent', session_id: sessionId, thread_id: 'thread-critic', artifact_path: '.omx/artifacts/critic.md' };
+        },
+      }, {
+        task: 'recover approved advisory', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
+        workflowVariant: 'advisory', rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
+      });
+      assert.equal(result.status, 'completed', result.error ?? 'runtime did not recover approved journal');
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(projection?.journal?.outcome, 'approved');
+      assert.equal(projection?.fence?.state, 'closed');
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
+      if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_FAILPOINT; else process.env.OMX_RALPLAN_ADVISORY_FAILPOINT = priorFailpoint;
       await rm(cwd, { recursive: true, force: true });
     }
   });

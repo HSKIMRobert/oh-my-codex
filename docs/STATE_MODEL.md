@@ -248,6 +248,14 @@ These rules should remain true unless intentionally changed:
 - native-hook output is a presentation layer over shared transition results, not a separate decision engine
 - compatibility sync must not resurrect completed source modes
 
+## Ralplan Advisory fence
+
+Standalone `$ralplan --advisory` separates local review completion from execution authority. Its append-only generation state lives at `.omx/state/sessions/<session>/ralplan-advisory/<generation>/`; `current.json` is a scope-validated CAS pointer, `fence.json` plus chained fence events is the durable deny boundary, and `closeout-journal.json` reconciles mode/skill mirrors after crashes.
+
+An approved Advisory terminalizes as `active:false` with `ralplan_review_lifecycle.complete:true`, while `ralplan_consensus_gate.complete`, `host_verified`, and `execution_handoff_authorized` are present and explicitly `false` (absence is invalid). `approved+proven` additionally requires the complete generation/iteration lifecycle digests and a successful post-write evidence revalidation; `approved+unproven` can only enter recovery-required. Negative outcomes terminalize as abandoned or recovery-required. Every inactive Advisory state requires either a canonical terminal fence plus committed generation-bound closeout journal, or an abandoned fence plus a separate append-only `admin-event-0001.json` bound to the exact prior fence/journal bytes. The closeout journal stores the exact reduced root/session skill projections so reconciliation repairs drift without deleting unrelated entries. Administrative abandonment never rewrites the original consensus journal and is idempotently recoverable whether that journal was prepared or committed. Missing, corrupt, unknown, mismatched, or partially committed state fails closed. Advisory evidence files are capped at 128 KiB on Darwin because the pinned-directory helper enforces that platform ceiling; other supported platforms use the 8 MiB ceiling.
+
+`pending_closeout`, `recovery_required`, `closed`, and `abandoned` deny product writes, orchestration, goal lifecycle, children, continuations, auto-nudges, Stop release, and unknown mutation transports. Only a later distinct native root `UserPromptSubmit` whose primary clause is an affirmative execution imperative plus a concrete anchor may append `released`; quoted/code/documental/meta directives are inert. Every activation, including G1, is two-phase: the intent remains durable and deny-first through activation/current publication, the session mode binding is persisted and fsynced, and only authenticated native-root reconciliation removes the intent. Replan and new-Advisory requests roll over to G+1 under the same current-pointer lock/CAS without rewriting G. A pending rollover intent is never auto-published from its self-asserted contents. Abandon never grants execution.
+
 ## Practical guidance
 
 ### If you are changing transition rules

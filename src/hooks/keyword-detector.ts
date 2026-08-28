@@ -12,7 +12,7 @@
 
 import { constants as fsConstants } from 'node:fs';
 import { assertValidHandoffCarriersIn } from '../state/handoff-carrier.js';
-import { access, lstat, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, open, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { classifyTaskSize, isHeavyMode, type TaskSizeResult, type TaskSizeThresholds } from './task-size-detector.js';
@@ -51,6 +51,7 @@ import {
   isAutopilotSuccessfulTerminalState,
   type AutopilotCompletionAdvisory,
 } from '../autopilot/completion-gate.js';
+import { activateRalplanAdvisory, isDirectRalplanAdvisoryInvocation, readAuthorizedPendingRalplanActivation, readCurrentRalplanAdvisory, reconcileRalplanAdvisory } from '../ralplan/advisory.js';
 import {
   preflightSelectedTargetOwner,
   extractSelectedTargetOwnerEvidence,
@@ -149,6 +150,8 @@ export interface SkillActiveState {
   transition_error?: string;
   transition_message?: string;
   transition_messages?: string[];
+  workflow_variant?: 'advisory';
+  advisory_generation_id?: string;
   requested_skills?: string[];
   deferred_skills?: string[];
   [key: string]: unknown;
@@ -167,6 +170,11 @@ export interface RecordSkillActivationInput {
   allowSecondaryAutopilot?: boolean;
   resolvedPromptTurnContext?: ResolvedPromptTurnContext;
   onProvenanceRejected?: (diagnostic: PromptDiagnosticDescriptor) => void | Promise<void>;
+}
+
+interface RecordSkillActivationDependencies {
+  advisoryActivationFailpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer') => void | Promise<void>;
+  advisoryAfterModeBindingFailpoint?: () => void | Promise<void>;
 }
 
 export interface DeepInterviewModeStatePersistenceInput {
@@ -676,7 +684,11 @@ async function persistStatefulSkillSeedState(
   previousSkill: SkillActiveState | null,
   activationText: string,
   sourceCwd: string,
-  options: { activeContinuation?: boolean; forceSessionScope?: boolean } = {},
+  options: {
+    activeContinuation?: boolean; forceSessionScope?: boolean;
+    advisoryActivationFailpoint?: RecordSkillActivationDependencies['advisoryActivationFailpoint'];
+    advisoryAfterModeBindingFailpoint?: RecordSkillActivationDependencies['advisoryAfterModeBindingFailpoint'];
+  } = {},
 ): Promise<SkillActiveState> {
   const config = STATEFUL_SKILL_SEED_CONFIG[nextSkill.skill as StatefulSkillMode];
   if (!config) return nextSkill;
@@ -738,6 +750,36 @@ async function persistStatefulSkillSeedState(
 
   if (config.mode === 'deep-interview') {
     Object.assign(baseState, buildDeepInterviewConfigStateFields(nextSkill.deep_interview_config));
+  }
+
+  const advisoryInvocation = config.mode === 'ralplan'
+    && isDirectRalplanAdvisoryInvocation(activationText);
+  if (config.mode === 'ralplan' && advisoryInvocation) {
+    const sessionId = safeString(nextSkill.session_id).trim();
+    const rootThreadId = safeString(nextSkill.thread_id).trim();
+    const activationTurnId = safeString(nextSkill.turn_id).trim();
+    if (!sessionId || !rootThreadId || !activationTurnId) throw new Error('ralplan_advisory_canonical_turn_identity_required');
+    const prior = await readCurrentRalplanAdvisory(sourceCwd, sessionId);
+    const pendingRecovery = prior?.corruption === 'rollover_pending_admin'
+      || prior?.corruption === 'current_missing_with_advisory_state'
+      ? await readAuthorizedPendingRalplanActivation({
+        cwd: sourceCwd, sessionId, producer: 'native', threadKind: 'root-or-drift',
+        rootThreadId, activationTurnId, prompt: activationText,
+      })
+      : null;
+    if (prior?.corruption && !pendingRecovery) throw new Error(`ralplan_advisory_${prior.corruption}`);
+    if (!pendingRecovery && prior && prior.fence?.state !== 'released') throw new Error('ralplan_advisory_existing_generation_not_released');
+    const activation = pendingRecovery ?? await activateRalplanAdvisory({
+      cwd: sourceCwd, sessionId, rootThreadId, activationTurnId,
+      ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),
+      nowIso, activationPrompt: activationText,
+      failpoint: options.advisoryActivationFailpoint,
+    });
+    baseState.workflow_variant = 'advisory';
+    baseState.advisory_generation_id = activation.generation_id;
+    baseState.execution_handoff_authorized = false;
+    baseState.host_verified = false;
+    baseState.ralplan_consensus_gate = { complete: false };
   }
 
   if (config.mode === 'autopilot') {
@@ -832,11 +874,25 @@ async function persistStatefulSkillSeedState(
 
   await mkdir(dirname(absolutePath), { recursive: true });
   await writeStateFile(absolutePath, JSON.stringify(baseState, null, 2));
+  if (baseState.workflow_variant === 'advisory') {
+    const bindingHandle = await open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try { await bindingHandle.sync(); } finally { await bindingHandle.close(); }
+    await options.advisoryAfterModeBindingFailpoint?.();
+    const committed = await reconcileRalplanAdvisory(sourceCwd, safeString(baseState.session_id), {
+      producer: 'native', threadKind: 'root-or-drift', rootThreadId: safeString(baseState.thread_id),
+      activationTurnId: safeString(baseState.turn_id),
+    });
+    if (!committed || committed.corruption) throw new Error(`ralplan_advisory_activation_commit_failed:${committed?.corruption ?? 'missing'}`);
+  }
 
   return {
     ...nextSkill,
     initialized_mode: config.mode,
     initialized_state_path: relativePath,
+    ...(baseState.workflow_variant === 'advisory' ? {
+      workflow_variant: 'advisory' as const,
+      advisory_generation_id: safeString(baseState.advisory_generation_id),
+    } : {}),
   };
 }
 
@@ -3794,6 +3850,7 @@ async function preflightKeywordTargetState(
 
 export async function recordSkillActivation(
   input: RecordSkillActivationInput,
+  dependencies: RecordSkillActivationDependencies = {},
 ): Promise<SkillActiveState | null> {
 
   const classification = input.classification ?? classifyKeywordInput(input.text);
@@ -3873,6 +3930,12 @@ export async function recordSkillActivation(
     classification,
   );
   if (!match) return null;
+
+  const mentionsAdvisory = /\$(?:oh-my-codex:)?ralplan\s+--advisory\b/u.test(input.text);
+  const validAdvisoryInvocation = isDirectRalplanAdvisoryInvocation(input.text);
+  if (mentionsAdvisory && (!validAdvisoryInvocation || match.skill !== 'ralplan' || classification.matches.some((candidate) => candidate.skill !== 'ralplan'))) {
+    return null;
+  }
   const hadDeepInterviewLock = previous?.skill === 'deep-interview' && previous?.input_lock?.active === true;
   const matches = filterMatchesForTeamMode(classification.matches, teamMode.enabled);
 
@@ -3904,6 +3967,7 @@ export async function recordSkillActivation(
       );
       await persistDeepInterviewModeState(input.stateDir, applyProvenanceOwner(state), nowIso, previous, input);
     } catch (error) {
+      if (isDirectRalplanAdvisoryInvocation(input.text)) throw error;
       console.warn('[omx] warning: failed to persist keyword activation state', error);
     }
 
@@ -4168,6 +4232,8 @@ export async function recordSkillActivation(
           {
             activeContinuation: requestedEntry.skill === 'autopilot' && sameSkillContinuation,
             forceSessionScope: suppressRootMutation,
+            advisoryActivationFailpoint: dependencies.advisoryActivationFailpoint,
+            advisoryAfterModeBindingFailpoint: dependencies.advisoryAfterModeBindingFailpoint,
           },
         );
         if (requestedEntry.skill === workflowState.skill) {
@@ -4175,6 +4241,8 @@ export async function recordSkillActivation(
             ...ownedWorkflowState,
             initialized_mode: seeded.initialized_mode,
             initialized_state_path: seeded.initialized_state_path,
+            ...(seeded.workflow_variant ? { workflow_variant: seeded.workflow_variant } : {}),
+            ...(seeded.advisory_generation_id ? { advisory_generation_id: seeded.advisory_generation_id } : {}),
           };
         }
       }
@@ -4189,6 +4257,7 @@ export async function recordSkillActivation(
       await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
       return nextState;
     } catch (error) {
+      if (isDirectRalplanAdvisoryInvocation(input.text)) throw error;
       console.warn('[omx] warning: failed to persist keyword activation state', error);
     }
 
@@ -4233,6 +4302,8 @@ export async function recordSkillActivation(
       {
         activeContinuation: match.skill === 'autopilot' && sameSkillContinuation,
         forceSessionScope: suppressRootMutation,
+        advisoryActivationFailpoint: dependencies.advisoryActivationFailpoint,
+        advisoryAfterModeBindingFailpoint: dependencies.advisoryAfterModeBindingFailpoint,
       },
     );
     const ownedNextState = applyProvenanceOwner(nextState);
