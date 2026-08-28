@@ -1,15 +1,25 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { activateRalplanAdvisory, readCurrentRalplanAdvisory, reconcileRalplanAdvisory, terminalizeRalplanAdvisory } from '../../ralplan/advisory.js';
-import { buildRalplanAdvisoryFenceGuardOutput, dispatchCodexNativeHook } from '../codex-native-hook.js';
+import { spawnSync } from 'node:child_process';
+import {
+  activateRalplanAdvisory,
+  readCurrentRalplanAdvisory,
+  reconcileRalplanAdvisory,
+  observeRalplanAdvisoryPrompt,
+  terminalizeRalplanAdvisory,
+} from '../../ralplan/advisory.js';
+import {
+  buildRalplanAdvisoryRoutingObservation,
+  dispatchCodexNativeHook,
+} from '../codex-native-hook.js';
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
-async function closedDispatchFixture(prefix: string): Promise<{ cwd: string; sessionId: string; payload: Record<string, unknown> }> {
+async function terminalFixture(prefix: string) {
   const cwd = await mkdtemp(join(tmpdir(), prefix));
   roots.push(cwd);
   const sessionId = 'session-a';
@@ -18,375 +28,293 @@ async function closedDispatchFixture(prefix: string): Promise<{ cwd: string; ses
   await mkdir(sessionDir, { recursive: true });
   await writeFile(join(stateDir, 'session.json'), JSON.stringify({
     session_id: sessionId, native_session_id: sessionId, owner_codex_session_id: sessionId,
-    started_at: '2026-08-28T00:00:00.000Z', cwd, state_root: stateDir,
+    leader_thread_id: 'root-a', started_at: '2026-08-28T00:00:00.000Z', cwd, state_root: stateDir,
+  }));
+  await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+    schemaVersion: 1,
+    sessions: {
+      [sessionId]: {
+        session_id: sessionId, leader_thread_id: 'root-a',
+        threads: { 'root-a': { thread_id: 'root-a', kind: 'leader' } },
+      },
+    },
   }));
   const activation = await activateRalplanAdvisory({
     cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a',
   });
-  await commitActivation(cwd, sessionId, activation);
+  const activeMode = {
+    active: true, mode: 'ralplan', current_phase: 'draft', iteration: 1,
+    session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-a',
+    workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
+    execution_handoff_authorized: false, host_verified: false, planning_complete: false,
+  };
+  await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(activeMode));
+  await reconcileRalplanAdvisory(cwd, sessionId, {
+    producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+  });
   await terminalizeRalplanAdvisory({
     cwd, sessionId, generationId: activation.generation_id, closingTurnId: 'turn-close', iteration: 1,
     outcome: 'cancelled', integrityStatus: 'proven',
   });
   const inactiveMode = {
-    active: false, mode: 'ralplan', current_phase: 'complete', iteration: 1,
-    session_id: sessionId, owner_codex_session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-close',
-    workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
-    execution_handoff_authorized: false, host_verified: false, ralplan_consensus_gate: { complete: false },
+    ...activeMode, active: false, current_phase: 'complete', planning_complete: true,
+    execution_handoff_authorized: false, host_verified: false,
   };
   await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(inactiveMode));
   await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify(inactiveMode));
-  return { cwd, sessionId, payload: {
-    hook_event_name: 'UserPromptSubmit', cwd, session_id: sessionId,
-    thread_id: 'root-a', turn_id: 'turn-new', prompt: 'creá un nuevo advisory para esta tarea',
-  } };
+  return { cwd, sessionId, stateDir, sessionDir, activation };
 }
 
-async function commitActivation(cwd: string, sessionId: string, activation: Awaited<ReturnType<typeof activateRalplanAdvisory>>): Promise<void> {
-  const dir = join(cwd, '.omx', 'state', 'sessions', sessionId);
-  await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, 'ralplan-state.json'), JSON.stringify({
-    active: true, mode: 'ralplan', session_id: sessionId, thread_id: activation.root_thread_id,
-    turn_id: activation.activation_turn_id, workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
-  }));
-  const projection = await reconcileRalplanAdvisory(cwd, sessionId, {
-    producer: 'native', threadKind: 'root-or-drift', rootThreadId: activation.root_thread_id, activationTurnId: activation.activation_turn_id,
+async function conflictingReplayFixture(prefix: string, standardPhase = 'architect-review') {
+  const fixture = await terminalFixture(prefix);
+  // Replace the committed cancellation fixture with a fresh generation whose
+  // journal is deliberately left prepared before any mirror replay.
+  await rm(join(fixture.sessionDir, 'ralplan-advisory'), { recursive: true, force: true });
+  const activation = await activateRalplanAdvisory({
+    cwd: fixture.cwd, sessionId: fixture.sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-replay', generationId: 'generation-replay',
   });
-  assert.equal(projection?.corruption, null);
+  const advisoryMode = {
+    active: true, mode: 'ralplan', current_phase: 'draft', session_id: fixture.sessionId, thread_id: 'root-a', turn_id: 'turn-replay',
+    workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
+  };
+  await writeFile(join(fixture.sessionDir, 'ralplan-state.json'), JSON.stringify(advisoryMode));
+  await reconcileRalplanAdvisory(fixture.cwd, fixture.sessionId, {
+    producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'root-a', activationTurnId: 'turn-replay',
+  });
+  await assert.rejects(terminalizeRalplanAdvisory({
+    cwd: fixture.cwd, sessionId: fixture.sessionId, generationId: activation.generation_id,
+    closingTurnId: 'turn-close-replay', iteration: 1, outcome: 'cancelled', integrityStatus: 'proven',
+    terminalModeUpdates: {
+      ...advisoryMode, active: false, current_phase: 'cancelled', execution_handoff_authorized: false, host_verified: false,
+    },
+    failpoint: (name) => { if (name === 'journal-prepare') throw new Error('prepared-replay'); },
+  }), /prepared-replay/);
+  const standardMode = {
+    active: true, mode: 'ralplan', workflow_variant: 'standard', current_phase: standardPhase,
+    session_id: fixture.sessionId, thread_id: 'root-standard', turn_id: 'turn-standard',
+  };
+  const modePath = join(fixture.sessionDir, 'ralplan-state.json');
+  await writeFile(modePath, JSON.stringify(standardMode));
+  return { ...fixture, activation, generationDir: join(fixture.sessionDir, 'ralplan-advisory', activation.generation_id), modePath, standardMode };
 }
 
-async function bindingWithoutCanonicalAdvisoryRoot(prefix: string, options: { advisory: boolean; symlinkLoop?: boolean } = { advisory: true }): Promise<{ cwd: string; sessionId: string }> {
-  const cwd = await mkdtemp(join(tmpdir(), prefix));
-  roots.push(cwd);
-  const sessionId = 'session-a';
-  const stateDir = join(cwd, '.omx', 'state');
-  const sessionDir = join(stateDir, 'sessions', sessionId);
-  await mkdir(sessionDir, { recursive: true });
-  await writeFile(join(stateDir, 'session.json'), JSON.stringify({
-    session_id: sessionId, native_session_id: sessionId, owner_codex_session_id: sessionId,
-    started_at: '2026-08-28T00:00:00.000Z', cwd, state_root: stateDir,
-  }));
-  await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(options.advisory
-    ? { active: false, mode: 'ralplan', workflow_variant: 'advisory', advisory_generation_id: 'generation-a' }
-    : { active: false, mode: 'ralplan' }));
-  if (options.symlinkLoop) await symlink('ralplan-advisory', join(sessionDir, 'ralplan-advisory'));
-  return { cwd, sessionId };
+async function snapshotDirectoryBytes(root: string): Promise<Array<[string, string]>> {
+  const values: Array<[string, string]> = [];
+  const walk = async (directory: string, prefix = ''): Promise<void> => {
+    for (const entry of (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await walk(path, relative);
+      else values.push([relative, (await readFile(path)).toString('base64')]);
+    }
+  };
+  await walk(root);
+  return values;
 }
 
-describe('ralplan advisory native hook fence', () => {
-  it('allows only explicitly audited read-only MCP methods through a real PreToolUse dispatch', async () => {
-    const { cwd, sessionId } = await closedDispatchFixture('omx-advisory-hook-mcp-policy-');
-    for (const toolName of [
-      'mcp__filesystem__read_file',
-      'mcp__omx_state__state_read',
-      'mcp__omx_goal__get_goal',
-    ]) {
-      const result = await dispatchCodexNativeHook({
+describe('ralplan advisory non-authoritative native hooks', () => {
+  it('the packed hook never emits a PreToolUse block for Advisory, including mutation and unknown MCP transports', async () => {
+    const { cwd, sessionId } = await terminalFixture('omx-advisory-nonauthoritative-pretool-');
+    for (const toolName of ['Write', 'Bash', 'mcp__omx_goal__create_goal', 'mcp__thirdparty__commit', 'mcp__unknown__anything']) {
+      const packed = await dispatchCodexNativeHook({
         hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-        tool_name: toolName, tool_input: {},
+        tool_name: toolName, tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
       } as never, { cwd });
-      assert.equal(result.outputJson, null, toolName);
+      assert.notEqual(packed.outputJson?.decision, 'block', toolName);
     }
-    for (const toolName of [
-      'mcp__thirdparty__lookup',
-      'mcp__thirdparty__commit',
-      'mcp__thirdparty__write',
-      'mcp__thirdparty__update',
-      'mcp__thirdparty__create',
-      'mcp__thirdparty__delete',
-      ' mcp__omx_state__state_read',
-      'mcp__omx_state__state_read ',
-      '\u00a0mcp__omx_state__state_read',
-      'mcp__omx_state__state_read\u2003',
-      'MCP__omx_state__state_read',
-    ]) {
-      const result = await dispatchCodexNativeHook({
-        hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-        tool_name: toolName, tool_input: {},
-      } as never, { cwd });
-      assert.equal(result.outputJson?.decision, 'block', toolName);
-    }
-  });
-
-  it('keeps inactive Advisory product writes and orchestration blocked while allowing reads', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-'));
-    roots.push(cwd);
-    const activation = await activateRalplanAdvisory({ cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a' });
-    await commitActivation(cwd, 'session-a', activation);
-    await terminalizeRalplanAdvisory({
-      cwd, sessionId: 'session-a', generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
-      outcome: 'cancelled', integrityStatus: 'proven',
-    });
-    const write = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, cwd, 'session-a');
-    assert.equal(write?.decision, 'block');
-    const orchestration = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'mcp__omx_goal__create_goal', tool_input: { objective: 'execute' },
-    } as never, cwd, 'session-a');
-    assert.equal(orchestration?.decision, 'block');
-    const read = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: join(cwd, 'README.md') },
-    } as never, cwd, 'session-a');
-    assert.equal(read, null);
-  });
-
-  it('fails closed when current state is tampered', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-tamper-'));
-    roots.push(cwd);
-    const activation = await activateRalplanAdvisory({ cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a' });
-    await commitActivation(cwd, 'session-a', activation);
-    await writeFile(join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-advisory', 'current.json'), '{');
-    const result = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, cwd, 'session-a');
-    assert.equal(result?.decision, 'block');
-    assert.match(String(result?.reason), /CORRUPT/);
-  });
-
-  it('blocks Write after the generation-one activation intent is durable but before publication', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-g1-intent-'));
-    roots.push(cwd);
-    await assert.rejects(activateRalplanAdvisory({
-      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a',
-      failpoint: (name) => { if (name === 'rollover_intent') throw new Error('crash-after-intent'); },
-    }), /crash-after-intent/);
-    const result = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, cwd, 'session-a');
-    assert.equal(result?.decision, 'block');
-  });
-
-  it('blocks Write when a published activation has an inactive binding but no closeout fence or journal', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-inactive-without-closeout-'));
-    roots.push(cwd);
-    const sessionId = 'session-a';
-    const activation = await activateRalplanAdvisory({
-      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a',
-    });
-    await commitActivation(cwd, sessionId, activation);
-    const modePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
-    const mode = JSON.parse(await readFile(modePath, 'utf8'));
-    await writeFile(modePath, JSON.stringify({ ...mode, active: false }));
-    const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-    assert.equal(projection?.corruption, 'inactive_without_closeout');
-    assert.equal(projection?.denyProductWrites, true);
-    const result = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, cwd, sessionId);
-    assert.equal(result?.decision, 'block');
-    assert.match(String(result?.reason), /inactive_without_closeout/);
-  });
-
-  it('blocks a real PreToolUse Write when an inactive Advisory binding has no state root', async () => {
-    const { cwd, sessionId } = await bindingWithoutCanonicalAdvisoryRoot('omx-advisory-hook-missing-root-');
-    const result = await dispatchCodexNativeHook({
-      hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-      tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, { cwd });
-    assert.equal(result.outputJson?.decision, 'block');
-    assert.match(String(result.outputJson?.reason), /STATE_MISSING/);
-    const read = await dispatchCodexNativeHook({
-      hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-      tool_name: 'Read', tool_input: { file_path: join(cwd, 'README.md') },
-    } as never, { cwd });
-    assert.equal(read.outputJson, null);
-    for (const toolName of ['create_goal', 'hostile_unknown_transport']) {
-      const denied = await dispatchCodexNativeHook({
-        hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-        tool_name: toolName, tool_input: toolName === 'create_goal' ? { objective: 'execute' } : {},
-      } as never, { cwd });
-      assert.equal(denied.outputJson?.decision, 'block', toolName);
-      assert.match(String(denied.outputJson?.reason), /STATE_MISSING/, toolName);
-    }
-  });
-
-  it('blocks a real PreToolUse Write when the Advisory root realpath fails with ELOOP', async () => {
-    const { cwd, sessionId } = await bindingWithoutCanonicalAdvisoryRoot('omx-advisory-hook-eloop-', { advisory: true, symlinkLoop: true });
-    const result = await dispatchCodexNativeHook({
-      hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-      tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, { cwd });
-    assert.equal(result.outputJson?.decision, 'block');
-    assert.match(String(result.outputJson?.reason), /STATE_UNREADABLE.*ELOOP/);
-    const read = await dispatchCodexNativeHook({
-      hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-      tool_name: 'Read', tool_input: { file_path: join(cwd, 'README.md') },
-    } as never, { cwd });
-    assert.equal(read.outputJson, null);
-    for (const toolName of ['create_goal', 'hostile_unknown_transport']) {
-      const denied = await dispatchCodexNativeHook({
-        hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-        tool_name: toolName, tool_input: toolName === 'create_goal' ? { objective: 'execute' } : {},
-      } as never, { cwd });
-      assert.equal(denied.outputJson?.decision, 'block', toolName);
-      assert.match(String(denied.outputJson?.reason), /STATE_UNREADABLE/, toolName);
-    }
-  });
-
-  it('fails closed when a canonical Advisory root disappears between detection and projection', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-detect-read-race-'));
-    roots.push(cwd);
-    const sessionId = 'session-a';
-    const stateDir = join(cwd, '.omx', 'state');
-    await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
-    await writeFile(join(stateDir, 'session.json'), JSON.stringify({
-      session_id: sessionId, native_session_id: sessionId, owner_codex_session_id: sessionId,
-      started_at: '2026-08-28T00:00:00.000Z', cwd, state_root: stateDir,
-    }));
-    const activation = await activateRalplanAdvisory({
-      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a',
-    });
-    await commitActivation(cwd, sessionId, activation);
-    let seamCalls = 0;
-    const result = await dispatchCodexNativeHook({
-      hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
-      tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, {
+    const cli = spawnSync(process.execPath, [join(process.cwd(), 'dist', 'scripts', 'codex-native-hook.js')], {
       cwd,
-      ralplanAdvisoryAfterDetectionFn: async (detection) => {
-        seamCalls += 1;
-        assert.equal(detection.status, 'normal');
-        await rm(detection.root, { recursive: true, force: true });
-      },
+      input: JSON.stringify({
+        hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
+        tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'packed.ts'), content: 'x' },
+      }),
+      encoding: 'utf8',
     });
-    assert.equal(seamCalls, 1);
-    assert.equal(result.outputJson?.decision, 'block');
-    assert.match(String(result.outputJson?.reason), /STATE_CHANGED_DURING_READ/);
+    assert.equal(cli.status, 0, cli.stderr);
+    assert.notEqual((JSON.parse(cli.stdout || '{}') as Record<string, unknown>).decision, 'block');
   });
 
-  it('treats absent Advisory root plus a non-Advisory binding as no Advisory state', async () => {
-    const { cwd, sessionId } = await bindingWithoutCanonicalAdvisoryRoot('omx-advisory-hook-no-state-', { advisory: false });
-    const result = await buildRalplanAdvisoryFenceGuardOutput({
-      hook_event_name: 'PreToolUse', tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
-    } as never, cwd, sessionId);
-    assert.equal(result, null);
-  });
-
-  it('suppresses global prompt, SessionStart, and Stop side effects when Advisory root lookup is unreadable', async () => {
-    for (const eventName of ['UserPromptSubmit', 'SessionStart', 'Stop'] as const) {
-      const { cwd, sessionId } = await bindingWithoutCanonicalAdvisoryRoot(`omx-advisory-hook-no-side-effects-${eventName}-`, { advisory: true, symlinkLoop: true });
-      const hooksDir = join(cwd, '.omx', 'hooks');
-      await mkdir(hooksDir, { recursive: true });
-      await writeFile(join(hooksDir, 'record-lifecycle.mjs'), [
-        "import { appendFileSync } from 'node:fs';",
-        "export async function onHookEvent(event) { appendFileSync('hook-events.jsonl', JSON.stringify({ event: event.event }) + '\\n'); }",
-      ].join('\n'));
-      let hudCalls = 0;
-      const result = await dispatchCodexNativeHook({
-        hook_event_name: eventName, cwd, session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-a',
-        ...(eventName === 'UserPromptSubmit' ? { prompt: '$ralplan --advisory nueva versión' } : {}),
-      } as never, { cwd, reconcileHudForPromptSubmitFn: async () => {
-        hudCalls += 1;
-        return { status: 'unchanged', paneId: '%1', desiredHeight: 3, duplicateCount: 0 };
-      } });
-      assert.equal(result.skillState, null, eventName);
-      assert.equal(hudCalls, 0, eventName);
-      await assert.rejects(access(join(cwd, 'hook-events.jsonl')), /ENOENT/, eventName);
-      await assert.rejects(access(join(cwd, '.omx', 'state', 'skill-active-state.json')), /ENOENT/, eventName);
-    }
-  });
-
-  it('allows only one concurrent native root UserPromptSubmit to own the new Advisory generation', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-hook-new-generation-'));
-    roots.push(cwd);
-    const sessionId = 'session-a';
-    const stateDir = join(cwd, '.omx', 'state');
-    const sessionDir = join(stateDir, 'sessions', sessionId);
-    await mkdir(sessionDir, { recursive: true });
-    await writeFile(join(stateDir, 'session.json'), JSON.stringify({
-      session_id: sessionId, native_session_id: sessionId, owner_codex_session_id: sessionId,
-      started_at: '2026-08-28T00:00:00.000Z', cwd, state_root: stateDir,
-    }));
-    const activation = await activateRalplanAdvisory({
-      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a',
+  it('observes an explicit later execution request without automatic handoff or persistent elevation', async () => {
+    const { cwd, sessionId, sessionDir, activation } = await terminalFixture('omx-advisory-routing-observation-');
+    const before = await readCurrentRalplanAdvisory(cwd, sessionId);
+    const observed = await observeRalplanAdvisoryPrompt({
+      cwd, sessionId, turnId: 'turn-execute', threadId: 'root-a', prompt: 'implementá el plan .omx/plans/plan.md',
+      producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
     });
-    await commitActivation(cwd, sessionId, activation);
-    await terminalizeRalplanAdvisory({
-      cwd, sessionId, generationId: activation.generation_id, closingTurnId: 'turn-close', iteration: 1,
-      outcome: 'cancelled', integrityStatus: 'proven',
-    });
-    const inactiveMode = {
-      active: false, mode: 'ralplan', current_phase: 'complete', iteration: 1,
-      session_id: sessionId, owner_codex_session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-close',
-      workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
-      execution_handoff_authorized: false, host_verified: false, ralplan_consensus_gate: { complete: false },
-    };
-    await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(inactiveMode));
-    await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify(inactiveMode));
-
-    const submit = (turnId: string) => dispatchCodexNativeHook({
-      hook_event_name: 'UserPromptSubmit', cwd, session_id: sessionId,
-      thread_id: 'root-a', turn_id: turnId, prompt: 'creá un nuevo advisory para esta tarea',
-    } as never, { cwd });
-    const results = await Promise.all([submit('turn-new-a'), submit('turn-new-b')]);
-
-    const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-    assert.equal(projection?.activation.predecessor_generation_id, activation.generation_id);
-    const generations = (await (await import('node:fs/promises')).readdir(join(sessionDir, 'ralplan-advisory'), { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory());
-    assert.equal(generations.length, 2, JSON.stringify({ results, projection }));
     const mode = JSON.parse(await readFile(join(sessionDir, 'ralplan-state.json'), 'utf8'));
-    assert.equal(mode.advisory_generation_id, projection?.activation.generation_id);
+    const context = buildRalplanAdvisoryRoutingObservation(observed.intent, observed.projection, mode) ?? '';
+    assert.match(context, /ended as cancelled/i);
+    assert.doesNotMatch(context, /planning is complete/i);
+    const after = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.deepEqual(after?.fence, before?.fence);
+    assert.equal(mode.active, false);
+    assert.equal(mode.planning_complete, true);
+    assert.equal(mode.host_verified, false);
+    assert.equal(mode.execution_handoff_authorized, false);
+    await assert.rejects(readFile(join(sessionDir, 'ralplan-advisory', activation.generation_id, 'release-authority.json')), /ENOENT/);
   });
 
-  it('dispatches both canonical Advisory literals through the same terminal-fence rollover parser', async () => {
-    for (const [index, literal] of ['$ralplan --advisory nueva versión', '$oh-my-codex:ralplan --advisory nueva versión'].entries()) {
-      const { cwd, sessionId, payload } = await closedDispatchFixture(`omx-advisory-hook-literal-${index}-`);
-      const result = await dispatchCodexNativeHook({ ...payload, prompt: literal } as never, { cwd });
-      assert.doesNotMatch(JSON.stringify(result.outputJson), /error|mismatch|corrupt/i, literal);
-      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-      assert.equal(projection?.activation.predecessor_generation_id, 'generation-a', literal);
-      assert.equal(projection?.corruption, null, literal);
+  it('keeps classifier negatives inert and supplies context only for a primary affirmative request', async () => {
+    for (const [index, prompt] of ['¿podés implementarlo?', 'no quiero implementar', 'considerá implementar', 'copiá la frase implementá el plan'].entries()) {
+      const { cwd, sessionId } = await terminalFixture(`omx-advisory-routing-negative-${index}-`);
+      const observed = await observeRalplanAdvisoryPrompt({
+        cwd, sessionId, turnId: `turn-${index}`, threadId: 'root-a', prompt,
+        producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+      });
+      const context = buildRalplanAdvisoryRoutingObservation(observed.intent, observed.projection, null) ?? '';
+      assert.doesNotMatch(context, /non-authoritative routing observation/i, prompt);
     }
   });
 
-  it('recovers every rollover publication failpoint by replaying the exact authenticated native-root UserPromptSubmit', async () => {
-    const priorNodeEnv = process.env.NODE_ENV;
-    const priorFailpoint = process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT;
-    try {
-      for (const failpoint of ['rollover_intent', 'rollover_activation', 'rollover_pointer'] as const) {
-        const { cwd, sessionId, payload } = await closedDispatchFixture(`omx-advisory-hook-replay-${failpoint}-`);
-        process.env.NODE_ENV = 'test';
-        process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT = failpoint;
-        const failed = await dispatchCodexNativeHook(payload as never, { cwd });
-        assert.match(JSON.stringify(failed.outputJson), /test_failpoint/);
-        delete process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT;
-        await dispatchCodexNativeHook(payload as never, { cwd });
-        const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
-        assert.equal(projection?.activation.predecessor_generation_id, 'generation-a', failpoint);
-        assert.equal(projection?.corruption, null, failpoint);
-        await assert.rejects(access(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'rollover-intent.json')), /ENOENT/);
-      }
-    } finally {
-      if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
-      if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT;
-      else process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT = priorFailpoint;
+  it('reports positive routing context only for a complete approved proven lifecycle without a conflicting workflow', async () => {
+    const { cwd, sessionId } = await terminalFixture('omx-advisory-routing-matrix-');
+    const base = (await readCurrentRalplanAdvisory(cwd, sessionId))!;
+    const digest = 'a'.repeat(64);
+    const approved = {
+      ...base,
+      fence: {
+        ...base.fence!, state: 'closed', outcome: 'approved', integrity_status: 'proven', evidence_bundle_sha256: digest,
+        iteration_id: 'iteration-a', plan_manifest_sha256: 'b'.repeat(64), architect_review_sha256: 'c'.repeat(64),
+        critic_review_sha256: 'd'.repeat(64),
+      },
+      journal: {
+        ...base.journal!, phase: 'committed', outcome: 'approved', integrity_status: 'proven', evidence_bundle_sha256: digest,
+        terminal_mode_updates: { ralplan_review_lifecycle: {
+          complete: true, sequence_valid: true, iteration: base.fence!.iteration, iteration_id: 'iteration-a',
+          plan_manifest_sha256: 'b'.repeat(64), architect_review_sha256: 'c'.repeat(64),
+          critic_review_sha256: 'd'.repeat(64), evidence_bundle_sha256: digest,
+          evidence_scope: 'local_runtime', host_observable: false, host_verified: false,
+        } },
+      },
+    } as typeof base;
+    const advisoryBinding = { workflow_variant: 'advisory', advisory_generation_id: base.activation.generation_id };
+    const positive = buildRalplanAdvisoryRoutingObservation('execute', approved, advisoryBinding) ?? '';
+    assert.match(positive, /planning is complete/i);
+    assert.match(buildRalplanAdvisoryRoutingObservation('execute', approved, null) ?? '', /planning is complete/i);
+    assert.equal(buildRalplanAdvisoryRoutingObservation('execute', approved, { workflow_variant: 'standard', active: true }), null);
+
+    for (const [state, outcome, expected] of [
+      ['pending_closeout', undefined, /still pending/i],
+      ['recovery_required', 'failed', /requires lifecycle recovery/i],
+      ['abandoned', 'abandoned', /ended as abandoned/i],
+      ['abandoned', 'cancelled', /ended as cancelled/i],
+    ] as const) {
+      const projection = { ...base, fence: { ...base.fence!, state, outcome } } as typeof base;
+      assert.match(buildRalplanAdvisoryRoutingObservation('execute', projection, advisoryBinding) ?? '', expected);
     }
+    const incomplete = { ...approved, journal: { ...approved.journal!, terminal_mode_updates: {} } } as typeof base;
+    assert.match(buildRalplanAdvisoryRoutingObservation('execute', incomplete, advisoryBinding) ?? '', /does not contain a complete/i);
   });
 
-  it('does not recover a pending rollover for a different turn, root, or literal prompt', async () => {
-    const priorNodeEnv = process.env.NODE_ENV;
-    const priorFailpoint = process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT;
-    try {
-      const { cwd, sessionId, payload } = await closedDispatchFixture('omx-advisory-hook-replay-negative-');
-      process.env.NODE_ENV = 'test';
-      process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT = 'rollover_intent';
-      await dispatchCodexNativeHook(payload as never, { cwd });
-      delete process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT;
-      for (const changed of [
-        { ...payload, turn_id: 'turn-other' },
-        { ...payload, thread_id: 'root-other' },
-        { ...payload, prompt: 'creá un nuevo advisory para otra tarea' },
-      ]) {
-        const denied = await dispatchCodexNativeHook(changed as never, { cwd });
-        assert.match(JSON.stringify(denied.outputJson), /pending_activation_authority_mismatch/);
-        assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.denyProductWrites, true);
-      }
-    } finally {
-      if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
-      if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT;
-      else process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT = priorFailpoint;
-    }
+  it('retains terminal evidence across restart-shaped reads without creating authorization', async () => {
+    const { cwd, sessionId, sessionDir } = await terminalFixture('omx-advisory-restart-evidence-');
+    const first = await readCurrentRalplanAdvisory(cwd, sessionId);
+    const second = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.deepEqual(second?.fence, first?.fence);
+    assert.equal(second?.corruption, null);
+    const mode = JSON.parse(await readFile(join(sessionDir, 'ralplan-state.json'), 'utf8'));
+    assert.equal(mode.host_verified, false);
+    assert.equal(mode.execution_handoff_authorized, false);
+  });
+
+  it('surfaces reconciliation failures non-authoritatively while SessionStart and Stop continue normally', async () => {
+    const { cwd, sessionId } = await terminalFixture('omx-advisory-reconcile-diagnostic-');
+    const reconcileFailure = async (): Promise<never> => { throw new Error('test-reconcile-visible'); };
+    const start = await dispatchCodexNativeHook({
+      hook_event_name: 'SessionStart', cwd, session_id: sessionId, thread_id: 'root-a', source: 'startup',
+    }, { cwd, reconcileRalplanAdvisoryFn: reconcileFailure });
+    const startContext = ((start.outputJson?.hookSpecificOutput as Record<string, unknown> | undefined)?.additionalContext ?? '') as string;
+    assert.match(startContext, /test-reconcile-visible/);
+    assert.match(startContext, /non-authoritative diagnostic/);
+    assert.match(startContext, /Execution environment/i, 'normal SessionStart context should still be produced');
+
+    const stopFixture = await terminalFixture('omx-advisory-stop-reconcile-diagnostic-');
+    const stop = await dispatchCodexNativeHook({
+      hook_event_name: 'Stop', cwd: stopFixture.cwd, source: 'codex-app', session_id: stopFixture.sessionId,
+      thread_id: 'root-a', turn_id: 'turn-stop-diagnostic',
+    }, { cwd: stopFixture.cwd, reconcileRalplanAdvisoryFn: reconcileFailure });
+    assert.notEqual(stop.outputJson?.decision, 'block');
+    const baselineFixture = await terminalFixture('omx-advisory-stop-reconcile-baseline-');
+    const baselineStop = await dispatchCodexNativeHook({
+      hook_event_name: 'Stop', cwd: baselineFixture.cwd, source: 'codex-app', session_id: baselineFixture.sessionId,
+      thread_id: 'root-a', turn_id: 'turn-stop-baseline',
+    }, { cwd: baselineFixture.cwd });
+    assert.deepEqual(stop.outputJson, baselineStop.outputJson, 'diagnostic must not change the Stop decision/output contract');
+    const logDir = join(stopFixture.cwd, '.omx', 'logs');
+    const logBytes = (await Promise.all((await (await import('node:fs/promises')).readdir(logDir))
+      .map((name) => readFile(join(logDir, name), 'utf8')))).join('\n');
+    assert.match(logBytes, /ralplan_advisory_reconciliation_diagnostic/);
+    assert.match(logBytes, /test-reconcile-visible/);
+  });
+
+  it('does not replay a terminal Advisory journal over a live standard workflow on SessionStart or Stop', async () => {
+    const snapshotRelevant = async (fixture: Awaited<ReturnType<typeof conflictingReplayFixture>>) => ({
+      mode: await readFile(fixture.modePath, 'utf8'),
+      generation: await snapshotDirectoryBytes(fixture.generationDir),
+      sessionSkill: await readFile(join(fixture.sessionDir, 'skill-active-state.json'), 'utf8').catch(() => null),
+      rootSkill: await readFile(join(fixture.stateDir, 'skill-active-state.json'), 'utf8').catch(() => null),
+    });
+
+    const startFixture = await conflictingReplayFixture('omx-advisory-standard-start-conflict-');
+    const startBefore = await snapshotRelevant(startFixture);
+    const start = await dispatchCodexNativeHook({
+      hook_event_name: 'SessionStart', cwd: startFixture.cwd, session_id: startFixture.sessionId,
+      thread_id: 'root-standard', source: 'startup',
+    }, { cwd: startFixture.cwd });
+    const startContext = ((start.outputJson?.hookSpecificOutput as Record<string, unknown> | undefined)?.additionalContext ?? '') as string;
+    assert.match(startContext, /live_session_binding_conflict/);
+    assert.deepEqual(await snapshotRelevant(startFixture), startBefore);
+    const routed = await observeRalplanAdvisoryPrompt({
+      cwd: startFixture.cwd, sessionId: startFixture.sessionId, turnId: 'turn-replan-conflict', threadId: 'root-standard',
+      prompt: 'replanificá el plan', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    assert.equal(routed.intent, 'unrelated');
+    assert.equal(routed.projection?.corruption, 'live_session_binding_conflict');
+    assert.deepEqual(await snapshotRelevant(startFixture), startBefore);
+
+    const stopFixture = await conflictingReplayFixture('omx-advisory-standard-stop-conflict-', 'critic-review');
+    const stopBefore = await snapshotRelevant(stopFixture);
+    const stop = await dispatchCodexNativeHook({
+      hook_event_name: 'Stop', cwd: stopFixture.cwd, source: 'codex-app', session_id: stopFixture.sessionId,
+      thread_id: 'root-standard', turn_id: 'turn-stop-standard-conflict',
+    }, { cwd: stopFixture.cwd });
+    assert.deepEqual(await snapshotRelevant(stopFixture), stopBefore);
+    const logBytes = (await Promise.all((await readdir(join(stopFixture.cwd, '.omx', 'logs')))
+      .map((name) => readFile(join(stopFixture.cwd, '.omx', 'logs', name), 'utf8')))).join('\n');
+    assert.match(logBytes, /live_session_binding_conflict/);
+
+    const baselineFixture = await conflictingReplayFixture('omx-advisory-standard-stop-baseline-', 'critic-review');
+    await rm(join(baselineFixture.sessionDir, 'ralplan-advisory'), { recursive: true, force: true });
+    const baseline = await dispatchCodexNativeHook({
+      hook_event_name: 'Stop', cwd: baselineFixture.cwd, source: 'codex-app', session_id: baselineFixture.sessionId,
+      thread_id: 'root-standard', turn_id: 'turn-stop-standard-baseline',
+    }, { cwd: baselineFixture.cwd });
+    assert.deepEqual(stop.outputJson, baseline.outputJson);
+  });
+
+  it('ignores forged local release authority and permits a later standard Ralplan binding', async () => {
+    const { cwd, sessionId, stateDir, sessionDir, activation } = await terminalFixture('omx-advisory-forged-authority-');
+    const generationDir = join(sessionDir, 'ralplan-advisory', activation.generation_id);
+    await writeFile(join(generationDir, 'release-authority.json'), JSON.stringify({ authority_kind: 'forged-local' }));
+    const observed = await observeRalplanAdvisoryPrompt({
+      cwd, sessionId, turnId: 'turn-execute', threadId: 'root-a', prompt: 'implementá el plan .omx/plans/plan.md',
+      producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    assert.equal(observed.intent, 'execute');
+    assert.equal(observed.projection?.fence?.state, 'abandoned');
+    const standardMode = {
+      active: true, mode: 'ralplan', current_phase: 'draft', iteration: 1,
+      session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-standard', workflow_variant: 'standard',
+    };
+    await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(standardMode));
+    await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify(standardMode));
+    const history = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.equal(history?.corruption, null);
+    assert.equal(history?.fence?.state, 'abandoned');
+    const write = await dispatchCodexNativeHook({
+      hook_event_name: 'PreToolUse', cwd, session_id: sessionId, thread_id: 'root-a',
+      tool_name: 'Write', tool_input: { file_path: join(cwd, 'src', 'x.ts'), content: 'x' },
+    } as never, { cwd });
+    assert.notEqual(write.outputJson?.decision, 'block');
   });
 });

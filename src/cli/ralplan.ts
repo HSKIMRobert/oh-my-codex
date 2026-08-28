@@ -250,7 +250,7 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
       execution_handoff_authorized: false,
       return_to_caller: true,
     };
-    stdout(json ? JSON.stringify(output) : 'Ralplan Advisory complete. Return to caller; execution remains fenced.');
+    stdout(json ? JSON.stringify(output) : 'Ralplan Advisory complete. Control returned to the caller without an automatic execution handoff; later user instructions follow normal host rules.');
     return;
   }
   if (args[0] !== 'role-intent' || args[1] !== 'write') throw new Error(`Unknown ralplan command: ${args.join(' ')}\n${RALPLAN_HELP}`);

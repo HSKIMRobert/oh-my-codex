@@ -299,8 +299,9 @@ export async function updateModeState(
   updates: Partial<ModeState>,
   projectRoot?: string,
   explicitSessionId?: string,
+  externalBeforeCommit?: (site: string) => void | Promise<void>,
 ): Promise<ModeState> {
-  return updateModeStateInternal(mode, updates, projectRoot, explicitSessionId, false);
+  return updateModeStateInternal(mode, updates, projectRoot, explicitSessionId, false, externalBeforeCommit);
 }
 
 /** Persists Autopilot pipeline bookkeeping while enforcing the ralplan-to-ultragoal gate. */
@@ -318,16 +319,21 @@ async function updateModeStateInternal(
   projectRoot: string | undefined,
   explicitSessionId: string | undefined,
   pipelineProgressWrite: boolean,
+  externalBeforeCommit?: (site: string) => void | Promise<void>,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
   const baseStateDir = getBaseStateDir(projectRoot);
-  const beforeCommit = createWritableCommitRevalidator({
+  const revalidateWritableScope = createWritableCommitRevalidator({
     operation: 'updateModeState',
     cwd: projectRoot ?? process.cwd(),
     explicitSessionId,
     capturedScope: scope,
     baseStateDir,
   });
+  const beforeCommit: typeof revalidateWritableScope = async (commit) => {
+    await revalidateWritableScope(commit);
+    await externalBeforeCommit?.(commit.site);
+  };
   const current = mode === 'ralph' && scope.sessionId
     ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
     : explicitSessionId

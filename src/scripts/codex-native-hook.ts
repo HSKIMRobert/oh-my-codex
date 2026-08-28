@@ -33,14 +33,11 @@ import {
 
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
 import {
-  advisoryFenceBlocksProductWrites,
-  prepareAdvisoryCloseout,
   readAuthorizedPendingRalplanActivation,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
-  releaseAdvisoryFence,
+  observeRalplanAdvisoryPrompt,
 } from "../ralplan/advisory.js";
-import { projectAdvisoryReviewLifecycle } from "../ralplan/advisory-evidence.js";
 import {
   resolveCanonicalTeamStateRoot,
   resolveWorkerTeamStateRootPath,
@@ -220,8 +217,9 @@ interface NativeHookDispatchOptions {
   /** @internal Scoped deterministic SessionStart durability seam for native-hook tests. */
   sessionStartOptions?: Pick<SessionStartOptions, 'platform' | 'regularFileSync'>;
   reconcileHudForPromptSubmitFn?: typeof reconcileHudForPromptSubmit;
+  /** @internal Deterministic Advisory reconciliation failure seam for hook tests. */
+  reconcileRalplanAdvisoryFn?: typeof reconcileRalplanAdvisory;
   /** @internal Deterministic Advisory detect/read race seam for native-hook tests. */
-  ralplanAdvisoryAfterDetectionFn?: (detection: RalplanAdvisoryStateDetection) => void | Promise<void>;
 }
 
 export interface NativeHookDispatchResult {
@@ -5653,26 +5651,6 @@ function classifyPreToolUseMutationTransport(
   return "unknown";
 }
 
-/** Advisory grants read passage only to MCP methods whose exact handler has
- * been audited above. The global classifier intentionally remains permissive
- * for third-party MCPs outside Advisory, but an active fence cannot infer
- * non-mutation from an unknown server or method name. */
-function classifyRalplanAdvisoryTransport(
-  payload: CodexHookPayload,
-  rawToolName: string,
-  canonicalToolName: string,
-  cwd: string,
-): PreToolUseMutationTransport {
-  if (rawToolName !== canonicalToolName && canonicalToolName.startsWith("mcp__")) return "unknown";
-  const classified = classifyPreToolUseMutationTransport(payload, canonicalToolName, cwd);
-  if (!rawToolName.startsWith("mcp__")) return classified;
-  if (
-    READ_ONLY_PRETOOLUSE_MCP_TOOL_NAMES.has(rawToolName)
-    || NATIVE_CODEX_GOAL_READ_TOOL_NAMES.has(rawToolName)
-  ) return "read-only";
-  return classified === "read-only" ? "unknown" : classified;
-}
-
 function extractDeepInterviewCommandWriteTargets(command: string, cwd = process.cwd(), rootCwd = cwd): string[] {
   const assignments = new Map<string, string>();
   const targets = extractDeepInterviewCommandRedirectTargets(command)
@@ -10172,14 +10150,6 @@ function directOmxCancelCommandHasTrustedExecutionContext(command: string, cwd: 
   return omxOrGjcExecutionContextIsTrusted(command, cwd, ["omx"]);
 }
 
-function isExactRalplanAdvisoryCompleteCommand(payload: CodexHookPayload, cwd: string): boolean {
-  if (safeString(payload.tool_name).trim() !== "Bash") return false;
-  const command = readPreToolUseCommand(payload);
-  if (readPreToolUseRawCommand(payload) !== command) return false;
-  if (!/^omx[ \t]+ralplan[ \t]+advisory[ \t]+complete(?:[ \t]+--json)?$/u.test(command)) return false;
-  return isSingleLiteralShellInvocation(command) && omxOrGjcExecutionContextIsTrusted(command, cwd, ["omx"]);
-}
-
 export type RalplanAdvisoryStateDetection =
   | { status: "normal"; root: string }
   | { status: "missing"; root: string; reason: "advisory_binding_without_state_root" }
@@ -10239,137 +10209,50 @@ export async function detectRalplanAdvisoryState(cwd: string, sessionId: string)
   }
 }
 
-export async function buildRalplanAdvisoryFenceGuardOutput(
-  payload: CodexHookPayload,
-  cwd: string,
-  sessionId: string,
-  dependencies: { afterDetection?: (detection: RalplanAdvisoryStateDetection) => void | Promise<void> } = {},
-): Promise<Record<string, unknown> | null> {
-  if (!sessionId) return null;
-  const rawToolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
-  const mutationTransport = classifyRalplanAdvisoryTransport(payload, rawToolName, rawToolName.trim(), cwd);
-  const readOnly = mutationTransport === "read-only";
-  const detection = await detectRalplanAdvisoryState(cwd, sessionId);
-  if (detection.status === "none") return null;
-  if (readOnly) return null;
-  if (detection.status !== "normal") {
-    return {
-      decision: "block",
-      reason: `RALPLAN_ADVISORY_STATE_${detection.status.toUpperCase()}: ${detection.reason}; mutation remains denied.`,
-      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory state cannot be proven absent or canonical. Product mutation remains fail-closed." },
-    };
-  }
-  await dependencies.afterDetection?.(detection);
-  let projection;
-  try {
-    // A durable activation/rollover intent is an administrative recovery
-    // boundary. Do not heal it and then authorize the same mutation that
-    // observed the incomplete publication; fail this tool call closed and let
-    // the next root prompt/session reconciliation publish the generation.
-    const observed = await readCurrentRalplanAdvisory(cwd, sessionId);
-    if (!observed) {
-      return {
-        decision: "block",
-        reason: "RALPLAN_ADVISORY_STATE_CHANGED_DURING_READ: canonical Advisory state disappeared after detection; mutation remains denied.",
-        hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory state changed between detection and projection. Retry only after the state boundary is canonical again." },
-      };
-    }
-    if (observed?.corruption === 'current_missing_with_advisory_state'
-      || observed?.corruption === 'rollover_pending_admin') {
-      return {
-        decision: "block",
-        reason: `RALPLAN_ADVISORY_PENDING_ADMIN: ${observed.corruption}; mutation remains denied.`,
-        hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory activation or rollover publication is incomplete. A later root prompt/session reconciliation must finish it before any mutation." },
-      };
-    }
-    projection = await reconcileRalplanAdvisory(cwd, sessionId);
-  }
-  catch {
-    return {
-      decision: "block",
-      reason: "RALPLAN_ADVISORY_STATE_UNREADABLE: advisory state could not be validated; mutation remains denied.",
-      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory state is unreadable. Repair or abandon it through the exact administrative workflow before mutating product state." },
-    };
-  }
-  if (!projection) {
-    return {
-      decision: "block",
-      reason: "RALPLAN_ADVISORY_STATE_CHANGED_DURING_READ: Advisory projection vanished after canonical detection; mutation remains denied.",
-      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory state changed during projection. Mutation remains fail-closed." },
-    };
-  }
-  const revalidated = await detectRalplanAdvisoryState(cwd, sessionId);
-  if (revalidated.status !== "normal") {
-    return {
-      decision: "block",
-      reason: `RALPLAN_ADVISORY_STATE_CHANGED_DURING_READ: post-read state is ${revalidated.status}; mutation remains denied.`,
-      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory root identity changed during projection. Mutation remains fail-closed." },
-    };
-  }
+export function buildRalplanAdvisoryRoutingObservation(
+  intent: string,
+  projection: Awaited<ReturnType<typeof readCurrentRalplanAdvisory>>,
+  binding: Record<string, unknown> | null,
+): string | null {
+  if (intent !== "execute" || !projection) return null;
   if (projection.corruption) {
-    return {
-      decision: "block",
-      reason: `RALPLAN_ADVISORY_CORRUPT: ${projection.corruption}; mutation remains denied.`,
-      hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Ralplan Advisory current/fence/journal state is corrupt or inconsistent. The execution fence remains fail-closed." },
-    };
+    return `Ralplan Advisory evidence is not a valid lifecycle projection (${projection.corruption}); this non-authoritative diagnostic does not grant or deny host tool permission.`;
   }
-  if (!projection.fence && isExactRalplanAdvisoryCompleteCommand(payload, cwd)) {
-    try {
-      const state = await readModeStateForSession("ralplan", sessionId, cwd);
-      if (!state || state.active !== true || state.workflow_variant !== "advisory"
-        || safeString(state.advisory_generation_id) !== projection.activation.generation_id) {
-        throw new Error("active advisory mode binding missing");
-      }
-      const iteration = typeof state.iteration === "number" && state.iteration > 0 ? state.iteration : 1;
-      const item = Array.isArray(state.review_history)
-        ? safeObject(state.review_history[iteration - 1])
-        : null;
-      const draft = safeObject(item?.draft);
-      const architect = safeObject(item?.architect_review);
-      const critic = safeObject(item?.critic_review);
-      const lifecycle = await projectAdvisoryReviewLifecycle({
-        cwd,
-        sessionId,
-        generationId: projection.activation.generation_id,
-        activationTurnId: projection.activation.activation_turn_id,
-        activationCreatedAt: projection.activation.created_at,
-        rootThreadId: projection.activation.root_thread_id,
-        iteration,
-        planPaths: [safeString(draft?.planPath ?? state.latest_plan_path).trim()],
-        architect: {
-          threadId: safeString(architect?.thread_id).trim(), artifactPath: safeString(architect?.artifact_path).trim(),
-          verdict: safeString(architect?.verdict).trim(), sessionId: safeString(architect?.session_id).trim() || undefined,
-        },
-        critic: {
-          threadId: safeString(critic?.thread_id).trim(), artifactPath: safeString(critic?.artifact_path).trim(),
-          verdict: safeString(critic?.verdict).trim(), sessionId: safeString(critic?.session_id).trim() || undefined,
-        },
-      });
-      await prepareAdvisoryCloseout({
-        cwd, sessionId, generationId: projection.activation.generation_id,
-        closingTurnId: readPayloadTurnId(payload) || safeString(state.turn_id).trim(), iteration, lifecycle,
-      });
-      return null;
-    } catch (error) {
-      return {
-        decision: "block",
-        reason: `RALPLAN_ADVISORY_CLOSEOUT_PREFLIGHT_FAILED: ${error instanceof Error ? error.message : String(error)}`,
-        hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Advisory evidence could not be bound before closeout; the command was denied before any inactive state write." },
-      };
-    }
+  const fence = projection.fence;
+  if (!fence) return "Ralplan Advisory planning has not reached a terminal lifecycle state; no automatic execution handoff was created.";
+  const matchingAdvisoryBinding = binding?.workflow_variant === "advisory"
+    && binding.advisory_generation_id === projection.activation.generation_id;
+  const conflictingWorkflow = binding?.active === true && !matchingAdvisoryBinding;
+  if (conflictingWorkflow) return null;
+  if (fence.state === "pending_closeout") {
+    return "Ralplan Advisory closeout is still pending; no automatic execution handoff was created.";
   }
-  if (!advisoryFenceBlocksProductWrites(projection)) return null;
-  if (projection.fence?.state === "pending_closeout" && isExactRalplanAdvisoryCompleteCommand(payload, cwd)) return null;
-  return {
-    decision: "block",
-    reason: `RALPLAN_ADVISORY_FENCE_${safeString(projection.fence?.state).toUpperCase() || "UNKNOWN"}: product writes, orchestration, goal lifecycle, and unknown mutation transports are denied.`,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      additionalContext: projection.fence?.state === "pending_closeout"
-        ? "Only safe reads or the exact trusted `omx ralplan advisory complete [--json]` administrative command are allowed."
-        : "A later eligible native root prompt with a concrete anchored execution request must release this Advisory fence before execution.",
-    },
-  };
+  if (fence.state === "recovery_required") {
+    return "Ralplan Advisory evidence requires lifecycle recovery; no automatic execution handoff was created.";
+  }
+  if (fence.state === "abandoned") {
+    return `Ralplan Advisory ended as ${fence.outcome ?? "abandoned"}, not as an approved planning result; later instructions follow normal host rules.`;
+  }
+  const lifecycle = projection.journal?.terminal_mode_updates?.ralplan_review_lifecycle;
+  const lifecycleRecord = lifecycle && typeof lifecycle === "object" && !Array.isArray(lifecycle)
+    ? lifecycle as Record<string, unknown>
+    : null;
+  const complete = fence.state === "closed" && fence.outcome === "approved" && fence.integrity_status === "proven"
+    && projection.journal?.phase === "committed" && projection.journal.outcome === "approved"
+    && lifecycleRecord?.complete === true
+    && lifecycleRecord.sequence_valid === true
+    && lifecycleRecord.iteration === fence.iteration
+    && lifecycleRecord.iteration_id === fence.iteration_id
+    && lifecycleRecord.plan_manifest_sha256 === fence.plan_manifest_sha256
+    && lifecycleRecord.architect_review_sha256 === fence.architect_review_sha256
+    && lifecycleRecord.critic_review_sha256 === fence.critic_review_sha256
+    && lifecycleRecord.evidence_bundle_sha256 === fence.evidence_bundle_sha256
+    && lifecycleRecord.evidence_scope === "local_runtime"
+    && lifecycleRecord.host_observable === false
+    && lifecycleRecord.host_verified === false;
+  return complete
+    ? "Ralplan Advisory planning is complete and its byte-bound evidence remains auditable. This execution request is a non-authoritative routing observation only; no local Advisory file or classifier grants tool permission or an automatic execution handoff."
+    : "Ralplan Advisory does not contain a complete approved and proven planning lifecycle; no automatic execution handoff was created.";
 }
 
 function isCommandResolutionSensitiveEnvironmentName(name: string): boolean {
@@ -22008,6 +21891,7 @@ export async function dispatchCodexNativeHook(
 ): Promise<NativeHookDispatchResult> {
   const hookEventName = readHookEventName(payload);
   const cwd = options.cwd ?? (safeString(payload.cwd).trim() || process.cwd());
+  const reconcileAdvisory = options.reconcileRalplanAdvisoryFn ?? reconcileRalplanAdvisory;
   const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   // #3497 / C1 boundary: documented-leader PreToolUse hard gate removed.
   if (hookEventName === "PreToolUse" && safeString(payload.tool_name).trim() === "Bash") {
@@ -22059,6 +21943,7 @@ export async function dispatchCodexNativeHook(
   let goalWorkflowAdditionalContext: string | null = null;
   let ultragoalSteeringAdditionalContext: string | null = null;
   let teamNoticeAdditionalContext: string | null = null;
+  let advisoryAdditionalContext: string | null = null;
   let teamNoticeTargetKey: string | null = null;
   let promptClassification: KeywordInputClassification | null = null;
 
@@ -22426,17 +22311,28 @@ export async function dispatchCodexNativeHook(
     && (hookEventName === "SessionStart" || hookEventName === "Stop" || hookEventName === "UserPromptSubmit")
     ? await detectRalplanAdvisoryState(policyCwd, canonicalSessionId)
     : null;
-  if (advisoryStateDetection?.status === "missing" || advisoryStateDetection?.status === "unreadable") {
-    allowGlobalSideEffects = false;
-  }
-
   if ((hookEventName === "SessionStart" || hookEventName === "Stop") && canonicalSessionId
     && advisoryStateDetection?.status === "normal") {
     try {
-      const advisory = await reconcileRalplanAdvisory(policyCwd, canonicalSessionId);
-      if (advisory?.corruption) allowGlobalSideEffects = false;
-    } catch {
-      allowGlobalSideEffects = false;
+      const reconciledAdvisory = await reconcileAdvisory(policyCwd, canonicalSessionId);
+      if (reconciledAdvisory?.corruption === "live_session_binding_conflict"
+        || reconciledAdvisory?.corruption === "live_session_binding_unreadable") {
+        throw new Error(reconciledAdvisory.corruption);
+      }
+    } catch (error) {
+      const diagnostic = `Ralplan Advisory lifecycle reconciliation reported a non-authoritative diagnostic: ${error instanceof Error ? error.message : String(error)}. It does not grant or deny host tool permission.`;
+      if (hookEventName === "SessionStart") {
+        advisoryAdditionalContext = diagnostic;
+      } else {
+        await appendToLog(cwd, {
+          event: "ralplan_advisory_reconciliation_diagnostic",
+          hook_event_name: "Stop",
+          session_id: canonicalSessionId,
+          reason: error instanceof Error ? error.message : String(error),
+          non_authoritative: true,
+          timestamp: new Date().toISOString(),
+        }).catch(() => {});
+      }
     }
   }
 
@@ -22462,14 +22358,14 @@ export async function dispatchCodexNativeHook(
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
           );
           try { await pendingBindingHandle.sync(); } finally { await pendingBindingHandle.close(); }
-          const committedPending = await reconcileRalplanAdvisory(policyCwd, canonicalSessionId, {
+          const committedPending = await reconcileAdvisory(policyCwd, canonicalSessionId, {
             producer: "native", threadKind: "root-or-drift", rootThreadId: threadId, activationTurnId: turnId,
           });
           if (!committedPending || committedPending.corruption) {
             throw new Error(`ralplan_advisory_activation_commit_failed:${committedPending?.corruption ?? "missing"}`);
           }
         }
-        const advisory = await releaseAdvisoryFence({
+        const advisory = await observeRalplanAdvisoryPrompt({
           cwd: policyCwd,
           sessionId: canonicalSessionId,
           turnId,
@@ -22515,29 +22411,17 @@ export async function dispatchCodexNativeHook(
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
           );
           try { await bindingHandle.sync(); } finally { await bindingHandle.close(); }
-          const committed = await reconcileRalplanAdvisory(policyCwd, canonicalSessionId, {
+          const committed = await reconcileAdvisory(policyCwd, canonicalSessionId, {
             producer: "native", threadKind: "root-or-drift", rootThreadId: threadId, activationTurnId: turnId,
           });
           if (!committed || committed.corruption) {
             throw new Error(`ralplan_advisory_activation_commit_failed:${committed?.corruption ?? "missing"}`);
           }
         }
-        if (advisory.projection && !advisory.released) {
-          allowGlobalSideEffects = false;
-        }
+        const advisoryBinding = await readModeStateForSession("ralplan", canonicalSessionId, policyCwd);
+        advisoryAdditionalContext = buildRalplanAdvisoryRoutingObservation(advisory.intent, advisory.projection, advisoryBinding);
       } catch (error) {
-        allowGlobalSideEffects = false;
-        return {
-          hookEventName,
-          omxEventName,
-          skillState: null,
-          outputJson: {
-            hookSpecificOutput: {
-              hookEventName: "UserPromptSubmit",
-              additionalContext: `Ralplan Advisory reconciliation failed closed: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          },
-        };
+        advisoryAdditionalContext = `Ralplan Advisory lifecycle reconciliation reported a non-authoritative diagnostic: ${error instanceof Error ? error.message : String(error)}. It does not grant or deny host tool permission.`;
       }
     }
     if (!isSubagentPromptSubmit) {
@@ -22777,16 +22661,17 @@ export async function dispatchCodexNativeHook(
     buildWikiPreCompactContext({ cwd });
   } else if ((hookEventName === "SessionStart" && !skipCanonicalSessionStartContext) || hookEventName === "UserPromptSubmit") {
     const additionalContext = hookEventName === "SessionStart"
-      ? await buildSessionStartContext(cwd, canonicalSessionId || nativeSessionId, {
+      ? [await buildSessionStartContext(cwd, canonicalSessionId || nativeSessionId, {
         hookEventName,
         payload,
         canonicalSessionId,
         nativeSessionId: resolvedNativeSessionId || nativeSessionId,
-      })
+      }), advisoryAdditionalContext].filter((entry): entry is string => Boolean(entry)).join("\n\n") || null
       : isSubagentPromptSubmit
         ? null
         : [
           teamNoticeAdditionalContext,
+          advisoryAdditionalContext,
           promptClassification ? buildAdditionalContextMessage(promptClassification, skillState, cwd, payload) : null,
           ultragoalSteeringAdditionalContext,
           goalWorkflowAdditionalContext,
@@ -22838,14 +22723,6 @@ export async function dispatchCodexNativeHook(
       if (directCancel.kind !== "not-direct-cancel") {
         outputJson = directCancel.output;
       }
-    }
-    if (!outputJson) {
-      outputJson = await buildRalplanAdvisoryFenceGuardOutput(
-        payload,
-        policyCwd,
-        sessionBinding.valid ? sessionBinding.canonicalSessionId : "",
-        { afterDetection: options.ralplanAdvisoryAfterDetectionFn },
-      );
     }
     if (!outputJson) {
       // Advisory guidance only (capability warnings, destructive confirm, etc.).

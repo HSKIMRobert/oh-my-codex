@@ -7,9 +7,10 @@ import { dirname, join } from 'path';
 import { tmpdir as osTmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { readModeState } from '../../modes/base.js';
+import { readModeState, readModeStateForSession } from '../../modes/base.js';
 import { readSkillActiveState } from '../../state/skill-active.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
+import { activateRalplanAdvisory, readCurrentRalplanAdvisory, reconcileRalplanAdvisory } from '../../ralplan/advisory.js';
 import { cancelModesForTest } from '../index.js';
 
 const tmpdir = (): string => realpathSync(osTmpdir());
@@ -78,7 +79,21 @@ case "$1" in
     count=$((count + 1))
     if [ -n "$FAKE_TMUX_COUNTER_FILE" ]; then printf '%s' "$count" > "$FAKE_TMUX_COUNTER_FILE"; fi
     created="$FAKE_TMUX_SESSION_CREATED"
-    if [ "$FAKE_TMUX_REPLACE_AFTER_FIRST" = "1" ] && [ "$count" -gt 1 ]; then created=$((created + 1)); fi
+    threshold="\${FAKE_TMUX_REPLACE_AFTER_COUNT:-1}"
+    if [ "$FAKE_TMUX_REPLACE_AFTER_FIRST" = "1" ] && [ "$count" -gt "$threshold" ]; then created=$((created + 1)); fi
+    if [ -n "$FAKE_TMUX_SWAP_RUN_DIR" ] && [ "$count" -gt "$threshold" ] && [ ! -e "$FAKE_TMUX_SWAP_MARKER" ]; then
+      mv "$FAKE_TMUX_SWAP_RUN_DIR" "$FAKE_TMUX_SWAP_RUN_DIR.old"
+      if [ "$FAKE_TMUX_SWAP_REAL_DIR" = "1" ]; then
+        mv "$FAKE_TMUX_SWAP_TARGET" "$FAKE_TMUX_SWAP_RUN_DIR"
+        foreign_mode="$FAKE_TMUX_SWAP_RUN_DIR/.omx/state/sessions/$FAKE_OMX_SESSION_ID/ralplan-state.json"
+        original_mode="$FAKE_TMUX_SWAP_RUN_DIR.old/.omx/state/sessions/$FAKE_OMX_SESSION_ID/ralplan-state.json"
+        rm -f "$foreign_mode"
+        mv "$original_mode" "$foreign_mode"
+      else
+        ln -s "$FAKE_TMUX_SWAP_TARGET" "$FAKE_TMUX_SWAP_RUN_DIR"
+      fi
+      : > "$FAKE_TMUX_SWAP_MARKER"
+    fi
     printf '%%42\\t0\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$FAKE_TMUX_PANE_PID" "$FAKE_TMUX_SESSION_NAME" "$FAKE_TMUX_INTERNAL_SESSION_ID" "$created" "$FAKE_OMX_SESSION_ID"
     ;;
   *) exit 1 ;;
@@ -117,6 +132,53 @@ async function writeActiveRunRecord(options: {
     tmux_session_created: '100',
     tmux_pane_pid: 4242,
   }, null, 2));
+}
+
+async function writeDetachedAdvisoryState(options: {
+  runDir: string;
+  sessionId: string;
+  boundGenerationId?: string;
+}): Promise<void> {
+  const stateDir = join(options.runDir, '.omx', 'state');
+  const sessionDir = join(stateDir, 'sessions', options.sessionId);
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+    session_id: options.sessionId,
+    cwd: options.runDir,
+    state_root: stateDir,
+  }));
+  const activation = await activateRalplanAdvisory({
+    cwd: options.runDir,
+    sessionId: options.sessionId,
+    rootThreadId: 'root-detached',
+    activationTurnId: 'turn-detached',
+    generationId: 'generation-detached',
+  });
+  const mode = {
+    active: true,
+    mode: 'ralplan',
+    current_phase: 'draft',
+    iteration: 1,
+    session_id: options.sessionId,
+    thread_id: 'root-detached',
+    turn_id: 'turn-detached',
+    workflow_variant: 'advisory',
+    advisory_generation_id: activation.generation_id,
+  };
+  await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(mode));
+  const committed = await reconcileRalplanAdvisory(options.runDir, options.sessionId, {
+    producer: 'native',
+    threadKind: 'root-or-drift',
+    rootThreadId: 'root-detached',
+    activationTurnId: 'turn-detached',
+  });
+  assert.equal(committed?.corruption, null);
+  if (options.boundGenerationId && options.boundGenerationId !== activation.generation_id) {
+    await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
+      ...mode,
+      advisory_generation_id: options.boundGenerationId,
+    }));
+  }
 }
 
 
@@ -847,7 +909,7 @@ describe('CLI session-scoped state parity', () => {
       assert.equal(await readFile(ralplanPath, 'utf-8'), ralplanState);
       assert.equal(await readFile(sessionSkillPath, 'utf-8'), sessionSkillState);
       const [state, skillState] = await Promise.all([
-        readModeState('ralplan', wd),
+        readModeStateForSession('ralplan', sessionId, wd),
         readSkillActiveState(sessionSkillPath),
       ]);
       assert.equal(state?.active, true);
@@ -1330,6 +1392,258 @@ describe('CLI session-scoped state parity', () => {
         })),
         [{ active: false, phase: 'cancelled' }],
       );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('terminalizes the exact detached Advisory run selected by hook-visible authority', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory';
+      const tmuxSessionName = 'omx-detached-advisory';
+      const runDir = join(runsRoot, 'run-advisory');
+      const fakeBin = await createFakeTmuxBin(wd);
+      const sourceStateDir = join(wd, '.omx', 'state');
+      const sourceModePath = join(sourceStateDir, 'ralplan-state.json');
+      const unrelatedSourceMode = JSON.stringify({
+        active: false, mode: 'ralplan', current_phase: 'complete', workflow_variant: 'standard',
+      });
+      await mkdir(sourceStateDir, { recursive: true });
+      await writeFile(sourceModePath, unrelatedSourceMode);
+      await mkdir(runDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId });
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+      }, 'cancel');
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, /Cancelled: ralplan/);
+      assert.equal(await readFile(sourceModePath, 'utf8'), unrelatedSourceMode);
+      const projection = await readCurrentRalplanAdvisory(runDir, sessionId);
+      assert.equal(projection?.fence?.state, 'abandoned');
+      assert.equal(projection?.journal?.outcome, 'cancelled');
+      const mode = JSON.parse(await readFile(join(runDir, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), 'utf8'));
+      assert.equal(mode.active, false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report detached Advisory cancellation when the selected binding mismatches', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-mismatch-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-mismatch-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory-mismatch';
+      const tmuxSessionName = 'omx-detached-advisory-mismatch';
+      const runDir = join(runsRoot, 'run-advisory-mismatch');
+      const fakeBin = await createFakeTmuxBin(wd);
+      await mkdir(runDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId, boundGenerationId: 'forged-generation' });
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-mismatch-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+      }, 'cancel');
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
+      assert.match(result.stderr, /generation_mode_binding_missing|projection_unavailable|Refusing/i);
+      const mode = JSON.parse(await readFile(join(runDir, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), 'utf8'));
+      assert.equal(mode.active, true);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('denies detached Advisory cancellation when the tmux incarnation changes before mutation', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-tmux-loss-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-tmux-loss-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory-tmux-loss';
+      const tmuxSessionName = 'omx-detached-advisory-tmux-loss';
+      const runDir = join(runsRoot, 'run-advisory');
+      const counterPath = join(wd, 'tmux-count');
+      const fakeBin = await createFakeTmuxBin(wd);
+      await mkdir(runDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId });
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-tmux-loss-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+      const modePath = join(runDir, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+      const originalMode = await readFile(modePath, 'utf8');
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+        FAKE_TMUX_COUNTER_FILE: counterPath,
+        FAKE_TMUX_REPLACE_AFTER_FIRST: '1',
+        FAKE_TMUX_REPLACE_AFTER_COUNT: '1',
+      }, 'cancel');
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
+      assert.match(result.stderr, /detached run authority changed|Refusing/i);
+      assert.equal(await readFile(modePath, 'utf8'), originalMode);
+      assert.equal((await readCurrentRalplanAdvisory(runDir, sessionId))?.fence, null);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('denies detached Advisory cancellation when the authorized run directory is swapped', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-path-loss-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-path-loss-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory-path-loss';
+      const tmuxSessionName = 'omx-detached-advisory-path-loss';
+      const runDir = join(runsRoot, 'run-advisory');
+      const foreignDir = join(runsRoot, 'foreign-run');
+      const counterPath = join(wd, 'tmux-count');
+      const swapMarker = join(wd, 'swap-complete');
+      const fakeBin = await createFakeTmuxBin(wd);
+      await mkdir(runDir, { recursive: true });
+      await mkdir(foreignDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId });
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-path-loss-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+      const modeRelative = join('.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+      const originalMode = await readFile(join(runDir, modeRelative), 'utf8');
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+        FAKE_TMUX_COUNTER_FILE: counterPath,
+        FAKE_TMUX_REPLACE_AFTER_COUNT: '1',
+        FAKE_TMUX_SWAP_RUN_DIR: runDir,
+        FAKE_TMUX_SWAP_TARGET: foreignDir,
+        FAKE_TMUX_SWAP_MARKER: swapMarker,
+      }, 'cancel');
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
+      assert.match(result.stderr, /detached run authority changed|detached run paths changed|Refusing/i);
+      assert.equal(await readFile(join(`${runDir}.old`, modeRelative), 'utf8'), originalMode);
+      assert.equal((await readCurrentRalplanAdvisory(`${runDir}.old`, sessionId))?.fence, null);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('denies a real-directory tree replacement even when the original mode inode is moved into it', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-real-tree-swap-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-real-tree-swap-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory-real-tree-swap';
+      const tmuxSessionName = 'omx-detached-advisory-real-tree-swap';
+      const runDir = join(runsRoot, 'run-advisory');
+      const foreignDir = join(runsRoot, 'foreign-run');
+      const counterPath = join(wd, 'tmux-count');
+      const swapMarker = join(wd, 'swap-complete');
+      const fakeBin = await createFakeTmuxBin(wd);
+      await mkdir(runDir, { recursive: true });
+      await mkdir(foreignDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId });
+      await writeDetachedAdvisoryState({ runDir: foreignDir, sessionId });
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-real-tree-swap-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+      const modeRelative = join('.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+      const originalMode = await readFile(join(runDir, modeRelative), 'utf8');
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+        FAKE_TMUX_COUNTER_FILE: counterPath,
+        FAKE_TMUX_REPLACE_AFTER_COUNT: '1',
+        FAKE_TMUX_SWAP_RUN_DIR: runDir,
+        FAKE_TMUX_SWAP_TARGET: foreignDir,
+        FAKE_TMUX_SWAP_MARKER: swapMarker,
+        FAKE_TMUX_SWAP_REAL_DIR: '1',
+      }, 'cancel');
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
+      assert.match(result.stderr, /Refusing cancellation because detached directory identity changed/i);
+      assert.equal(await readFile(join(runDir, modeRelative), 'utf8'), originalMode);
+      assert.equal((await readCurrentRalplanAdvisory(`${runDir}.old`, sessionId))?.fence, null);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('stops after authority loss mid-closeout and the durable prefix reconciles safely', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-mid-loss-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-mid-loss-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory-mid-loss';
+      const tmuxSessionName = 'omx-detached-advisory-mid-loss';
+      const runDir = join(runsRoot, 'run-advisory');
+      const counterPath = join(wd, 'tmux-count');
+      const fakeBin = await createFakeTmuxBin(wd);
+      await mkdir(runDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId });
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-mid-loss-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+        FAKE_TMUX_COUNTER_FILE: counterPath,
+        FAKE_TMUX_REPLACE_AFTER_FIRST: '1',
+        FAKE_TMUX_REPLACE_AFTER_COUNT: '6',
+      }, 'cancel');
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
+      assert.match(result.stderr, /detached run authority changed|Refusing/i);
+      const partial = await readCurrentRalplanAdvisory(runDir, sessionId);
+      assert.equal(partial?.fence?.state, 'pending_closeout');
+      assert.equal(partial?.journal?.phase, 'prepared');
+      assert.equal(partial?.journal?.steps.session_mode, 'pending');
+
+      const recovered = await reconcileRalplanAdvisory(runDir, sessionId);
+      assert.equal(recovered?.corruption, null);
+      assert.equal(recovered?.fence?.state, 'abandoned');
+      assert.equal(recovered?.journal?.phase, 'committed');
+      assert.equal(recovered?.journal?.outcome, 'cancelled');
+      const mode = JSON.parse(await readFile(join(runDir, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), 'utf8'));
+      assert.equal(mode.active, false);
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(runsRoot, { recursive: true, force: true });
