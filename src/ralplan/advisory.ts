@@ -407,56 +407,67 @@ async function withGenerationLock<T>(cwd: string, sessionId: string, generationI
   finally { await lock.close().catch(() => {}); await rm(lockPath, { force: true }); await syncDirectory(dir).catch(() => {}); }
 }
 
-export async function activateRalplanAdvisory(input: {
+interface AdvisoryActivationInput {
   cwd: string; sessionId: string; rootThreadId: string; activationTurnId: string;
   predecessorGenerationId?: string; generationId?: string; nowIso?: string; activationPrompt?: string;
   failpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer') => void | Promise<void>;
-}): Promise<AdvisoryActivation> {
+}
+
+async function prepareActivationIntentUnlocked(
+  cwd: string,
+  root: string,
+  input: AdvisoryActivationInput,
+): Promise<AdvisoryActivation> {
+  const pointerPath = join(root, 'current.json');
+  const intentPath = join(root, 'rollover-intent.json');
+  const current = await readStrictJson(pointerPath);
+  const expectedPredecessor = input.predecessorGenerationId;
+  const pendingRaw = await readStrictJson(intentPath);
+  if (pendingRaw) throw new Error('ralplan_advisory_rollover_intent_pending_admin');
+  if (current && current.generation_id !== expectedPredecessor) throw new Error('ralplan_advisory_current_cas_mismatch');
+  if (!current && expectedPredecessor) throw new Error('ralplan_advisory_current_cas_mismatch');
+  const generationId = input.generationId ?? randomUUID();
+  if (!safeId(generationId)) throw new Error('ralplan_advisory_generation_id_invalid');
+  const createdAt = input.nowIso ?? new Date().toISOString();
+  const intent: AdvisoryRolloverIntent = {
+    schema_version: 1, ...(expectedPredecessor ? { predecessor_generation_id: expectedPredecessor } : {}), generation_id: generationId,
+    session_id: input.sessionId, root_thread_id: input.rootThreadId,
+    activation_turn_id: input.activationTurnId,
+    ...(input.activationPrompt !== undefined ? { activation_prompt_sha256: sha256(input.activationPrompt) } : {}),
+    canonical_cwd: cwd, created_at: createdAt,
+  };
+  await writeExclusive(intentPath, intent);
+  return {
+    schema_version: 1, generation_id: generationId,
+    ...(expectedPredecessor ? { predecessor_generation_id: expectedPredecessor } : {}),
+    canonical_cwd: cwd, session_id: input.sessionId, root_thread_id: input.rootThreadId,
+    activation_turn_id: input.activationTurnId, created_at: createdAt,
+  };
+}
+
+export async function prepareRalplanAdvisoryActivation(input: Omit<AdvisoryActivationInput, 'failpoint'>): Promise<AdvisoryActivation> {
+  const cwd = await canonicalCwd(input.cwd);
+  if (![input.sessionId, input.rootThreadId, input.activationTurnId].every(safeId)) throw new Error('ralplan_advisory_identity_missing');
+  const root = advisoryRoot(cwd, input.sessionId);
+  return withCurrentLock(root, () => prepareActivationIntentUnlocked(cwd, root, input));
+}
+
+export async function activateRalplanAdvisory(input: AdvisoryActivationInput): Promise<AdvisoryActivation> {
   const cwd = await canonicalCwd(input.cwd);
   if (![input.sessionId, input.rootThreadId, input.activationTurnId].every(safeId)) throw new Error('ralplan_advisory_identity_missing');
   const root = advisoryRoot(cwd, input.sessionId);
   return withCurrentLock(root, async () => {
     const pointerPath = join(root, 'current.json');
-    const intentPath = join(root, 'rollover-intent.json');
-    let current = await readStrictJson(pointerPath);
-    const expectedPredecessor = input.predecessorGenerationId;
-    const pendingRaw = await readStrictJson(intentPath);
-    if (pendingRaw) {
-      throw new Error('ralplan_advisory_rollover_intent_pending_admin');
-    }
-    if (current && current.generation_id !== expectedPredecessor) throw new Error('ralplan_advisory_current_cas_mismatch');
-    if (!current && expectedPredecessor) throw new Error('ralplan_advisory_current_cas_mismatch');
-    const generationId = input.generationId ?? randomUUID();
-    if (!safeId(generationId)) throw new Error('ralplan_advisory_generation_id_invalid');
-    const createdAt = input.nowIso ?? new Date().toISOString();
-    {
-      const intent: AdvisoryRolloverIntent = {
-        schema_version: 1, ...(expectedPredecessor ? { predecessor_generation_id: expectedPredecessor } : {}), generation_id: generationId,
-        session_id: input.sessionId, root_thread_id: input.rootThreadId,
-        activation_turn_id: input.activationTurnId,
-        ...(input.activationPrompt !== undefined ? { activation_prompt_sha256: sha256(input.activationPrompt) } : {}),
-        canonical_cwd: cwd, created_at: createdAt,
-      };
-      await writeExclusive(intentPath, intent);
-      await input.failpoint?.('rollover_intent');
-    }
-    const activation: AdvisoryActivation = {
-      schema_version: 1,
-      generation_id: generationId,
-      ...(expectedPredecessor ? { predecessor_generation_id: expectedPredecessor } : {}),
-      canonical_cwd: cwd,
-      session_id: input.sessionId,
-      root_thread_id: input.rootThreadId,
-      activation_turn_id: input.activationTurnId,
-      created_at: createdAt,
-    };
+    const activation = await prepareActivationIntentUnlocked(cwd, root, input);
+    await input.failpoint?.('rollover_intent');
+    const generationId = activation.generation_id;
     const dir = generationDir(cwd, input.sessionId, generationId);
     await mkdir(dir, { recursive: false });
     await writeExclusive(join(dir, 'activation.json'), activation);
     await input.failpoint?.('rollover_activation');
     const pointer: AdvisoryCurrentPointer = {
       schema_version: 1, generation_id: generationId,
-      ...(expectedPredecessor ? { predecessor_generation_id: expectedPredecessor } : {}),
+      ...(activation.predecessor_generation_id ? { predecessor_generation_id: activation.predecessor_generation_id } : {}),
       session_id: input.sessionId, canonical_cwd: cwd, updated_at: activation.created_at,
     };
     await writeAtomic(pointerPath, pointer);
@@ -1203,10 +1214,23 @@ const META_OR_DOCUMENTAL_DIRECTIVE = /^\s*(?:(?:por\s+favor|please)\s+)?(?:consi
 const QUOTED_OR_CODE_DIRECTIVE = /^\s*(?:>|```|~~~|[`"“'‘])|(?:```|~~~)[\s\S]*(?:implement|execute|fix|ejecut|correg)/iu;
 const PRIMARY_EXECUTION_DIRECTIVE = /^\s*(?:(?:por\s+favor|please)\s+)?(?:implement(?:á|a|e|ar)?|fix(?:e|ear|á)?|correg(?:í|ir|i)|ejecut(?:á|a|e|ar)|corr(?:é|e|er)|build|ship|deploy|aplic(?:á|a|ar)|cre(?:á|a|ar))\b/iu;
 
-export function isDirectRalplanAdvisoryInvocation(text: string): boolean {
+export type RalplanAdvisoryInvocationKind = 'none' | 'valid' | 'invalid';
+
+/** Canonical parser for direct `$ralplan --advisory` invocations. */
+export function parseRalplanAdvisoryInvocation(text: string): RalplanAdvisoryInvocationKind {
   const tokens = text.trim().split(/\s+/u);
-  if (!/^\$(?:oh-my-codex:)?ralplan$/u.test(tokens[0] ?? '') || tokens[1] !== '--advisory') return false;
-  return tokens.slice(2).every((token) => !token.startsWith('-') && !token.startsWith('$'));
+  if (!/^\$(?:oh-my-codex:)?ralplan$/iu.test(tokens[0] ?? '')) return 'none';
+  const arguments_ = tokens.slice(1);
+  const hasAdvisoryLikeToken = arguments_.some((token) => token.toLowerCase().startsWith('--advisory'));
+  if (!hasAdvisoryLikeToken) return 'none';
+  return arguments_.every((token) => {
+    if (/^--(?:advisory|interactive|deliberate)$/iu.test(token)) return true;
+    return !token.startsWith('-') && !token.startsWith('$');
+  }) ? 'valid' : 'invalid';
+}
+
+export function isDirectRalplanAdvisoryInvocation(text: string): boolean {
+  return parseRalplanAdvisoryInvocation(text) === 'valid';
 }
 
 export function classifyAdvisoryPrompt(prompt: string): AdvisoryIntent {
@@ -1275,8 +1299,9 @@ export async function observeRalplanAdvisoryPrompt(input: {
   } catch {
     return { intent: 'unrelated', projection };
   }
-  if (!binding || binding.mode !== 'ralplan' || binding.session_id !== input.sessionId || binding.active !== true
-    || binding.thread_id !== projection.activation.root_thread_id
+  if (!binding || binding.mode !== 'ralplan' || binding.session_id !== input.sessionId
+    || (binding.active !== true && binding.active !== false)
+    || (binding.thread_id !== undefined && binding.thread_id !== projection.activation.root_thread_id)
     || binding.workflow_variant !== 'advisory'
     || binding.advisory_generation_id !== projection.activation.generation_id) {
     return { intent: 'unrelated', projection };

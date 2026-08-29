@@ -249,6 +249,172 @@ describe('ralplan runtime', () => {
 });
 
 describe('ralplan advisory runtime', () => {
+  it('rejects the restricted Advisory start profile without its matching durable intent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-profile-'));
+    const sessionId = 'sess-advisory-profile';
+    try {
+      await writeSessionPointer(cwd, sessionId);
+      await assert.rejects(
+        () => startMode('ralplan', 'cannot mint advisory state', 1, cwd, sessionId, {
+          kind: 'ralplan-advisory', sessionId, generationId: 'generation-a',
+          rootThreadId: 'thread-leader', activationTurnId: 'turn-a',
+          activationPrompt: 'cannot mint advisory state',
+        }),
+        /ralplan_advisory_start_profile_intent_mismatch/,
+      );
+      assert.equal(existsSync(sessionStatePath(cwd, sessionId)), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes a complete Advisory binding on the first mode write and retries after an intent-only crash', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-intent-retry-'));
+    const sessionId = 'sess-advisory-intent-retry';
+    const priorNodeEnv = process.env.NODE_ENV;
+    const priorFailpoint = process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT;
+    try {
+      process.env.NODE_ENV = 'test';
+      process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = 'after_intent';
+      await writeSessionPointer(cwd, sessionId);
+      await writeNativeSubagentTracking(cwd, sessionId, true);
+      await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+      await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+      await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+      const executor = {
+        async draft() {
+          await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+          const planPath = join(cwd, '.omx', 'plans', 'advisory.md');
+          await writeFile(planPath, '# approved plan\n');
+          return { planPath, summary: 'draft' };
+        },
+        async architectReview() {
+          return { verdict: 'approve' as const, agent_role: 'architect' as const, provenance_kind: 'native_subagent' as const, session_id: sessionId, thread_id: 'thread-architect', artifact_path: '.omx/artifacts/architect.md' };
+        },
+        async criticReview() {
+          return { verdict: 'approve' as const, agent_role: 'critic' as const, provenance_kind: 'native_subagent' as const, session_id: sessionId, thread_id: 'thread-critic', artifact_path: '.omx/artifacts/critic.md' };
+        },
+      };
+      const options = {
+        task: 'retry advisory startup', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
+        workflowVariant: 'advisory' as const, rootThreadId: 'thread-leader', activationTurnId: 'turn-intent', closingTurnId: 'turn-intent',
+      };
+
+      await assert.rejects(() => runRalplanConsensus(executor, options), /startup_test_failpoint:after_intent/);
+      assert.equal(existsSync(sessionStatePath(cwd, sessionId)), false, 'intent must precede every mode write');
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'rollover-intent.json')), true);
+
+      delete process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT;
+      const result = await runRalplanConsensus(executor, options);
+      assert.equal(result.status, 'completed', result.error ?? 'retry should complete');
+      const state = await readScopedRalplanState(cwd, sessionId);
+      assert.equal(state.workflow_variant, 'advisory');
+      assert.equal(state.execution_handoff_authorized, false);
+      assert.equal(state.host_verified, false);
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
+      if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT; else process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = priorFailpoint;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retries idempotently after the Advisory mode binding is durable but activation is not committed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-mode-retry-'));
+    const sessionId = 'sess-advisory-mode-retry';
+    const priorNodeEnv = process.env.NODE_ENV;
+    const priorFailpoint = process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT;
+    try {
+      process.env.NODE_ENV = 'test';
+      process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = 'after_mode';
+      await writeSessionPointer(cwd, sessionId);
+      await writeNativeSubagentTracking(cwd, sessionId, true);
+      await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+      await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+      await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+      const executor = {
+        async draft() {
+          await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+          const planPath = join(cwd, '.omx', 'plans', 'advisory.md');
+          await writeFile(planPath, '# approved plan\n');
+          return { planPath, summary: 'draft' };
+        },
+        async architectReview() { return { verdict: 'approve' as const, agent_role: 'architect' as const, provenance_kind: 'native_subagent' as const, session_id: sessionId, thread_id: 'thread-architect', artifact_path: '.omx/artifacts/architect.md' }; },
+        async criticReview() { return { verdict: 'approve' as const, agent_role: 'critic' as const, provenance_kind: 'native_subagent' as const, session_id: sessionId, thread_id: 'thread-critic', artifact_path: '.omx/artifacts/critic.md' }; },
+      };
+      const options = {
+        task: 'retry bound advisory startup', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
+        workflowVariant: 'advisory' as const, rootThreadId: 'thread-leader', activationTurnId: 'turn-mode', closingTurnId: 'turn-mode',
+      };
+
+      await assert.rejects(() => runRalplanConsensus(executor, options), /startup_test_failpoint:after_mode/);
+      const firstBinding = await readScopedRalplanState(cwd, sessionId);
+      assert.equal(firstBinding.workflow_variant, 'advisory');
+      assert.equal(firstBinding.execution_handoff_authorized, false);
+      assert.equal(firstBinding.host_verified, false);
+      const generationId = String(firstBinding.advisory_generation_id);
+
+      delete process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT;
+      const result = await runRalplanConsensus(executor, options);
+      assert.equal(result.status, 'completed', result.error ?? 'retry should complete');
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(projection?.activation.generation_id, generationId, 'retry must reuse the durable generation intent');
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
+      if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT; else process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = priorFailpoint;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mutate a standard or foreign Advisory binding that wins after intent preparation', async () => {
+    const priorNodeEnv = process.env.NODE_ENV;
+    const priorFailpoint = process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT;
+    try {
+      process.env.NODE_ENV = 'test';
+      for (const competitor of ['standard', 'foreign-advisory'] as const) {
+        const cwd = await mkdtemp(join(tmpdir(), `omx-ralplan-advisory-race-${competitor}-`));
+        const sessionId = `sess-advisory-race-${competitor}`;
+        try {
+          await writeSessionPointer(cwd, sessionId);
+          const executor = {
+            async draft() { return { summary: 'unreachable' }; },
+            async architectReview() { return { verdict: 'approve' as const }; },
+            async criticReview() { return { verdict: 'approve' as const }; },
+          };
+          const options = {
+            task: `race ${competitor}`, cwd, sessionId, maxIterations: 1,
+            workflowVariant: 'advisory' as const, rootThreadId: 'thread-leader',
+            activationTurnId: 'turn-race', closingTurnId: 'turn-race',
+          };
+          process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = 'after_intent';
+          await assert.rejects(() => runRalplanConsensus(executor, options), /startup_test_failpoint:after_intent/);
+
+          const competingBinding = competitor === 'standard'
+            ? { active: true, mode: 'ralplan', session_id: sessionId, current_phase: 'draft' }
+            : {
+              active: true, mode: 'ralplan', session_id: sessionId, current_phase: 'draft',
+              workflow_variant: 'advisory', advisory_generation_id: 'foreign-generation',
+              execution_handoff_authorized: false, host_verified: false,
+            };
+          await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+          const competingBytes = `${JSON.stringify(competingBinding, null, 2)}\n`;
+          await writeFile(sessionStatePath(cwd, sessionId), competingBytes);
+          delete process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT;
+
+          await assert.rejects(
+            () => runRalplanConsensus(executor, options),
+            competitor === 'standard' ? /ralplan_active_mode_exists/ : /ralplan_advisory_start_binding_conflict/,
+          );
+          assert.equal(await readFile(sessionStatePath(cwd, sessionId), 'utf-8'), competingBytes);
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
+      if (priorFailpoint === undefined) delete process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT; else process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = priorFailpoint;
+    }
+  });
+
   it('returns completed only after a byte-bound tracker-backed lifecycle closes the durable fence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-runtime-'));
     const sessionId = 'sess-advisory-runtime';

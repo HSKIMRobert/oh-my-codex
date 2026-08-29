@@ -12,8 +12,9 @@ import { readSubagentTrackingState, recordSubagentTurnForSession } from '../suba
 import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import {
   administrativelyAbandonRalplanAdvisory,
-  activateRalplanAdvisory,
   isCanonicalInactiveAdvisoryBinding,
+  prepareRalplanAdvisoryActivation,
+  readAuthorizedPendingRalplanActivation,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
   terminalizeRalplanAdvisory,
@@ -407,6 +408,12 @@ function requiredAdvisoryIdentity(value: string | undefined, name: string): stri
   return normalized;
 }
 
+function advisoryStartupFailpoint(name: 'after_intent' | 'after_mode'): void {
+  if (process.env.NODE_ENV === 'test' && process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT === name) {
+    throw new Error(`ralplan_advisory_startup_test_failpoint:${name}`);
+  }
+}
+
 async function terminalizeRuntimeAdvisory(input: {
   cwd: string;
   sessionId: string;
@@ -525,8 +532,40 @@ export async function runRalplanConsensus(
     advisoryActivationTurnId = requiredAdvisoryIdentity(options.activationTurnId ?? String(existing?.turn_id ?? ''), 'activation_turn_id');
     advisoryClosingTurnId = requiredAdvisoryIdentity(options.closingTurnId ?? advisoryActivationTurnId, 'closing_turn_id');
     advisoryRootThreadId = requiredAdvisoryIdentity(options.rootThreadId ?? String(existing?.thread_id ?? ''), 'root_thread_id');
-    if (existing?.active && existing.workflow_variant === 'advisory') {
+    const activationAuthority = {
+      cwd, sessionId: advisorySessionId, producer: 'native', threadKind: 'root-or-drift',
+      rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId, prompt: options.task,
+    };
+    let pendingActivation = await readAuthorizedPendingRalplanActivation(activationAuthority);
+    if (pendingActivation) {
+      advisoryGenerationId = pendingActivation.generation_id;
+      if (existing?.active === true && (
+        existing.workflow_variant !== 'advisory'
+        || existing.advisory_generation_id !== advisoryGenerationId
+        || existing.session_id !== advisorySessionId
+      )) {
+        throw new Error('ralplan_advisory_start_binding_conflict');
+      }
+      if (!existing?.active) {
+        await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId, {
+          kind: 'ralplan-advisory', sessionId: advisorySessionId, generationId: advisoryGenerationId,
+          rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId,
+          activationPrompt: options.task,
+        });
+      }
+      await syncExplicitSessionModeState('ralplan', cwd, advisorySessionId);
+      advisoryStartupFailpoint('after_mode');
+      const committedActivation = await reconcileRalplanAdvisory(cwd, advisorySessionId, {
+        producer: 'native', threadKind: 'root-or-drift', rootThreadId: advisoryRootThreadId,
+        activationTurnId: advisoryActivationTurnId,
+      });
+      if (committedActivation?.corruption) throw new Error(`ralplan_advisory_${committedActivation.corruption}`);
+    } else if (existing?.active && existing.workflow_variant === 'advisory') {
       advisoryGenerationId = requiredAdvisoryIdentity(String(existing.advisory_generation_id ?? ''), 'generation_id');
+      const current = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
+      if (!current?.activation || current.activation.generation_id !== advisoryGenerationId) {
+        throw new Error('ralplan_advisory_active_binding_without_matching_activation');
+      }
     } else {
       let prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
       if (prior?.corruption || prior?.fence?.state === 'pending_closeout') {
@@ -547,20 +586,22 @@ export async function runRalplanConsensus(
       // binding. A crash can leave a pending journal while the mode is already
       // inactive; startMode first would poison the generation binding and
       // strand the closeout forever.
-      await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId);
-      const activation = await activateRalplanAdvisory({
-        cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId,
+      await prepareRalplanAdvisoryActivation({
+        cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId,
+        activationTurnId: advisoryActivationTurnId, activationPrompt: options.task,
         ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),
       });
-      advisoryGenerationId = activation.generation_id;
-      await writeRalplanState({
-        session_id: advisorySessionId,
-        workflow_variant: 'advisory',
-        advisory_generation_id: advisoryGenerationId,
-        execution_handoff_authorized: false,
-        host_verified: false,
+      advisoryStartupFailpoint('after_intent');
+      pendingActivation = await readAuthorizedPendingRalplanActivation(activationAuthority);
+      if (!pendingActivation) throw new Error('ralplan_advisory_activation_intent_missing');
+      advisoryGenerationId = pendingActivation.generation_id;
+      await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId, {
+        kind: 'ralplan-advisory', sessionId: advisorySessionId, generationId: advisoryGenerationId,
+        rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId,
+        activationPrompt: options.task,
       });
       await syncExplicitSessionModeState('ralplan', cwd, advisorySessionId);
+      advisoryStartupFailpoint('after_mode');
       const committedActivation = await reconcileRalplanAdvisory(cwd, advisorySessionId, {
         producer: 'native', threadKind: 'root-or-drift', rootThreadId: advisoryRootThreadId,
         activationTurnId: advisoryActivationTurnId,

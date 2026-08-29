@@ -32,7 +32,12 @@ import {
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, writeStateFile } from '../state/operations.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
-import { readCurrentRalplanAdvisory, validateAdvisoryInactiveState, validateAdvisoryPreparedInactiveWrite } from '../ralplan/advisory.js';
+import {
+  readAuthorizedPendingRalplanActivation,
+  readCurrentRalplanAdvisory,
+  validateAdvisoryInactiveState,
+  validateAdvisoryPreparedInactiveWrite,
+} from '../ralplan/advisory.js';
 
 
 export interface ModeState {
@@ -51,6 +56,42 @@ export interface ModeState {
 }
 
 export type ModeName = 'autopilot' | 'autoresearch' | 'deep-interview' | 'ralph' | 'ultrawork' | 'team' | 'ultraqa' | 'ultragoal' | 'ralplan';
+
+/**
+ * Restricted startup profile for Ralplan Advisory. This is deliberately not a
+ * generic partial-state escape hatch: callers may only supply the identities
+ * required to publish the canonical, non-authoritative Advisory binding.
+ */
+export interface RalplanAdvisoryStartProfile {
+  kind: 'ralplan-advisory';
+  sessionId: string;
+  generationId: string;
+  rootThreadId: string;
+  activationTurnId: string;
+  activationPrompt: string;
+}
+
+async function assertRalplanAdvisoryStartBindingAllowed(
+  path: string,
+  profile: RalplanAdvisoryStartProfile,
+): Promise<void> {
+  if (!existsSync(path)) return;
+  let binding: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('invalid binding');
+    }
+    binding = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error('ralplan_advisory_start_binding_unreadable');
+  }
+  if (binding.active !== true) return;
+  const sameAdvisoryBinding = binding.workflow_variant === 'advisory'
+    && binding.session_id === profile.sessionId
+    && binding.advisory_generation_id === profile.generationId;
+  if (!sameAdvisoryBinding) throw new Error('ralplan_advisory_start_binding_conflict');
+}
 
 /** @deprecated These mode names were removed in v4.6. Use the canonical modes instead. */
 export type DeprecatedModeName = 'ultrapilot' | 'pipeline' | 'ecomode';
@@ -148,8 +189,28 @@ export async function startMode(
   maxIterations: number = 50,
   projectRoot?: string,
   explicitSessionId?: string,
+  startProfile?: RalplanAdvisoryStartProfile,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
+  const primaryStatePath = join(scope.stateDir, getStateFilename(mode));
+  if (startProfile) {
+    if (mode !== 'ralplan') throw new Error('ralplan_advisory_start_profile_mode_mismatch');
+    if (!scope.sessionId || scope.sessionId !== startProfile.sessionId || explicitSessionId !== startProfile.sessionId) {
+      throw new Error('ralplan_advisory_start_profile_session_mismatch');
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(startProfile.generationId)) {
+      throw new Error('ralplan_advisory_start_profile_generation_invalid');
+    }
+    const pending = await readAuthorizedPendingRalplanActivation({
+      cwd: projectRoot ?? process.cwd(), sessionId: startProfile.sessionId,
+      producer: 'native', threadKind: 'root-or-drift', rootThreadId: startProfile.rootThreadId,
+      activationTurnId: startProfile.activationTurnId, prompt: startProfile.activationPrompt,
+    });
+    if (!pending || pending.generation_id !== startProfile.generationId) {
+      throw new Error('ralplan_advisory_start_profile_intent_mismatch');
+    }
+    await assertRalplanAdvisoryStartBindingAllowed(primaryStatePath, startProfile);
+  }
   const dir = stateDir(projectRoot);
   await mkdir(dir, { recursive: true });
 
@@ -184,13 +245,32 @@ export async function startMode(
     started_at: new Date().toISOString(),
     ...(transitionMessage ? { transition_message: transitionMessage } : {}),
     ...(mode === 'ralph' && scope.sessionId ? { owner_omx_session_id: scope.sessionId } : {}),
+    ...(startProfile ? {
+      session_id: startProfile.sessionId,
+      workflow_variant: 'advisory',
+      advisory_generation_id: startProfile.generationId,
+      planning_complete: false,
+      execution_handoff_authorized: false,
+      host_verified: false,
+    } : {}),
   };
 
   const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
   const state = normalizeModeStateOrThrow(mode, withContext);
   const payload = JSON.stringify(state, null, 2);
-  const path = join(scope.stateDir, getStateFilename(mode));
+  const path = primaryStatePath;
   await beforeCommit({ site: 'mode.primary', kind: 'write', path });
+  if (startProfile) {
+    const pending = await readAuthorizedPendingRalplanActivation({
+      cwd: projectRoot ?? process.cwd(), sessionId: startProfile.sessionId,
+      producer: 'native', threadKind: 'root-or-drift', rootThreadId: startProfile.rootThreadId,
+      activationTurnId: startProfile.activationTurnId, prompt: startProfile.activationPrompt,
+    });
+    if (!pending || pending.generation_id !== startProfile.generationId) {
+      throw new Error('ralplan_advisory_start_profile_intent_changed');
+    }
+    await assertRalplanAdvisoryStartBindingAllowed(path, startProfile);
+  }
   await writeStateFile(path, payload);
   await syncRunStateFromModeState(state, projectRoot, scope.sessionId, {
     beforeCommit,

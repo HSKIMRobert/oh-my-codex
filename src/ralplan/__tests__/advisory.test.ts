@@ -774,6 +774,31 @@ describe('ralplan advisory fence and journal', () => {
     await assert.rejects(activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-c', predecessorGenerationId: 'generation-a' }), /cas_mismatch/);
   });
 
+  it('processes replan and abandon against the exact terminal inactive Advisory binding', async () => {
+    for (const [index, prompt] of ['replanificá el plan', 'abandoná el advisory'].entries()) {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      await terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'approved', integrityStatus: 'proven', lifecycle,
+        revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+      });
+      const modePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+      const terminal = JSON.parse(await readFile(modePath, 'utf8'));
+      await writeFile(modePath, JSON.stringify({
+        ...terminal, active: false, execution_handoff_authorized: false, host_verified: false,
+        ralplan_consensus_gate: { complete: false },
+      }));
+
+      const result = await observeRalplanAdvisoryPrompt({
+        cwd, sessionId, turnId: `turn-terminal-${index}`, threadId: 'root-a', prompt,
+        producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+      });
+      assert.equal(result.intent, index === 0 ? 'replan' : 'abandon');
+      if (index === 0) assert.equal(result.projection?.activation.predecessor_generation_id, 'generation-a');
+      else assert.equal(result.projection?.fence?.state, 'abandoned');
+    }
+  });
+
   it('recovers the single-owner rollover intent after every durable checkpoint', async () => {
     for (const failpoint of ['rollover_intent', 'rollover_activation', 'rollover_pointer'] as const) {
       const { cwd, sessionId, lifecycle } = await fixture();
@@ -917,6 +942,9 @@ describe('ralplan advisory routing classifier', () => {
     assert.equal(classifyAdvisoryPrompt('implementá esto'), 'unrelated');
     assert.equal(classifyAdvisoryPrompt('$ralplan --advisory nueva versión'), 'new_advisory');
     assert.equal(classifyAdvisoryPrompt('$oh-my-codex:ralplan --advisory nueva versión'), 'new_advisory');
+    assert.equal(classifyAdvisoryPrompt('$RALPLAN --DELIBERATE --ADVISORY nueva versión'), 'new_advisory');
+    assert.equal(classifyAdvisoryPrompt('$ralplan --interactive --advisory nueva versión'), 'new_advisory');
+    assert.equal(classifyAdvisoryPrompt('$ralplan --advisory --execute nueva versión'), 'unrelated');
     assert.equal(classifyAdvisoryPrompt('creá un nuevo advisory para esta tarea'), 'new_advisory');
     assert.equal(classifyAdvisoryPrompt('replanificá el plan'), 'replan');
     assert.equal(classifyAdvisoryPrompt('abandoná el advisory'), 'abandon');

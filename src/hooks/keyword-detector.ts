@@ -51,7 +51,7 @@ import {
   isAutopilotSuccessfulTerminalState,
   type AutopilotCompletionAdvisory,
 } from '../autopilot/completion-gate.js';
-import { activateRalplanAdvisory, isDirectRalplanAdvisoryInvocation, readAuthorizedPendingRalplanActivation, readCurrentRalplanAdvisory, reconcileRalplanAdvisory } from '../ralplan/advisory.js';
+import { activateRalplanAdvisory, isDirectRalplanAdvisoryInvocation, parseRalplanAdvisoryInvocation, readAuthorizedPendingRalplanActivation, readCurrentRalplanAdvisory, reconcileRalplanAdvisory } from '../ralplan/advisory.js';
 import {
   preflightSelectedTargetOwner,
   extractSelectedTargetOwnerEvidence,
@@ -561,6 +561,19 @@ async function readJsonStateWithStatus(path: string): Promise<{
   }
 }
 
+function assertRalplanAdvisoryActiveBindingAllowed(
+  binding: Record<string, unknown> | null,
+  sessionId: string,
+  generationId?: string,
+): void {
+  if (binding?.active !== true) return;
+  const sameAdvisoryBinding = binding.workflow_variant === 'advisory'
+    && safeString(binding.session_id).trim() === sessionId
+    && Boolean(generationId)
+    && safeString(binding.advisory_generation_id).trim() === generationId;
+  if (!sameAdvisoryBinding) throw new Error('ralplan_advisory_active_binding_conflict');
+}
+
 export async function persistDeepInterviewModeState(
   stateDir: string,
   nextSkill: SkillActiveState | null,
@@ -771,6 +784,12 @@ async function persistStatefulSkillSeedState(
     if (!pendingRecovery && prior && (!prior.fence || !['closed', 'abandoned', 'recovery_required'].includes(prior.fence.state))) {
       throw new Error('ralplan_advisory_existing_generation_not_terminal');
     }
+    const bindingBeforeIntent = await readJsonStateIfExists(absolutePath);
+    assertRalplanAdvisoryActiveBindingAllowed(
+      bindingBeforeIntent,
+      sessionId,
+      pendingRecovery?.generation_id,
+    );
     const activation = pendingRecovery ?? await activateRalplanAdvisory({
       cwd: sourceCwd, sessionId, rootThreadId, activationTurnId,
       ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),
@@ -875,6 +894,14 @@ async function persistStatefulSkillSeedState(
   }
 
   await mkdir(dirname(absolutePath), { recursive: true });
+  if (baseState.workflow_variant === 'advisory') {
+    const bindingBeforeWrite = await readJsonStateIfExists(absolutePath);
+    assertRalplanAdvisoryActiveBindingAllowed(
+      bindingBeforeWrite,
+      safeString(baseState.session_id).trim(),
+      safeString(baseState.advisory_generation_id).trim(),
+    );
+  }
   await writeStateFile(absolutePath, JSON.stringify(baseState, null, 2));
   if (baseState.workflow_variant === 'advisory') {
     const bindingHandle = await open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -3933,9 +3960,10 @@ export async function recordSkillActivation(
   );
   if (!match) return null;
 
-  const mentionsAdvisory = /\$(?:oh-my-codex:)?ralplan\s+--advisory\b/u.test(input.text);
-  const validAdvisoryInvocation = isDirectRalplanAdvisoryInvocation(input.text);
-  if (mentionsAdvisory && (!validAdvisoryInvocation || match.skill !== 'ralplan' || classification.matches.some((candidate) => candidate.skill !== 'ralplan'))) {
+  const advisoryInvocation = parseRalplanAdvisoryInvocation(input.text);
+  if (advisoryInvocation === 'invalid'
+    || (advisoryInvocation === 'valid'
+      && (match.skill !== 'ralplan' || classification.matches.some((candidate) => candidate.skill !== 'ralplan')))) {
     return null;
   }
   const hadDeepInterviewLock = previous?.skill === 'deep-interview' && previous?.input_lock?.active === true;
