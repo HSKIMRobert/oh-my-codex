@@ -4,9 +4,9 @@
  */
 
 import { execFileSync, spawn } from "child_process";
-import { basename, dirname, isAbsolute, join, posix, relative, resolve, win32 } from "path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "path";
 import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { copyFile, cp, lstat, mkdir, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "fs/promises";
+import { access, chmod, copyFile, cp, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash, randomUUID } from "crypto";
 import {
@@ -137,6 +137,7 @@ import {
   readSessionPointer,
   readSessionState,
   resolveSessionPointerContext,
+  sessionOwnerFileIdentityMatches,
   finalizeBoundOnce,
   isSessionPointerLaunchAbort,
   normalizeSessionId,
@@ -940,10 +941,14 @@ export function runtimeCodexHomePath(
   return join(omxRoot(cwd), "runtime", "codex-home", sessionId);
 }
 
-async function linkOrCopyCodexHomeEntry(source: string, destination: string): Promise<void> {
+async function linkOrCopyCodexHomeEntry(
+  source: string,
+  destination: string,
+  createSymlink: typeof symlink = symlink,
+): Promise<void> {
   const stat = await lstat(source);
   try {
-    await symlink(source, destination, stat.isDirectory() && process.platform === "win32" ? "junction" : undefined);
+    await createSymlink(source, destination, stat.isDirectory() && process.platform === "win32" ? "junction" : undefined);
   } catch {
     if (stat.isDirectory()) {
       await cp(source, destination, { recursive: true, force: true, verbatimSymlinks: true });
@@ -953,10 +958,132 @@ async function linkOrCopyCodexHomeEntry(source: string, destination: string): Pr
   }
 }
 
-async function copyFilePreservingTimestamps(source: string, destination: string): Promise<void> {
-  await copyFile(source, destination);
-  const sourceStat = await stat(source);
-  await utimes(destination, sourceStat.atime, sourceStat.mtime);
+async function copyFilePreservingTimestamps(
+  source: string,
+  destination: string,
+  options: {
+    allowTopLevelSymlink?: boolean;
+    afterSourceOpen?: () => Promise<void>;
+    afterStage?: (temporary: string, destination: string) => Promise<void>;
+    sourceRoot?: string;
+    destinationRoot?: string;
+    expectedSourceStat?: { dev: number; ino: number };
+  } = {},
+): Promise<void> {
+  const sourcePath = options.allowTopLevelSymlink === true ? await realpath(source) : source;
+  const sourceRoot = options.sourceRoot ? await realpath(options.sourceRoot) : undefined;
+  const destinationRoot = options.destinationRoot ? await realpath(options.destinationRoot) : undefined;
+  if (sourceRoot) await assertHistoryPathWithin(sourcePath, sourceRoot);
+  if (destinationRoot) await assertHistoryDestinationParentWithin(destination, destinationRoot);
+  const sourceHandle = await open(sourcePath, fsConstants.O_RDONLY | historyNoFollowFlag());
+  let destinationHandle;
+  const temporary = `${destination}.omx-history-${randomUUID()}`;
+  try {
+    const sourceStat = await sourceHandle.stat();
+    if (!sourceStat.isFile()) throw new Error(`history source is not a regular file: ${source}`);
+    if (options.expectedSourceStat && !hasSameHistoryIdentity(sourceStat, options.expectedSourceStat)) {
+      throw new HistoryEntryChangedError(`history source changed during copy: ${source}`);
+    }
+    await options.afterSourceOpen?.();
+    if (destinationRoot) await assertHistoryDestinationParentWithin(destination, destinationRoot);
+    await mkdir(dirname(destination), { recursive: true });
+    destinationHandle = await open(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | historyNoFollowFlag(),
+      historyDestinationMode(sourceStat.mode),
+    );
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    const copiedHash = createHash("sha256");
+    while (true) {
+      const { bytesRead } = await sourceHandle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      copiedHash.update(buffer.subarray(0, bytesRead));
+      let written = 0;
+      while (written < bytesRead) {
+        const { bytesWritten } = await destinationHandle.write(buffer, written, bytesRead - written);
+        written += bytesWritten;
+      }
+      position += bytesRead;
+    }
+    const copiedSourceStat = await sourceHandle.stat();
+    if (!hasSameHistoryVersion(copiedSourceStat, sourceStat)) {
+      throw new HistoryEntryChangedError(`history source content changed during copy: ${source}`);
+    }
+    const verificationHash = createHash("sha256");
+    position = 0;
+    while (true) {
+      const { bytesRead } = await sourceHandle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      verificationHash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    if (verificationHash.digest("hex") !== copiedHash.digest("hex")) {
+      throw new HistoryEntryChangedError(`history source bytes changed during copy: ${source}`);
+    }
+    await destinationHandle.chmod(historyDestinationMode(sourceStat.mode));
+    await destinationHandle.utimes(sourceStat.atime, sourceStat.mtime);
+    await destinationHandle.close();
+    destinationHandle = undefined;
+    await options.afterStage?.(temporary, destination);
+    const stagedStat = await lstat(temporary);
+    if (!stagedStat.isFile() || stagedStat.isSymbolicLink() || stagedStat.nlink !== 1) {
+      throw new Error(`history staging path is not a regular file: ${temporary}`);
+    }
+    if (destinationRoot) await assertHistoryDestinationParentWithin(destination, destinationRoot);
+    await publishHistoryReplacement(temporary, destination, false);
+  } finally {
+    await destinationHandle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+    await sourceHandle.close();
+  }
+}
+
+async function readHistoryFileWithoutSymlink(
+  source: string,
+  allowTopLevelSymlink = false,
+  sourceRoot?: string,
+): Promise<string> {
+  const sourcePath = allowTopLevelSymlink === true ? await realpath(source) : source;
+  const canonicalSourceRoot = sourceRoot ? await realpath(sourceRoot) : undefined;
+  if (canonicalSourceRoot) await assertHistoryPathWithin(sourcePath, canonicalSourceRoot);
+  const sourceHandle = await open(sourcePath, fsConstants.O_RDONLY | historyNoFollowFlag());
+  try {
+    const sourceStat = await sourceHandle.stat();
+    if (!sourceStat.isFile()) throw new Error(`history source is not a regular file: ${source}`);
+    return await sourceHandle.readFile("utf-8");
+  } finally {
+    await sourceHandle.close();
+  }
+}
+
+async function writeHistoryFileAtomically(
+  destination: string,
+  contents: string,
+  mode: number,
+  destinationRoot?: string,
+): Promise<void> {
+  const canonicalDestinationRoot = destinationRoot ? await realpath(destinationRoot) : undefined;
+  if (canonicalDestinationRoot) await assertHistoryDestinationParentWithin(destination, canonicalDestinationRoot);
+  const destinationMode = historyDestinationMode(mode);
+  const temporary = `${destination}.omx-history-${randomUUID()}`;
+  let destinationHandle;
+  try {
+    destinationHandle = await open(
+      temporary,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | historyNoFollowFlag(),
+      destinationMode,
+    );
+    await destinationHandle.writeFile(contents, "utf-8");
+    await destinationHandle.chmod(destinationMode);
+    await destinationHandle.close();
+    destinationHandle = undefined;
+    if (canonicalDestinationRoot) await assertHistoryDestinationParentWithin(destination, canonicalDestinationRoot);
+    await publishHistoryReplacement(temporary, destination, false);
+  } finally {
+    await destinationHandle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 function isCodexSqliteArtifact(entryName: string): boolean {
@@ -992,6 +1119,379 @@ function shouldPersistProjectLaunchRuntimeEntry(entryName: string): boolean {
   return PROJECT_LAUNCH_PERSISTED_RUNTIME_ENTRY_NAMES.has(entryName);
 }
 
+function isRegularHistoryTarget(sourceStat: { isDirectory(): boolean; isFile(): boolean }): boolean {
+  return sourceStat.isDirectory() || sourceStat.isFile();
+}
+
+export function historyDestinationMode(sourceMode: number): number {
+  const permissions = sourceMode & 0o777;
+  return permissions | ((permissions & 0o070) << 3) | ((permissions & 0o007) << 6);
+}
+
+function historyNoFollowFlag(): number {
+  return process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0);
+}
+
+function isHistoryPathWithin(candidate: string, root: string): boolean {
+  const normalizedRoot = process.platform === "win32" ? win32.normalize(root).toLowerCase() : root;
+  const normalizedCandidate = process.platform === "win32" ? win32.normalize(candidate).toLowerCase() : candidate;
+  const path = process.platform === "win32"
+    ? win32.relative(normalizedRoot, normalizedCandidate)
+    : relative(normalizedRoot, normalizedCandidate);
+  const escapes = path === ".." || path.startsWith(`..${sep}`);
+  return path === "" || (!escapes && !isAbsolute(path));
+}
+
+async function assertHistoryPathWithin(path: string, root: string, allowMissing = false): Promise<void> {
+  const canonicalRoot = root;
+  const canonicalPath = await realpath(path).catch((error) => {
+      if (allowMissing && isUnresolvableHistoryLinkError(error)) return undefined;
+      throw error;
+    });
+  if (canonicalPath && !isHistoryPathWithin(canonicalPath, canonicalRoot)) {
+    throw new Error(`history path escapes its authorized root: ${path}`);
+  }
+}
+
+async function assertHistoryDestinationParentWithin(destination: string, root: string): Promise<void> {
+  await assertHistoryPathWithin(dirname(destination), root);
+}
+
+async function assertHistoryDestinationDirectorySafe(destination: string, root: string): Promise<void> {
+  const destinationStat = await lstat(destination);
+  if (!destinationStat.isDirectory() || destinationStat.isSymbolicLink()) {
+    throw new HistoryEntryChangedError(`history destination changed during copy: ${destination}`);
+  }
+  await assertHistoryPathWithin(destination, root);
+}
+
+async function chmodHistoryDestination(
+  destination: string,
+  mode: number,
+  tolerateForeignOwner: boolean,
+): Promise<void> {
+  try {
+    await chmod(destination, mode);
+  } catch (error) {
+    if (tolerateForeignOwner && (error as NodeJS.ErrnoException).code === "EPERM") return;
+    throw error;
+  }
+}
+
+async function utimesHistoryDestination(
+  destination: string,
+  atime: Date,
+  mtime: Date,
+  tolerateForeignOwner: boolean,
+): Promise<void> {
+  try {
+    await utimes(destination, atime, mtime);
+  } catch (error) {
+    if (tolerateForeignOwner && (error as NodeJS.ErrnoException).code === "EPERM") return;
+    throw error;
+  }
+}
+
+async function publishHistoryReplacement(
+  temporary: string,
+  destination: string,
+  recursive: boolean,
+): Promise<void> {
+  try {
+    await rename(temporary, destination);
+    return;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST" && code !== "EPERM" && code !== "ENOTEMPTY") throw error;
+  }
+  const backup = `${destination}.omx-history-backup-${randomUUID()}`;
+  await rename(destination, backup);
+  try {
+    await rename(temporary, destination);
+  } catch (error) {
+    await rename(backup, destination).catch(() => undefined);
+    throw error;
+  }
+  await rm(backup, { recursive, force: true }).catch(() => undefined);
+}
+
+function isUnresolvableHistoryLinkError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP";
+}
+
+class HistoryEntryChangedError extends Error {
+  code = "ESTALE";
+}
+
+function isDiscardableHistoryCopyError(error: unknown): boolean {
+  return isUnresolvableHistoryLinkError(error) || error instanceof HistoryEntryChangedError;
+}
+
+const HISTORY_PERSISTENCE_LOCK_TIMEOUT_MS = 5_000;
+const HISTORY_PERSISTENCE_LOCK_STALE_MS = 30_000;
+const HISTORY_PERSISTENCE_LOCK_HEARTBEAT_MS = 5_000;
+const HISTORY_PERSISTENCE_LOCK_RENAME_RETRIES = 20;
+const HISTORY_PERSISTENCE_LOCK_RENAME_RETRY_DELAY_MS = 10;
+
+interface HistoryPersistenceLockOptions {
+  timeoutMs?: number;
+  staleMs?: number;
+  heartbeatMs?: number;
+}
+
+interface HistoryPersistenceLockLease {
+  root: string;
+  lockPath: string;
+  token: string;
+  lockIdentity: { dev: number; ino: number };
+  heartbeat: ReturnType<typeof setInterval>;
+  waitForHeartbeat: () => Promise<void>;
+}
+
+interface HistoryPersistenceLockOwner {
+  token: string;
+  pid: number;
+  startIdentity?: string;
+}
+
+async function readHistoryPersistenceLockOwner(
+  lockPath: string,
+): Promise<HistoryPersistenceLockOwner | null | undefined> {
+  try {
+    const raw = await readFile(join(lockPath, "owner.json"), "utf-8");
+    const parts = raw.split("\n");
+    const completeLines = raw.endsWith("\n") || parts.length === 1 ? parts.filter(Boolean) : parts.slice(0, -1).filter(Boolean);
+    const owner = JSON.parse(completeLines.at(-1) ?? "") as {
+      token?: unknown;
+      pid?: unknown;
+      startIdentity?: unknown;
+    };
+    if (typeof owner.token !== "string" || typeof owner.pid !== "number") return null;
+    if (owner.startIdentity !== undefined && typeof owner.startIdentity !== "string") return null;
+    return { token: owner.token, pid: owner.pid, startIdentity: owner.startIdentity };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    return null;
+  }
+}
+
+async function historyProcessStartIdentity(pid: number): Promise<string | undefined> {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = await readFile(`/proc/${pid}/stat`, "utf-8");
+    const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+    return fields[19] ? `${pid}:${fields[19]}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function isHistoryProcessAlive(owner: HistoryPersistenceLockOwner): Promise<boolean | undefined> {
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    return true;
+  }
+  if (!owner.startIdentity) return undefined;
+  const currentIdentity = await historyProcessStartIdentity(owner.pid);
+  if (!currentIdentity) return undefined;
+  return currentIdentity === owner.startIdentity;
+}
+
+async function historyLockIsCurrent(lease: HistoryPersistenceLockLease): Promise<boolean> {
+  const lockStat = await lstat(lease.lockPath).catch(() => undefined);
+  if (!lockStat || !lockStat.isDirectory() || lockStat.isSymbolicLink()) return false;
+  if (!hasSameHistoryIdentity(lockStat, lease.lockIdentity)) return false;
+  const owner = await readHistoryPersistenceLockOwner(lease.lockPath);
+  return owner?.token === lease.token;
+}
+
+async function retireHistoryLock(
+  lockPath: string,
+  root: string,
+  expectedIdentity: { dev: number; ino: number },
+  expectedToken?: string,
+): Promise<void> {
+  const currentStat = await lstat(lockPath).catch(() => undefined);
+  if (!currentStat || !currentStat.isDirectory() || currentStat.isSymbolicLink()) return;
+  if (!hasSameHistoryIdentity(currentStat, expectedIdentity)) return;
+  if (expectedToken) {
+    const owner = await readHistoryPersistenceLockOwner(lockPath);
+    if (owner?.token !== expectedToken) return;
+  }
+  const retiredPath = `${lockPath}.retired-${randomUUID()}`;
+  let retired = false;
+  for (let attempt = 0; attempt < HISTORY_PERSISTENCE_LOCK_RENAME_RETRIES; attempt += 1) {
+    try {
+      await rename(lockPath, retiredPath);
+      retired = true;
+      break;
+    } catch {
+      if (attempt + 1 < HISTORY_PERSISTENCE_LOCK_RENAME_RETRIES) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, HISTORY_PERSISTENCE_LOCK_RENAME_RETRY_DELAY_MS));
+      }
+    }
+  }
+  if (!retired) return;
+  await assertHistoryPathWithin(retiredPath, root);
+  await rm(retiredPath, { recursive: true, force: true }).catch(() => undefined);
+}
+
+export async function releaseHistoryPersistenceLock(lease: HistoryPersistenceLockLease): Promise<void> {
+  clearInterval(lease.heartbeat);
+  await lease.waitForHeartbeat();
+  if (!(await historyLockIsCurrent(lease))) return;
+  await retireHistoryLock(lease.lockPath, lease.root, lease.lockIdentity, lease.token);
+}
+
+export async function acquireHistoryPersistenceLock(
+  root: string,
+  options: HistoryPersistenceLockOptions = {},
+): Promise<HistoryPersistenceLockLease> {
+  root = await realpath(root);
+  const lockPath = join(root, ".omx-history.lock");
+  const ownerPath = join(lockPath, "owner.json");
+  const timeoutMs = options.timeoutMs ?? HISTORY_PERSISTENCE_LOCK_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? HISTORY_PERSISTENCE_LOCK_STALE_MS;
+  const heartbeatMs = options.heartbeatMs ?? HISTORY_PERSISTENCE_LOCK_HEARTBEAT_MS;
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      const lockStat = await lstat(lockPath);
+      if (!lockStat.isDirectory() || lockStat.isSymbolicLink()) {
+        throw new Error(`history persistence lock is not a private directory: ${lockPath}`);
+      }
+      await assertHistoryPathWithin(lockPath, root);
+      const lockIdentity = { dev: lockStat.dev, ino: lockStat.ino };
+      if (process.platform !== "win32" && (lockStat.mode & 0o077) !== 0) {
+        throw new Error(`history persistence lock is not private: ${lockPath}`);
+      }
+      const token = randomUUID();
+      const startIdentity = await historyProcessStartIdentity(process.pid);
+      const initialOwnerPath = `${ownerPath}.${randomUUID()}.tmp`;
+      await writeFile(
+        initialOwnerPath,
+        `${JSON.stringify({ token, pid: process.pid, startIdentity, heartbeatAt: Date.now() })}\n`,
+        { flag: "wx", mode: 0o600 },
+      );
+      await rename(initialOwnerPath, ownerPath);
+      let heartbeatInFlight = Promise.resolve();
+      const runHeartbeat = async () => {
+        let temporaryOwnerPath: string | undefined;
+        try {
+          const owner = await readHistoryPersistenceLockOwner(lockPath);
+          if (owner?.token !== token) return;
+          if (process.platform === "win32") {
+            const currentLockStat = await lstat(lockPath);
+            if (!hasSameHistoryIdentity(currentLockStat, lockIdentity)) return;
+            await utimes(lockPath, new Date(), new Date());
+            await writeFile(ownerPath, `${JSON.stringify({ token, pid: process.pid, startIdentity, heartbeatAt: Date.now() })}\n`, { flag: "a" });
+            return;
+          }
+          temporaryOwnerPath = `${ownerPath}.${randomUUID()}.tmp`;
+          await writeFile(
+            temporaryOwnerPath,
+            `${JSON.stringify({ token, pid: process.pid, startIdentity, heartbeatAt: Date.now() })}\n`,
+            { flag: "wx", mode: 0o600 },
+          );
+          const currentLockStat = await lstat(lockPath);
+          const currentOwner = await readHistoryPersistenceLockOwner(lockPath);
+          if (!hasSameHistoryIdentity(currentLockStat, lockIdentity) || currentOwner?.token !== token) {
+            await rm(temporaryOwnerPath, { force: true }).catch(() => undefined);
+            return;
+          }
+          await rename(temporaryOwnerPath, ownerPath);
+        } catch {
+          // A contender may have removed a dead owner's lock between checks.
+          if (temporaryOwnerPath) await rm(temporaryOwnerPath, { force: true }).catch(() => undefined);
+        }
+      };
+      const heartbeat = setInterval(() => {
+        heartbeatInFlight = heartbeatInFlight.then(runHeartbeat, runHeartbeat);
+      }, heartbeatMs);
+      heartbeat.unref?.();
+      return { root, lockPath, token, lockIdentity, heartbeat, waitForHeartbeat: () => heartbeatInFlight };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const lockStat = await lstat(lockPath).catch(() => undefined);
+      if (!lockStat) continue;
+      if (lockStat?.isSymbolicLink()) throw new Error(`history persistence lock is a symlink: ${lockPath}`);
+      const owner = await readHistoryPersistenceLockOwner(lockPath);
+      const lockAge = lockStat ? Date.now() - lockStat.mtimeMs : 0;
+      if (owner && owner !== null && (await isHistoryProcessAlive(owner)) === false) {
+        const ownerStat = await stat(join(lockPath, "owner.json")).catch(() => undefined);
+        if (ownerStat && Date.now() - ownerStat.mtimeMs > staleMs) {
+          await retireHistoryLock(lockPath, root, lockStat ? { dev: lockStat.dev, ino: lockStat.ino } : { dev: -1, ino: -1 }, owner.token);
+          continue;
+        }
+      } else if (owner === undefined && lockAge > staleMs) {
+        await retireHistoryLock(lockPath, root, lockStat ? { dev: lockStat.dev, ino: lockStat.ino } : { dev: -1, ino: -1 });
+        continue;
+      }
+      if (process.platform !== "win32" && (lockStat.mode & 0o077) !== 0) {
+        throw new Error(`history persistence lock is not private: ${lockPath}`);
+      }
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for history persistence lock: ${lockPath}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+}
+
+function hasSameHistoryIdentity(
+  actual: { dev: number; ino: number },
+  expected: { dev: number; ino: number },
+): boolean {
+  return actual.dev === expected.dev && actual.ino === expected.ino;
+}
+
+function hasSameHistoryVersion(
+  actual: { dev: number; ino: number; size: number; mtimeMs: number },
+  expected: { dev: number; ino: number; size: number; mtimeMs: number },
+): boolean {
+  return hasSameHistoryIdentity(actual, expected) && actual.size === expected.size && actual.mtimeMs === expected.mtimeMs;
+}
+
+async function inspectProjectLaunchRuntimeHistoryEntry(source: string) {
+  // Durable history names are an explicit allowlist. Follow only the named
+  // entry's top-level link so a directory link is classified as a directory;
+  // the destination remains the fixed runtime history path below.
+  let linkStat;
+  try {
+    linkStat = await lstat(source);
+  } catch (error) {
+    if (isUnresolvableHistoryLinkError(error)) return undefined;
+    throw error;
+  }
+  if (!linkStat.isSymbolicLink()) return { linkStat, targetStat: linkStat, targetRealpath: undefined };
+  try {
+    return { linkStat, targetStat: await stat(source), targetRealpath: await realpath(source) };
+  } catch (error) {
+    if (isUnresolvableHistoryLinkError(error)) return { linkStat, targetStat: undefined };
+    throw error;
+  }
+}
+
+async function historyEntryStillMatches(
+  source: string,
+  inspection: Awaited<ReturnType<typeof inspectProjectLaunchRuntimeHistoryEntry>>,
+): Promise<boolean> {
+  if (!inspection) return false;
+  const current = await inspectProjectLaunchRuntimeHistoryEntry(source);
+  const inspectedTarget = inspection.targetStat;
+  const currentTarget = current?.targetStat;
+  if (!current || !inspectedTarget || !currentTarget) return false;
+  if (current.linkStat.dev !== inspection.linkStat.dev || current.linkStat.ino !== inspection.linkStat.ino) return false;
+  if (inspection.targetRealpath !== current.targetRealpath) return false;
+  return (
+    currentTarget.dev === inspectedTarget.dev &&
+    currentTarget.ino === inspectedTarget.ino
+  );
+}
+
 function uniqueJsonlLines(contents: string): string[] {
   const seen = new Set<string>();
   const lines: string[] = [];
@@ -1003,75 +1503,396 @@ function uniqueJsonlLines(contents: string): string[] {
   return lines;
 }
 
-async function persistProjectLaunchRuntimeJsonlArtifact(source: string, destination: string): Promise<void> {
-  const existing = existsSync(destination) ? await readFile(destination, "utf-8").catch(() => "") : "";
-  const sourceContents = await readFile(source, "utf-8");
-  const separator = existing === "" || existing.endsWith("\n") || sourceContents === "" ? "" : "\n";
-  const lines = uniqueJsonlLines(`${existing}${separator}${sourceContents}`);
-  await writeFile(destination, lines.length > 0 ? `${lines.join("\n")}\n` : "", "utf-8");
+async function persistProjectLaunchRuntimeJsonlArtifact(
+  source: string,
+  destination: string,
+  sourceRoot: string,
+  destinationRoot: string,
+  sourceMode: number,
+  expectedSourceStat: { dev: number; ino: number; size: number; mtimeMs: number },
+): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const destinationInspection = await inspectProjectLaunchRuntimeHistoryEntry(destination);
+    if (destinationInspection && !destinationInspection.targetStat?.isFile()) return;
+    const destinationPath = destinationInspection?.targetRealpath ?? destination;
+    await assertHistoryPathWithin(destinationPath, destinationRoot, true);
+    const destinationVersion = destinationInspection?.targetStat;
+    const existing = destinationInspection ? await readHistoryFileWithoutSymlink(destinationPath, false, destinationRoot) : "";
+    const sourceContents = await readHistoryFileWithoutSymlink(source, false, sourceRoot);
+    const sourceStat = await stat(source);
+    if (!hasSameHistoryVersion(sourceStat, expectedSourceStat)) {
+      throw new HistoryEntryChangedError(`history source changed during JSONL read: ${source}`);
+    }
+    const latestDestinationInspection = await inspectProjectLaunchRuntimeHistoryEntry(destination);
+    const latestDestinationVersion = latestDestinationInspection?.targetStat;
+    if (
+      (destinationVersion && !latestDestinationVersion) ||
+      (!destinationVersion && latestDestinationVersion) ||
+      (destinationVersion && latestDestinationVersion && !hasSameHistoryVersion(latestDestinationVersion, destinationVersion))
+    ) {
+      continue;
+    }
+    const separator = existing === "" || existing.endsWith("\n") || sourceContents === "" ? "" : "\n";
+    const lines = uniqueJsonlLines(`${existing}${separator}${sourceContents}`);
+    const mode = destinationInspection?.targetStat?.mode ?? historyDestinationMode(sourceMode);
+    await writeHistoryFileAtomically(
+      destinationPath,
+      lines.length > 0 ? `${lines.join("\n")}\n` : "",
+      mode,
+      destinationRoot,
+    );
+    return;
+  }
+  throw new HistoryEntryChangedError(`history destination changed during JSONL persistence: ${destination}`);
+}
+
+async function resolveHistoryPersistenceLockRoot(
+  projectCodexHome: string,
+  destinationRoot: string,
+): Promise<string[]> {
+  const candidates: string[] = [];
+  for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+    const destination = join(projectCodexHome, entryName);
+    const inspection = await inspectProjectLaunchRuntimeHistoryEntry(destination);
+    const targetStat = inspection?.targetStat;
+    const target = inspection?.targetRealpath ?? (targetStat ? await realpath(destination).catch(() => undefined) : undefined);
+    if (!target) continue;
+    const anchors = [dirname(target), ...(targetStat?.isDirectory() ? [target] : [])];
+    for (const anchor of anchors) {
+      const canonicalAnchor = await realpath(anchor).catch(() => undefined);
+      if (!canonicalAnchor) continue;
+      if (await access(canonicalAnchor, fsConstants.W_OK).then(() => true, () => false)) {
+        candidates.push(canonicalAnchor);
+        break;
+      }
+    }
+  }
+  return (candidates.length > 0 ? [...new Set(candidates)] : [destinationRoot]).sort();
+}
+
+async function withHistoryPersistenceLocks<T>(roots: string[], action: () => Promise<T>): Promise<T> {
+  const leases: HistoryPersistenceLockLease[] = [];
+  try {
+    for (const root of [...new Set(roots)].sort()) leases.push(await acquireHistoryPersistenceLock(root));
+    return await action();
+  } finally {
+    for (const lease of leases.reverse()) await releaseHistoryPersistenceLock(lease);
+  }
 }
 
 async function persistProjectLaunchRuntimeHistoryArtifacts(
   runtimeCodexHome: string | undefined,
   projectCodexHome: string | undefined,
-): Promise<void> {
-  if (!runtimeCodexHome || !projectCodexHome) return;
-  if (!existsSync(runtimeCodexHome)) return;
+  expectedRuntimeStat?: { dev: number; ino: number },
+): Promise<boolean> {
+  if (!runtimeCodexHome || !projectCodexHome) return true;
+  if (!existsSync(runtimeCodexHome)) return true;
   await mkdir(projectCodexHome, { recursive: true });
+  const destinationRoot = await realpath(projectCodexHome);
+  const lockRoots = await resolveHistoryPersistenceLockRoot(projectCodexHome, destinationRoot);
 
-  for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+  return withHistoryPersistenceLocks(lockRoots, async () => {
+    let complete = true;
+    for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+    if (expectedRuntimeStat) {
+      const runtimeStat = await lstat(runtimeCodexHome).catch(() => undefined);
+      if (!runtimeStat || !hasSameHistoryIdentity(runtimeStat, expectedRuntimeStat)) {
+        complete = false;
+        break;
+      }
+    }
     const source = join(runtimeCodexHome, entryName);
-    if (!existsSync(source)) continue;
-    const sourceStat = await lstat(source);
-    if (sourceStat.isSymbolicLink()) continue;
+    const sourceInspection = await inspectProjectLaunchRuntimeHistoryEntry(source);
+    if (!sourceInspection?.targetStat || !isRegularHistoryTarget(sourceInspection.targetStat)) continue;
+    const sourcePath = sourceInspection.targetRealpath ?? source;
+    const sourceRoot = sourceInspection.targetRealpath ?? source;
+    if (!(await historyEntryStillMatches(source, sourceInspection))) {
+      complete = false;
+      continue;
+    }
     const destination = join(projectCodexHome, entryName);
-    if (sourceStat.isDirectory()) {
-      await cp(source, destination, { recursive: true, force: true, preserveTimestamps: true, verbatimSymlinks: true });
+    const destinationInspection = await inspectProjectLaunchRuntimeHistoryEntry(destination);
+    if (destinationInspection && !destinationInspection.targetStat) {
+      complete = false;
+      continue;
+    }
+    if (destinationInspection && !isRegularHistoryTarget(destinationInspection.targetStat)) {
+      complete = false;
+      continue;
+    }
+    const destinationPath = destinationInspection?.targetRealpath ?? destination;
+    const sourceCanonical = await realpath(sourcePath).catch((error) => {
+      if (isDiscardableHistoryCopyError(error)) return undefined;
+      throw error;
+    });
+    const destinationCanonical = await realpath(destinationPath).catch((error) => {
+      if (isDiscardableHistoryCopyError(error)) return undefined;
+      throw error;
+    });
+    if (sourceCanonical && destinationCanonical && sourceCanonical === destinationCanonical) continue;
+    await assertHistoryPathWithin(destinationPath, destinationRoot, true);
+    if (sourceInspection.targetStat.isDirectory()) {
+      try {
+        await copyProjectLaunchRuntimeHistoryDirectory(sourcePath, destinationPath, false, sourceRoot, destinationRoot, sourceInspection.targetStat);
+      } catch (error) {
+        if (isDiscardableHistoryCopyError(error)) {
+          complete = false;
+          continue;
+        }
+        throw error;
+      }
       continue;
     }
     if (entryName === "history.jsonl" || entryName === "session_index.jsonl") {
-      await persistProjectLaunchRuntimeJsonlArtifact(source, destination);
+      try {
+        await persistProjectLaunchRuntimeJsonlArtifact(
+          sourcePath,
+          destinationPath,
+          sourceRoot,
+          destinationRoot,
+          sourceInspection.targetStat.mode,
+          sourceInspection.targetStat,
+        );
+      } catch (error) {
+        if (isDiscardableHistoryCopyError(error)) {
+          complete = false;
+          continue;
+        }
+        throw error;
+      }
       continue;
     }
-    if (sourceStat.isFile()) {
-      await copyFilePreservingTimestamps(source, destination);
+    if (sourceInspection.targetStat.isFile()) {
+      try {
+        await copyFilePreservingTimestamps(sourcePath, destinationPath, {
+          sourceRoot,
+          destinationRoot,
+          expectedSourceStat: sourceInspection.targetStat,
+        });
+      } catch (error) {
+        if (isDiscardableHistoryCopyError(error)) {
+          complete = false;
+          continue;
+        }
+        throw error;
+      }
     }
-  }
+    }
+    return complete;
+  });
 }
 
 async function ensureProjectLaunchRuntimeHistoryLinks(
   runtimeCodexHome: string,
   projectCodexHome: string,
+  skipEntryNames: ReadonlySet<string> = new Set(),
+  createSymlink: typeof symlink = symlink,
 ): Promise<void> {
   await mkdir(projectCodexHome, { recursive: true });
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+    if (skipEntryNames.has(entryName)) continue;
     const runtimeEntry = join(runtimeCodexHome, entryName);
     if (existsSync(runtimeEntry)) continue;
     const projectEntry = join(projectCodexHome, entryName);
+    const projectEntryInspection = await inspectProjectLaunchRuntimeHistoryEntry(projectEntry);
+    if (
+      projectEntryInspection &&
+      (!projectEntryInspection.targetStat || !isRegularHistoryTarget(projectEntryInspection.targetStat))
+    ) {
+      continue;
+    }
     if (entryName === "sessions") {
       await mkdir(projectEntry, { recursive: true });
     } else if (!existsSync(projectEntry)) {
       await writeFile(projectEntry, "");
     }
-    await linkOrCopyCodexHomeEntry(projectEntry, runtimeEntry);
+    await linkOrCopyCodexHomeEntry(projectEntry, runtimeEntry, createSymlink);
   }
+}
+
+interface MaterializeProjectLaunchRuntimeHistoryOptions {
+  onlySymlinks?: boolean;
+  beforeCopy?: (entryName: string, source: string, destination: string) => Promise<void>;
+  afterValidation?: (entryName: string, source: string, destination: string) => Promise<void>;
+  afterStage?: (entryName: string, temporary: string, destination: string) => Promise<void>;
+  afterSourceOpen?: (entryName: string, source: string) => Promise<void>;
 }
 
 async function materializeProjectLaunchRuntimeHistoryEntries(
   runtimeCodexHome: string,
   sourceCodexHome: string,
-): Promise<void> {
+  options: MaterializeProjectLaunchRuntimeHistoryOptions = {},
+): Promise<Set<string>> {
+  const skipEntryNames = new Set<string>();
+  const destinationRoot = await realpath(runtimeCodexHome);
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(sourceCodexHome, entryName);
-    if (!existsSync(source)) continue;
+    const sourceInspection = await inspectProjectLaunchRuntimeHistoryEntry(source);
+    if (!sourceInspection || !sourceInspection.targetStat) continue;
+    if (options.onlySymlinks === true && !sourceInspection.linkStat.isSymbolicLink()) continue;
     const destination = join(runtimeCodexHome, entryName);
-    await rm(destination, { recursive: true, force: true });
-    const sourceStat = await lstat(source);
-    if (sourceStat.isDirectory()) {
-      await cp(source, destination, { recursive: true, force: true, dereference: true, preserveTimestamps: true });
+    await options.beforeCopy?.(entryName, source, destination);
+    if (!(await historyEntryStillMatches(source, sourceInspection))) {
+      skipEntryNames.add(entryName);
       continue;
     }
-    await copyFilePreservingTimestamps(source, destination);
+    await options.afterValidation?.(entryName, source, destination);
+    if (!(await historyEntryStillMatches(source, sourceInspection))) {
+      skipEntryNames.add(entryName);
+      continue;
+    }
+    try {
+      const sourceStat = sourceInspection.targetStat;
+      if (!sourceStat) continue;
+      const sourcePath = sourceInspection.targetRealpath ?? source;
+      if (sourceStat.isDirectory()) {
+        await replaceProjectLaunchRuntimeHistoryDirectory(
+          sourcePath,
+          destination,
+          false,
+          destinationRoot,
+          sourceStat,
+          options.afterStage
+            ? (temporary, stagedDestination) => options.afterStage!(entryName, temporary, stagedDestination)
+            : undefined,
+        );
+        continue;
+      }
+      if (sourceStat.isFile()) {
+        await copyFilePreservingTimestamps(sourcePath, destination, {
+          allowTopLevelSymlink: false,
+          sourceRoot: sourcePath,
+          destinationRoot,
+          expectedSourceStat: sourceStat,
+          afterStage: options.afterStage
+            ? (temporary, stagedDestination) => options.afterStage!(entryName, temporary, stagedDestination)
+            : undefined,
+          afterSourceOpen: options.afterSourceOpen
+            ? () => options.afterSourceOpen!(entryName, sourcePath)
+            : undefined,
+        });
+      }
+    } catch (error) {
+      if (isDiscardableHistoryCopyError(error)) {
+        skipEntryNames.add(entryName);
+        continue;
+      }
+      throw error;
+    }
+  }
+  return skipEntryNames;
+}
+
+async function copyProjectLaunchRuntimeHistoryDirectory(
+  source: string,
+  destination: string,
+  allowTopLevelSymlink = false,
+  sourceRoot = source,
+  destinationRoot = destination,
+  expectedSourceStat?: { dev: number; ino: number },
+): Promise<void> {
+  sourceRoot = await realpath(sourceRoot);
+  destinationRoot = await realpath(destinationRoot);
+  const sourceStat = allowTopLevelSymlink ? await stat(source) : await lstat(source);
+  if (!sourceStat.isDirectory() || (!allowTopLevelSymlink && sourceStat.isSymbolicLink())) return;
+  if (expectedSourceStat && !hasSameHistoryIdentity(sourceStat, expectedSourceStat)) {
+    throw new HistoryEntryChangedError(`history source changed during directory copy: ${source}`);
+  }
+  await assertHistoryPathWithin(source, sourceRoot);
+  const destinationStat = await lstat(destination).catch((error) => {
+    if (isUnresolvableHistoryLinkError(error)) return undefined;
+    throw error;
+  });
+  if (destinationStat && (!destinationStat.isDirectory() || destinationStat.isSymbolicLink())) {
+    await rm(destination, { recursive: true, force: true });
+  }
+  await assertHistoryDestinationParentWithin(destination, destinationRoot);
+  const destinationMode =
+    destinationStat && destinationStat.isDirectory() && !destinationStat.isSymbolicLink()
+      ? destinationStat.mode & historyDestinationMode(sourceStat.mode) & 0o7777
+      : undefined;
+  const destinationWasExistingDirectory = Boolean(
+    destinationStat && destinationStat.isDirectory() && !destinationStat.isSymbolicLink(),
+  );
+  const sourceDestinationMode = historyDestinationMode(sourceStat.mode);
+  await mkdir(destination, { recursive: true, mode: destinationMode ?? sourceDestinationMode });
+  await assertHistoryDestinationDirectorySafe(destination, destinationRoot);
+  await chmodHistoryDestination(
+    destination,
+    (destinationMode ?? sourceDestinationMode) | 0o700,
+    destinationWasExistingDirectory,
+  );
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    if (entry.name === ".omx-history.lock" || entry.name.startsWith(".omx-history.lock.")) continue;
+    const sourceEntry = join(source, entry.name);
+    const destinationEntry = join(destination, entry.name);
+    const entryStat = await lstat(sourceEntry).catch((error) => {
+      if (isUnresolvableHistoryLinkError(error)) return undefined;
+      throw error;
+    });
+    if (!entryStat || entryStat.isSymbolicLink()) continue;
+    if (entryStat.isDirectory()) {
+      await copyProjectLaunchRuntimeHistoryDirectory(
+        sourceEntry,
+        destinationEntry,
+        false,
+        sourceRoot,
+        destinationRoot,
+        entryStat,
+      );
+    } else if (entryStat.isFile()) {
+      await copyFilePreservingTimestamps(sourceEntry, destinationEntry, {
+        sourceRoot,
+        destinationRoot,
+        expectedSourceStat: entryStat,
+      });
+    }
+  }
+  await assertHistoryDestinationDirectorySafe(destination, destinationRoot);
+  await chmodHistoryDestination(destination, destinationMode ?? sourceDestinationMode, destinationWasExistingDirectory);
+  await assertHistoryDestinationDirectorySafe(destination, destinationRoot);
+  await utimesHistoryDestination(
+    destination,
+    sourceStat.atime,
+    sourceStat.mtime,
+    destinationWasExistingDirectory,
+  );
+}
+
+async function replaceProjectLaunchRuntimeHistoryDirectory(
+  source: string,
+  destination: string,
+  allowTopLevelSymlink: boolean,
+  destinationRoot: string,
+  expectedSourceStat: { dev: number; ino: number },
+  afterStage?: (temporary: string, destination: string) => Promise<void>,
+): Promise<void> {
+  const temporary = `${destination}.omx-history-${randomUUID()}`;
+  try {
+    const sourceStat = allowTopLevelSymlink ? await stat(source) : await lstat(source);
+    if (!sourceStat.isDirectory() || (!allowTopLevelSymlink && sourceStat.isSymbolicLink())) {
+      throw new Error(`history source is not a directory: ${source}`);
+    }
+    if (!hasSameHistoryIdentity(sourceStat, expectedSourceStat)) {
+      throw new HistoryEntryChangedError(`history source changed during directory publication: ${source}`);
+    }
+    await copyProjectLaunchRuntimeHistoryDirectory(
+      source,
+      temporary,
+      allowTopLevelSymlink,
+      source,
+      destinationRoot,
+      sourceStat,
+    );
+    await afterStage?.(temporary, destination);
+    const stagedStat = await lstat(temporary);
+    if (!stagedStat.isDirectory() || stagedStat.isSymbolicLink()) {
+      throw new Error(`history staging path is not a directory: ${temporary}`);
+    }
+    await assertHistoryDestinationParentWithin(destination, destinationRoot);
+    await publishHistoryReplacement(temporary, destination, true);
+  } finally {
+    await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -1080,37 +1901,122 @@ async function mergeProjectLaunchRuntimeHistoryEntries(
   sourceCodexHome: string,
   mergedHistorySourceRealpaths: Set<string>,
 ): Promise<void> {
+  const destinationRoot = await realpath(runtimeCodexHome);
   for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
     const source = join(sourceCodexHome, entryName);
-    if (!existsSync(source)) continue;
-    const sourceRealpath = realpathSync(source);
+    const sourceInspection = await inspectProjectLaunchRuntimeHistoryEntry(source);
+    if (!sourceInspection?.targetStat || !isRegularHistoryTarget(sourceInspection.targetStat)) continue;
+    const sourceRealpath =
+      sourceInspection.targetRealpath ??
+      await realpath(source).catch((error) => {
+        if (isUnresolvableHistoryLinkError(error)) return undefined;
+        throw error;
+      });
+    if (!sourceRealpath) continue;
     if (mergedHistorySourceRealpaths.has(sourceRealpath)) continue;
+    if (!(await historyEntryStillMatches(source, sourceInspection))) continue;
     const destination = join(runtimeCodexHome, entryName);
-    const sourceStat = await stat(source);
+    const sourceStat = sourceInspection.targetStat;
+    if (!sourceStat) continue;
     if (sourceStat.isDirectory()) {
+      const destinationStat = await lstat(destination).catch((error) => {
+        if (isUnresolvableHistoryLinkError(error)) return undefined;
+        throw error;
+      });
+      if (destinationStat && (!destinationStat.isDirectory() || destinationStat.isSymbolicLink())) {
+        await rm(destination, { recursive: true, force: true });
+      }
       await mkdir(destination, { recursive: true });
-      await cp(source, destination, { recursive: true, force: true, dereference: true, preserveTimestamps: true });
+      try {
+        await copyProjectLaunchRuntimeHistoryDirectory(
+          sourceInspection.targetRealpath ?? source,
+          destination,
+          false,
+          sourceInspection.targetRealpath ?? source,
+          destinationRoot,
+          sourceStat,
+        );
+      } catch (error) {
+        if (isDiscardableHistoryCopyError(error)) continue;
+        throw error;
+      }
       mergedHistorySourceRealpaths.add(sourceRealpath);
       continue;
     }
     if (entryName === "sessions") continue;
     if (!sourceStat.isFile()) continue;
-    if (existsSync(destination)) {
-      const destinationStat = await stat(destination);
+    const destinationLinkStat = await lstat(destination).catch((error) => {
+      if (isUnresolvableHistoryLinkError(error)) return undefined;
+      throw error;
+    });
+    if (destinationLinkStat?.isSymbolicLink()) {
+      await rm(destination, { force: true });
+    }
+    if (destinationLinkStat && !destinationLinkStat.isSymbolicLink()) {
+      const destinationStat = destinationLinkStat;
       if (!destinationStat.isFile()) {
         await rm(destination, { recursive: true, force: true });
-        await copyFilePreservingTimestamps(source, destination);
+        try {
+          await copyFilePreservingTimestamps(
+            sourceInspection.targetRealpath ?? source,
+            destination,
+            {
+              allowTopLevelSymlink: false,
+              sourceRoot: sourceInspection.targetRealpath ?? source,
+              destinationRoot,
+              expectedSourceStat: sourceStat,
+            },
+          );
+        } catch (error) {
+          if (isDiscardableHistoryCopyError(error)) continue;
+          throw error;
+        }
         mergedHistorySourceRealpaths.add(sourceRealpath);
         continue;
       }
-      const existing = await readFile(destination, "utf-8").catch(() => "");
-      const addition = await readFile(source, "utf-8");
+      let existing: string;
+      let addition: string;
+      try {
+        existing = await readHistoryFileWithoutSymlink(destination, false, destinationRoot);
+        addition = await readHistoryFileWithoutSymlink(
+          sourceInspection.targetRealpath ?? source,
+          false,
+          sourceInspection.targetRealpath ?? source,
+        );
+      } catch (error) {
+        if (isDiscardableHistoryCopyError(error)) continue;
+        throw error;
+      }
       const separator = existing === "" || existing.endsWith("\n") || addition === "" ? "" : "\n";
-      await writeFile(destination, `${existing}${separator}${addition}`, "utf-8");
+      try {
+        await writeHistoryFileAtomically(
+          destination,
+          `${existing}${separator}${addition}`,
+          destinationStat.mode & 0o7777,
+          destinationRoot,
+        );
+      } catch (error) {
+        if (isDiscardableHistoryCopyError(error)) continue;
+        throw error;
+      }
       mergedHistorySourceRealpaths.add(sourceRealpath);
       continue;
     }
-    await copyFilePreservingTimestamps(source, destination);
+    try {
+      await copyFilePreservingTimestamps(
+        sourceInspection.targetRealpath ?? source,
+        destination,
+        {
+          allowTopLevelSymlink: false,
+          sourceRoot: sourceInspection.targetRealpath ?? source,
+          destinationRoot,
+          expectedSourceStat: sourceStat,
+        },
+      );
+    } catch (error) {
+      if (isDiscardableHistoryCopyError(error)) continue;
+      throw error;
+    }
     mergedHistorySourceRealpaths.add(sourceRealpath);
   }
 }
@@ -1138,6 +2044,11 @@ export async function persistProjectLaunchRuntimeAuthState(
 export interface PrepareRuntimeCodexHomeForProjectLaunchOptions {
   includeHistoryArtifacts?: boolean;
   extraHistoryCodexHomes?: string[];
+  createSymlink?: typeof symlink;
+  beforeHistoryEntryCopy?: MaterializeProjectLaunchRuntimeHistoryOptions["beforeCopy"];
+  afterHistoryEntryValidation?: MaterializeProjectLaunchRuntimeHistoryOptions["afterValidation"];
+  afterHistoryEntryStage?: MaterializeProjectLaunchRuntimeHistoryOptions["afterStage"];
+  afterHistorySourceOpen?: MaterializeProjectLaunchRuntimeHistoryOptions["afterSourceOpen"];
 }
 
 export async function prepareRuntimeCodexHomeForProjectLaunch(
@@ -1151,7 +2062,7 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
   await mkdir(runtimeCodexHome, { recursive: true });
 
   if (!existsSync(projectCodexHome)) {
-    await ensureProjectLaunchRuntimeHistoryLinks(runtimeCodexHome, projectCodexHome);
+    await ensureProjectLaunchRuntimeHistoryLinks(runtimeCodexHome, projectCodexHome, new Set(), options.createSymlink);
     return runtimeCodexHome;
   }
 
@@ -1160,6 +2071,14 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
     if (PROJECT_LAUNCH_RUNTIME_SKIPPED_ENTRY_NAMES.has(entry.name)) continue;
     const source = join(projectCodexHome, entry.name);
     const destination = join(runtimeCodexHome, entry.name);
+    if (PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES.has(entry.name)) {
+      const sourceInspection = await inspectProjectLaunchRuntimeHistoryEntry(source);
+      if (!sourceInspection?.targetStat) continue;
+      if (options.includeHistoryArtifacts === true) {
+        if (!isRegularHistoryTarget(sourceInspection.targetStat)) continue;
+        continue;
+      }
+    }
     if (entry.name === "config.toml") {
       const projectHooksPath = join(projectCodexHome, "hooks.json");
       const projectConfig = await readFile(source, "utf-8");
@@ -1179,18 +2098,40 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
 	}
     await linkOrCopyCodexHomeEntry(source, destination);
   }
-  await ensureProjectLaunchRuntimeHistoryLinks(runtimeCodexHome, projectCodexHome);
-  if (options.includeHistoryArtifacts === true && (options.extraHistoryCodexHomes?.length ?? 0) > 0) {
+  let skippedHistoryEntryNames = new Set<string>();
+  if (options.includeHistoryArtifacts === true) {
+    const extraHistoryCodexHomes = options.extraHistoryCodexHomes ?? [];
+    const mergingHistory = extraHistoryCodexHomes.length > 0;
     const mergedHistorySourceRealpaths = new Set<string>();
     for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
       const source = join(projectCodexHome, entryName);
-      if (existsSync(source)) mergedHistorySourceRealpaths.add(realpathSync(source));
+      const sourceInspection = await inspectProjectLaunchRuntimeHistoryEntry(source);
+      if (!sourceInspection?.targetStat || !isRegularHistoryTarget(sourceInspection.targetStat)) continue;
+      const sourceRealpath =
+        sourceInspection.targetRealpath ??
+        await realpath(source).catch((error) => {
+          if (isUnresolvableHistoryLinkError(error)) return undefined;
+          throw error;
+        });
+      if (sourceRealpath) mergedHistorySourceRealpaths.add(sourceRealpath);
     }
-    await materializeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, projectCodexHome);
-    for (const extraCodexHome of options.extraHistoryCodexHomes ?? []) {
+    skippedHistoryEntryNames = await materializeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, projectCodexHome, {
+      onlySymlinks: !mergingHistory,
+      beforeCopy: options.beforeHistoryEntryCopy,
+      afterValidation: options.afterHistoryEntryValidation,
+      afterStage: options.afterHistoryEntryStage,
+      afterSourceOpen: options.afterHistorySourceOpen,
+    });
+    for (const extraCodexHome of extraHistoryCodexHomes) {
       await mergeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, extraCodexHome, mergedHistorySourceRealpaths);
     }
   }
+  await ensureProjectLaunchRuntimeHistoryLinks(
+    runtimeCodexHome,
+    projectCodexHome,
+    skippedHistoryEntryNames,
+    options.createSymlink,
+  );
 
 
   return runtimeCodexHome;
@@ -1420,6 +2361,8 @@ async function prepareResumeCodexHomeForLaunch(
       args: selection.args,
       prepared: {
         codexHomeOverride: runtimeCodexHome,
+        projectLocalCodexHomeForCleanup: projectHomes[0].path,
+        runtimeCodexHomeForCleanup: runtimeCodexHome,
       },
     };
   }
@@ -1461,18 +2404,43 @@ export async function cleanupRuntimeCodexHome(
   projectCodexHomeForPersistence?: string,
 ): Promise<void> {
   if (!runtimeCodexHomeForCleanup) return;
+  const runtimeParent = dirname(runtimeCodexHomeForCleanup);
+  const initialParentStat = await lstat(runtimeParent).catch(() => undefined);
+  const initialParentRealpath = await realpath(runtimeParent).catch(() => undefined);
+  const initialRuntimeStat = await lstat(runtimeCodexHomeForCleanup).catch(() => undefined);
+  if (!initialParentStat || !initialParentRealpath || !initialRuntimeStat) return;
+  if (initialParentStat.isSymbolicLink()) return;
+  try {
+    await assertHistoryPathWithin(runtimeCodexHomeForCleanup, initialParentRealpath);
+  } catch {
+    return;
+  }
   await persistProjectLaunchRuntimeAuthState(
     runtimeCodexHomeForCleanup,
     projectCodexHomeForPersistence,
   );
-  await persistProjectLaunchRuntimeHistoryArtifacts(
+  const historyPersisted = await persistProjectLaunchRuntimeHistoryArtifacts(
     runtimeCodexHomeForCleanup,
     projectCodexHomeForPersistence,
+    { dev: initialRuntimeStat.dev, ino: initialRuntimeStat.ino },
   );
+  if (!historyPersisted) return;
   await persistProjectLaunchRuntimeProjectTrustState(
     runtimeCodexHomeForCleanup,
     projectCodexHomeForPersistence,
   );
+  const finalParentStat = await lstat(runtimeParent).catch(() => undefined);
+  const finalParentRealpath = await realpath(runtimeParent).catch(() => undefined);
+  const finalRuntimeStat = await lstat(runtimeCodexHomeForCleanup).catch(() => undefined);
+  if (
+    !finalParentStat ||
+    finalParentStat.isSymbolicLink() ||
+    !finalParentRealpath ||
+    finalParentRealpath !== initialParentRealpath ||
+    !hasSameHistoryIdentity(finalParentStat, initialParentStat) ||
+    !finalRuntimeStat ||
+    !hasSameHistoryIdentity(finalRuntimeStat, initialRuntimeStat)
+  ) return;
   await rm(runtimeCodexHomeForCleanup, { recursive: true, force: true });
 }
 
@@ -1500,8 +2468,9 @@ type DetachedLeaderAuthority = {
 type DetachedHudAuthority = {
   paneId: string;
   panePid: number;
+  sessionName: string;
   sessionId: string;
-  sessionCreated?: string;
+  sessionCreated: string;
   windowId: string;
   operationMarker: string;
 };
@@ -1539,6 +2508,54 @@ export function parseDetachedLeaderPaneIdByPid(snapshot: string, leaderPid: numb
   return matches[0]!;
 }
 
+function resolveDetachedLeaderPaneIdentity(
+  sessionName: string,
+  expectedTmuxSessionId: string | undefined,
+  inheritedPane: string | undefined,
+  platform: NodeJS.Platform,
+  leaderPid: number,
+  requireInheritedPane: boolean,
+  probeInheritedPane: (paneId: string) => string,
+  listPanes: () => string,
+): string {
+  if (inheritedPane && /^%[0-9]+$/.test(inheritedPane)) {
+    try {
+      const [observedSessionName, observedSessionId, observedPaneId] = probeInheritedPane(inheritedPane).split("\t");
+      if (observedSessionName === sessionName && observedPaneId === inheritedPane
+        && (expectedTmuxSessionId === undefined || observedSessionId === expectedTmuxSessionId)) return inheritedPane;
+    } catch {
+      // Fall through to the platform-specific resolution policy below.
+    }
+  }
+  if (requireInheritedPane || platform === "win32") {
+    throw new Error("detached leader inherited pane identity is unavailable");
+  }
+  return parseDetachedLeaderPaneIdByPid(listPanes(), leaderPid);
+}
+
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function resolveDetachedLeaderPaneForTest(options: {
+  sessionName: string;
+  expectedTmuxSessionId?: string;
+  inheritedPane?: string;
+  platform: NodeJS.Platform;
+  leaderPid: number;
+  requireInheritedPane: boolean;
+  identityOutput: string;
+  paneSnapshot: string;
+}): string {
+  return resolveDetachedLeaderPaneIdentity(
+    options.sessionName,
+    options.expectedTmuxSessionId,
+    options.inheritedPane,
+    options.platform,
+    options.leaderPid,
+    options.requireInheritedPane,
+    () => options.identityOutput,
+    () => options.paneSnapshot,
+  );
+}
+
 function detachedLeaderAuthorityCondition(authority: DetachedLeaderAuthority, requireOwner = true): string {
   const conditions = [
     "#{==:#{pane_dead},0}",
@@ -1553,14 +2570,21 @@ function detachedLeaderAuthorityCondition(authority: DetachedLeaderAuthority, re
   return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
 }
 
-function detachedHudAuthorityCondition(authority: DetachedHudAuthority, requireMarker = true): string {
+function detachedHudAuthorityCondition(
+  authority: DetachedHudAuthority,
+  requireMarker = true,
+  ownerId?: string,
+): string {
   const conditions = [
     "#{==:#{pane_dead},0}",
     `#{==:#{pane_id},${authority.paneId}}`,
     `#{==:#{pane_pid},${authority.panePid}}`,
+    `#{==:#{session_name},${authority.sessionName}}`,
     `#{==:#{session_id},${authority.sessionId}}`,
+    `#{==:#{session_created},${authority.sessionCreated}}`,
     `#{==:#{window_id},${authority.windowId}}`,
     ...(requireMarker ? [`#{m:*OMX_DETACHED_HUD_OPERATION=${authority.operationMarker}*,#{pane_start_command}}`] : []),
+    ...(ownerId ? [`#{==:#{@omx_hud_owner},${ownerId}}`] : []),
   ];
   return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
 }
@@ -1602,26 +2626,195 @@ function runDetachedLeaderMutation(
   throw new Error(`detached leader authority blocked tmux mutation ${mutation}: ${describeDetachedLeaderAuthorityMismatch(authority)}`);
 }
 
-function detachedPreReportCleanupCondition(authority: DetachedLeaderAuthority): string {
+function runDetachedLeaderTagMutation(authority: DetachedLeaderAuthority, ownerId: string): void {
+  const receipt = detachedAuthorityReceipt();
+  const phaseMarker = ["set-option", "-t", authority.sessionName, "@omx_detached_owner_tag_attempted", "1"].map(quoteShellArg).join(" ");
+  const ownerTag = ["set-option", "-t", authority.sessionName, OMX_INSTANCE_OPTION, ownerId].map(quoteShellArg).join(" ");
+  const success = `${phaseMarker} ; ${ownerTag} ; display-message -p ${quoteShellArg(receipt)}`;
+  const output = execTmuxFileSync([
+    "if-shell", "-F", "-t", authority.paneId, detachedLeaderAuthorityCondition(authority, false),
+    success, "display-message -p ''",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  if (output !== receipt) throw new Error(`detached leader authority blocked tmux mutation tag-session: ${describeDetachedLeaderAuthorityMismatch(authority)}`);
+}
+
+/**
+ * #3578: session-scoped fence for pre-report cleanup when the leader pane no
+ * longer exists at all. A normal leader exit with `remain-on-exit off` (set by
+ * the tag-session step) removes the pane, so the pane-dead predicate above can
+ * never match and rollback leaked a HUD-only session. The replacement fence is
+ * evaluated against the SESSION (a server-scoped stable identity), not a pane:
+ * exact session_name + session_id + session_created, plus either this launch's
+ * @omx_instance_id owner tag or the empty owner state that exists before the
+ * tag-session step succeeds. A foreign tag is never accepted. The leader-pane
+ * probe is retained as a fail-closed existence check, but is not reused as a
+ * pane-targeted destructive sink; a replacement session has a different
+ * session_id/session_created and fails the session fence.
+ */
+function detachedPreReportSessionCleanupCondition(
+  authority: DetachedLeaderAuthority,
+  allowUnownedPreTag: boolean,
+  requireCapturedDeadPane: boolean,
+): string {
+  // The tag-session step is the first mutation after new-session. A bootstrap
+  // failure can therefore leave a retained dead leader pane in a session whose
+  // exact identity is ours but whose owner option is still unset. When the
+  // caller has authenticated the pre-tag phase, accept only that empty state
+  // or our expected tag; otherwise require our expected tag. A foreign tag
+  // remains a hard denial. Session id + creation time prevent a name-reused
+  // session from satisfying the pre-tag branch.
+  const owner = allowUnownedPreTag
+    ? `#{||:#{==:#{@omx_instance_id},${authority.ownerId}},#{==:#{@omx_instance_id},}}`
+    : `#{==:#{@omx_instance_id},${authority.ownerId}}`;
   const conditions = [
-    "#{==:#{pane_dead},1}",
-    `#{==:#{pane_id},${authority.paneId}}`,
     `#{==:#{session_name},${authority.sessionName}}`,
     `#{==:#{session_id},${authority.sessionId}}`,
     `#{==:#{session_created},${authority.sessionCreated}}`,
-    `#{==:#{window_id},${authority.windowId}}`,
+    owner,
   ];
+  if (requireCapturedDeadPane) {
+    // The session target resolves the active pane without using a pane target.
+    // If the captured dead pane was respawned, its PID or liveness changes and
+    // this single queued tmux predicate refuses the destructive sink. If a
+    // different pane is active, preserving is the only safe result.
+    conditions.push(
+      `#{==:#{pane_id},${authority.paneId}}`,
+      `#{==:#{pane_pid},${authority.panePid}}`,
+      "#{==:#{pane_dead},1}",
+    );
+  }
   return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
 }
 
-export function cleanupDetachedPreReportSession(authority: DetachedLeaderAuthority): void {
+function detachedPreReportLeaderPaneState(authority: DetachedLeaderAuthority): "absent" | "dead" | "live" | "unknown" {
+  // Enumerate the exact named session and classify the captured pane before any
+  // destructive command. A live captured leader is always preserved: a report
+  // can arrive after the final file read and before a separate tmux command,
+  // so timeout-based cleanup must never kill a pane that is still running.
+  // Enumeration failures (notably the exact session no longer exists) are
+  // fail-closed: unknown topology preserves without mutation.
+  try {
+    const sessionTarget = authority.sessionName;
+    const output = execTmuxFileSync(["list-panes", "-s", "-t", sessionTarget, "-F", "#{pane_id}\t#{pane_dead}"], {
+      encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    const row = output.split("\n").map((line) => line.trim()).filter(Boolean).find((line) => line.split("\t")[0] === authority.paneId);
+    if (!row) return "absent";
+    const paneDead = row.split("\t")[1];
+    if (paneDead === "1") return "dead";
+    if (paneDead === "0") return "live";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function detachedSessionExists(sessionName: string): boolean {
+  try {
+    execTmuxFileSync(["has-session", "-t", sessionName], {
+      encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupDetachedPreReportSessionInternal(
+  authority: DetachedLeaderAuthority,
+  afterTopologyProbe?: () => void,
+  allowUnownedPreTag = false,
+  authenticatedReadyOrTerminalProbe?: () => boolean,
+  afterAuthenticatedReadyOrTerminalProbe?: () => void,
+): DetachedPreReportCleanupResult {
   const receipt = detachedAuthorityReceipt();
-  const success = `kill-session -t ${quoteShellArg(authority.sessionName)} ; display-message -p ${quoteShellArg(receipt)}`;
-  const output = execTmuxFileSync([
-    "if-shell", "-F", "-t", authority.paneId, detachedPreReportCleanupCondition(authority),
+  const sessionTarget = authority.sessionName;
+  const success = `kill-session -t ${quoteShellArg(sessionTarget)} ; display-message -p ${quoteShellArg(receipt)}`;
+  // #3562/#3578: probe the exact session topology for diagnostics, but never
+  // feed the captured pane id into the destructive sink. The probe is
+  // non-atomic; a leader pane can disappear or be reused before the sink runs.
+  // The sink therefore targets only the session name and rechecks the complete
+  // session identity plus the authenticated owner/pre-tag fence in the same
+  // tmux command queue.
+  const paneState = detachedPreReportLeaderPaneState(authority);
+  if (paneState === "unknown") throw new Error("detached pre-report topology changed before cleanup");
+  afterTopologyProbe?.();
+  const authenticatedReady = authenticatedReadyOrTerminalProbe?.() === true;
+  afterAuthenticatedReadyOrTerminalProbe?.();
+  if (authenticatedReady) {
+    throw new Error("detached leader became ready or terminal before pre-report cleanup");
+  }
+  if (paneState === "live") return "preserved-live";
+  const sessionScoped = execTmuxFileSync([
+    "if-shell", "-F", "-t", sessionTarget, detachedPreReportSessionCleanupCondition(authority, allowUnownedPreTag, paneState === "dead"),
     success, "display-message -p ''",
   ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-  if (output !== receipt) throw new Error("detached pre-report topology changed before cleanup");
+  if (sessionScoped !== receipt) throw new Error("detached pre-report topology changed before cleanup");
+  return "cleaned";
+}
+
+type DetachedPreReportCleanupResult = "cleaned" | "preserved-live";
+
+function cleanupDetachedPreReportSessionWithRetry(
+  authority: DetachedLeaderAuthority,
+  allowUnownedPreTag: boolean,
+  authenticatedReadyOrTerminalProbe?: () => boolean,
+  authenticatedFailedReportProbe?: () => boolean,
+  retryAuthenticatedFailure = true,
+): DetachedPreReportCleanupResult {
+  let result: DetachedPreReportCleanupResult;
+  try {
+    result = cleanupDetachedPreReportSessionInternal(authority, undefined, allowUnownedPreTag, authenticatedReadyOrTerminalProbe);
+  } catch (error) {
+    // A failed leader may have already removed its own exact session before
+    // the parent reaches rollback. Only an authenticated failed report permits
+    // acknowledging that disappearance as completed cleanup.
+    if (authenticatedFailedReportProbe?.() && !detachedSessionExists(authority.sessionName)) return "cleaned";
+    throw error;
+  }
+  if (result === "cleaned" || !retryAuthenticatedFailure || !authenticatedFailedReportProbe?.()) return result;
+  // A failed report may be published while the leader pane is still live. Do
+  // not treat that observation as successful cleanup: retain the marker and
+  // retry the identity-fenced decision after the leader exits. A later ready,
+  // terminal, respawn, or ownership change fails closed inside the retry.
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    blockMs(20);
+    try {
+      result = cleanupDetachedPreReportSessionInternal(authority, undefined, allowUnownedPreTag, authenticatedReadyOrTerminalProbe);
+    } catch (error) {
+      if (authenticatedFailedReportProbe() && !detachedSessionExists(authority.sessionName)) return "cleaned";
+      throw error;
+    }
+    if (result === "cleaned") return result;
+  }
+  throw new Error("detached leader remained live before pre-report cleanup retry");
+}
+
+export function cleanupDetachedPreReportSession(
+  authority: DetachedLeaderAuthority,
+  allowUnownedPreTag = false,
+  authenticatedReadyOrTerminalProbe?: () => boolean,
+  authenticatedFailedReportProbe?: () => boolean,
+  retryAuthenticatedFailure = true,
+): DetachedPreReportCleanupResult {
+  return cleanupDetachedPreReportSessionWithRetry(authority, allowUnownedPreTag, authenticatedReadyOrTerminalProbe, authenticatedFailedReportProbe, retryAuthenticatedFailure);
+}
+
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function cleanupDetachedPreReportSessionForTest(
+  authority: DetachedLeaderAuthority,
+  afterTopologyProbe: () => void,
+  allowUnownedPreTag = false,
+  authenticatedReadyOrTerminalProbe?: () => boolean,
+  afterAuthenticatedReadyOrTerminalProbe?: () => void,
+  retryAfterLive = false,
+  authenticatedFailedReportProbe?: () => boolean,
+): void {
+  const result = cleanupDetachedPreReportSessionInternal(authority, afterTopologyProbe, allowUnownedPreTag, authenticatedReadyOrTerminalProbe, afterAuthenticatedReadyOrTerminalProbe);
+  if (retryAfterLive && result === "preserved-live") {
+    cleanupDetachedPreReportSessionWithRetry(authority, allowUnownedPreTag, authenticatedReadyOrTerminalProbe, authenticatedFailedReportProbe);
+  }
 }
 
 function runDetachedHudMutation(
@@ -1641,45 +2834,154 @@ function runDetachedHudMutation(
 }
 
 
-export function cleanupDetachedHudPane(authority: DetachedHudAuthority, ownerId?: string): void {
-  if (ownerId) {
-    execTmuxFileSync(["kill-pane", "-t", authority.paneId], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-  } else {
-    execTmuxFileSync([
-      "if-shell", "-F", "-t", authority.paneId, detachedHudAuthorityCondition(authority, false),
-      `kill-pane -t ${quoteShellArg(authority.paneId)}`, "",
+function detachedHudPaneProofFormat(): string {
+  // The trailing literal sentinel keeps an empty @omx_hud_owner from being
+  // trimmed away as trailing whitespace by tmux's format output.
+  return "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{session_id}\t#{session_created}\t#{window_id}\t#{pane_dead}\t#{@omx_hud_owner}\t#{pane_start_command}\tEND";
+}
+
+type DetachedHudPaneProof = {
+  paneId: string;
+  panePid: string;
+  sessionName: string;
+  sessionId: string;
+  sessionCreated: string;
+  windowId: string;
+  paneDead: string;
+  paneStartCommand: string;
+  hudOwner: string;
+};
+
+function parseDetachedHudPaneProofLine(line: string): DetachedHudPaneProof | undefined {
+  const fields = line.split("\t");
+  // Seven fixed fields, then @omx_hud_owner, then pane_start_command (which may
+  // itself contain TAB bytes), then the literal END sentinel.
+  if (fields.length < 10 || fields.at(-1) !== "END") return undefined;
+  const [paneId, panePid, sessionName, sessionId, sessionCreated, windowId, paneDead, hudOwner] = fields;
+  const paneStartCommand = fields.slice(8, -1).join("\t");
+  return {
+    paneId: paneId ?? "", panePid: panePid ?? "", sessionName: sessionName ?? "",
+    sessionId: sessionId ?? "", sessionCreated: sessionCreated ?? "", windowId: windowId ?? "",
+    paneDead: paneDead ?? "", paneStartCommand, hudOwner: hudOwner ?? "",
+  };
+}
+
+function matchesDetachedHudAuthority(proof: DetachedHudPaneProof, authority: DetachedHudAuthority, ownerId?: string): boolean {
+  if (proof.paneId !== authority.paneId) return false;
+  if (Number(proof.panePid) !== authority.panePid) return false;
+  if (proof.paneDead !== "0") return false;
+  if (proof.sessionName !== authority.sessionName) return false;
+  if (proof.sessionId !== authority.sessionId) return false;
+  if (proof.sessionCreated !== authority.sessionCreated) return false;
+  if (proof.windowId !== authority.windowId) return false;
+  // Marker non-vacuity: tmux reports pane_start_command wrapped in double
+  // quotes; the command must begin with the exact env assignment the
+  // production split sink injects. A pane whose command merely contains the
+  // marker text (e.g. an echo) is not the HUD.
+  const markerPrefix = `env OMX_DETACHED_HUD_OPERATION=${authority.operationMarker} `;
+  const startCommand = proof.paneStartCommand.replace(/^"|"$/g, "");
+  if (!startCommand.startsWith(markerPrefix)) return false;
+  if (ownerId !== undefined && proof.hudOwner !== ownerId) return false;
+  return true;
+}
+
+/**
+ * Enumerate the exact expected HUD pane inside its proven session scope and
+ * evaluate the full proof locally. The tmux enumeration target is the session
+ * name (a server-scoped stable identity), never the pane id: a stale or
+ * missing pane proof must resolve to an ordinary fail-closed preserve result
+ * instead of an `if-shell -t <stale pane>` evaluation that can tear down the
+ * server with the leader and any replacement/foreign panes (#3562).
+ * `-s` widens the enumeration to every window of the session: an attached user
+ * may select another window, and a window-scoped listing would hide a fully
+ * matching HUD in the original window (#3562 review).
+ *
+ * Preserve (undefined) on malformed enumeration output and any tmux command
+ * failure; callers preserve on zero or multiple authority matches.
+ */
+function listDetachedHudPaneProofsInSession(authority: DetachedHudAuthority): DetachedHudPaneProof[] | undefined {
+  try {
+    const output = execTmuxFileSync([
+      "list-panes", "-s", "-t", authority.sessionName, "-F", detachedHudPaneProofFormat(),
     ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    const proofs: DetachedHudPaneProof[] = [];
+    for (const line of output.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const proof = parseDetachedHudPaneProofLine(trimmed);
+      if (!proof) return undefined;
+      proofs.push(proof);
+    }
+    return proofs;
+  } catch {
+    return undefined;
   }
+}
+
+function removeDetachedHudPaneIfAuthorized(authority: DetachedHudAuthority, ownerId?: string): boolean {
+  const proofs = listDetachedHudPaneProofsInSession(authority);
+  if (!proofs) return false;
+  const matching = proofs.filter((proof) => matchesDetachedHudAuthority(proof, authority, ownerId));
+  if (matching.length !== 1) return false;
+  const receipt = detachedAuthorityReceipt();
+  const killed = `killed:${receipt}`;
+  const mismatched = `mismatch:${receipt}`;
+  try {
+    const output = execTmuxFileSync([
+      "if-shell", "-F", "-t", matching[0]!.paneId,
+      detachedHudAuthorityCondition(authority, true, ownerId),
+      `kill-pane -t ${quoteShellArg(matching[0]!.paneId)} ; display-message -p ${quoteShellArg(killed)}`,
+      `display-message -p ${quoteShellArg(mismatched)}`,
+    ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return output === killed;
+  } catch {
+    return false;
+  }
+}
+
+function awaitDetachedHudPaneRemoval(paneId: string): void {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const panes = execTmuxFileSync(["list-panes", "-a", "-F", "#{pane_id}"], {
       encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
     }).split("\n").map((value) => value.trim()).filter(Boolean);
-    if (!panes.includes(authority.paneId)) return;
+    if (!panes.includes(paneId)) return;
     blockMs(20);
   }
   throw new Error("detached HUD topology changed before teardown");
+}
+
+export function cleanupDetachedHudPane(authority: DetachedHudAuthority, ownerId?: string): boolean {
+  if (!removeDetachedHudPaneIfAuthorized(authority, ownerId)) {
+    // A stale, missing, or changed proof is an ordinary fail-closed preserve
+    // result. Throwing here would let callers escalate a benign mismatch into
+    // broader cleanup; the HUD pane and its session are left untouched.
+    return false;
+  }
+  awaitDetachedHudPaneRemoval(authority.paneId);
+  return true;
+}
+
+/**
+ * Remove the bootstrap HUD after an authenticated finalized leader result.
+ *
+ * The outer launcher retained the original HUD proof while creating the pane.
+ * Revalidate that proof and its owner tag at the tmux mutation sink so failure
+ * cleanup stays fail-closed when a pane is replaced or taken over.
+ */
+export function cleanupFinalizedDetachedHud(
+  expected: DetachedHudAuthority | null,
+  ownerId: string,
+): boolean {
+  if (!expected) return false;
+  if (!removeDetachedHudPaneIfAuthorized(expected, ownerId)) return false;
+  awaitDetachedHudPaneRemoval(expected.paneId);
+  return true;
 }
 
 function tagDetachedHudPane(leaderAuthority: DetachedLeaderAuthority, authority: DetachedHudAuthority, ownerId: string): void {
   runDetachedHudMutation(leaderAuthority, authority, [
     "set-option", "-pq", "-t", authority.paneId, "@omx_hud_owner", ownerId,
   ], false);
-}
-
-
-export function discoverDetachedHudAuthority(sessionName: string, ownerId: string): DetachedHudAuthority | undefined {
-  const rows = execTmuxFileSync([
-    "list-panes", "-a", "-F",
-    "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{session_id}\t#{session_created}\t#{window_id}\t#{@omx_hud_owner}",
-  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-  const matches = rows.split("\n").map((line) => line.trim()).filter(Boolean).flatMap((line) => {
-    const [paneId, paneDead, panePidRaw, discoveredSessionName, sessionId, sessionCreated, windowId, owner] = line.split("\t");
-    const panePid = Number(panePidRaw);
-    if (paneDead !== "0" || discoveredSessionName !== sessionName || owner !== ownerId || !/^%\d+$/.test(paneId ?? "") || !/^\$\d+$/.test(sessionId ?? "") || !/^\d+$/.test(sessionCreated ?? "") || !/^@\d+$/.test(windowId ?? "") || !Number.isSafeInteger(panePid) || panePid <= 0) return [];
-    return [{ paneId: paneId!, panePid, sessionId: sessionId!, sessionCreated: sessionCreated!, windowId: windowId!, operationMarker: randomUUID() }];
-  });
-  if (matches.length > 1) throw new Error("multiple detached HUD ownership tags found");
-  return matches[0];
 }
 
 
@@ -1760,19 +3062,19 @@ function runDetachedLeaderSplit(authority: DetachedLeaderAuthority, args: string
   if (formatIndex < 0 || splitArgs[formatIndex + 1] !== "#{pane_id}") throw new Error("invalid detached HUD split receipt format");
   const commandIndex = splitArgs.length - 1;
   splitArgs[commandIndex] = `env OMX_DETACHED_HUD_OPERATION=${operationMarker} ${splitArgs[commandIndex]}`;
-  splitArgs[formatIndex + 1] = `#{pane_id}\t#{pane_pid}\t#{session_id}\t#{window_id}\t${receipt}`;
+  splitArgs[formatIndex + 1] = `#{pane_id}\t#{pane_pid}\t#{session_name}\t#{session_id}\t#{session_created}\t#{window_id}\t${receipt}`;
   const output = execTmuxFileSync([
     "if-shell", "-F", "-t", authority.paneId, detachedLeaderAuthorityCondition(authority),
     splitArgs.map(quoteShellArg).join(" "), "display-message -p ''",
   ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-  const [paneId, panePid, sessionId, windowId, observedReceipt, ...extra] = output.split("\t");
-  if (!/^%[0-9]+$/.test(paneId) || !/^[1-9][0-9]*$/.test(panePid) || !/^\$[0-9]+$/.test(sessionId)
-    || !/^@[0-9]+$/.test(windowId) || observedReceipt !== receipt || extra.length !== 0) {
+  const [paneId, panePid, sessionName, sessionId, sessionCreated, windowId, observedReceipt, ...extra] = output.split("\t");
+  if (!/^%[0-9]+$/.test(paneId) || !/^[1-9][0-9]*$/.test(panePid) || !sessionName || !/^\$[0-9]+$/.test(sessionId)
+    || !/^\d+$/.test(sessionCreated) || !/^@[0-9]+$/.test(windowId) || observedReceipt !== receipt || extra.length !== 0) {
     throw new Error("detached leader authority changed before HUD split");
   }
   const parsedPid = Number(panePid);
   if (!Number.isSafeInteger(parsedPid) || parsedPid <= 0) throw new Error("malformed detached HUD authority");
-  return { paneId, panePid: parsedPid, sessionId, windowId, operationMarker };
+  return { paneId, panePid: parsedPid, sessionName, sessionId, sessionCreated, windowId, operationMarker };
 }
 
 function readTmuxEnvValueForTarget(targetPaneId: string): string | undefined {
@@ -1986,6 +3288,40 @@ function reportOrdinaryLaunchRootConflict(
       "[omx] cmd.exe: set \"OMX_ROOT=%USERPROFILE%\\.omx\\instances\\second-conversation\" && omx\n" +
       "[omx] The selected OMX_ROOT is used literally; OMX does not reroute or allocate one automatically.",
   );
+}
+/**
+ * #3578: a detached leader's session-pointer abort previously died with the
+ * leader pane. The validated abort code now reaches the outer launcher; print
+ * the same bounded, actionable guidance the ordinary launch path prints.
+ * `cwd` selects the root that produced the conflict, mirroring the ordinary
+ * path's cwd-default gating without weakening any ownership check.
+ */
+export function reportDetachedSessionPointerGuidance(
+  error: unknown,
+  cwd: string = process.cwd(),
+): void {
+  const candidate = findDetachedSessionPointerAbort(error);
+  if (!candidate) return;
+  if (candidate.code === "session_pointer_owner_conflict") {
+    // Rebuild a well-formed SessionPointerLaunchAbort so reportOrdinaryLaunchRootConflict's
+    // isSessionPointerLaunchAbort gate (name/committed/cwd/operation/code) accepts it,
+    // then reuse the ordinary path's exact OMX_ROOT guidance block unchanged.
+    reportOrdinaryLaunchRootConflict(
+      Object.assign(new Error("Session pointer sess-live-owner conflicts with an active session; launch aborted"), {
+        name: "SessionPointerLaunchAbort",
+        committed: false as const,
+        cwd,
+        operation: "detached-leader-pre-bind",
+        code: candidate.code,
+      }),
+      cwd,
+      true,
+    );
+    return;
+  }
+  if (candidate.code === "session_pointer_unusable") {
+    console.error("[omx] the selected session pointer is unusable; run `omx doctor` for the exact pointer status and bounded recovery steps.");
+  }
 }
 
 function logCliOperationFailure(error: unknown): void {
@@ -3098,12 +4434,21 @@ export function describeDetachedLeaderFailure(error: unknown): string {
 
 export class DetachedLaunchSafetyError extends Error {
   readonly name = "DetachedLaunchSafetyError";
+  /**
+   * The exact bootstrap step that failed, when the failure came from a named
+   * detached tmux step (#3578). `phase` stays the coarse D-state group; `step`
+   * disambiguates `tag-session`, its follow-on mutations, the HUD split, and
+   * every finalize step that previously collapsed into `pane-id`.
+   */
+  readonly step?: string;
   constructor(
     readonly phase: "establishment" | "completion" | "inert-session" | "pane-id" | "name-metadata" | "pane-metadata" | "active-record" | "lease-close" | "barrier-release" | "post-release-attach",
     readonly cause: unknown,
     readonly report: DetachedBootstrapReport,
+    step?: string,
   ) {
-    super(`detached launch safety failure during ${phase}${cause instanceof Error ? `: ${describeDetachedLeaderFailure(cause)}` : ""}`);
+    super(`detached launch safety failure during ${phase}${step && step !== phase ? ` (${step})` : ""}${cause instanceof Error ? `: ${describeDetachedLeaderFailure(cause)}` : ""}`);
+    if (step) this.step = step;
   }
 }
 
@@ -3123,6 +4468,44 @@ export interface DetachedReleaseFailureResolution {
   sessionName?: string;
   leaderPid?: number;
   kind?: "failed" | "terminal";
+}
+
+export interface DetachedFinalizationAuthority {
+  readonly nonce: string;
+  readonly sessionId: string;
+  readonly sessionName: string;
+  readonly leaderPid: number;
+  readonly kind: "failed" | "terminal";
+}
+
+export function isExactDetachedFinalization(
+  finalization: DetachedFinalizationAuthority | undefined,
+  expected: {
+    nonce: string;
+    sessionId: string;
+    sessionName: string;
+    leaderPid: number | null;
+  },
+): boolean {
+  return finalization !== undefined && (finalization.kind === "failed" || finalization.kind === "terminal") &&
+    finalization.nonce === expected.nonce &&
+    finalization.sessionId === expected.sessionId && finalization.sessionName === expected.sessionName &&
+    finalization.leaderPid === expected.leaderPid;
+}
+
+function authenticatedDetachedFinalization(
+  resolution: DetachedReleaseFailureResolution | undefined,
+): DetachedFinalizationAuthority | undefined {
+  if (resolution?.acknowledged !== true || !resolution.nonce || !resolution.sessionId || !resolution.sessionName ||
+    typeof resolution.leaderPid !== "number" || !Number.isSafeInteger(resolution.leaderPid) ||
+    (resolution.kind !== "failed" && resolution.kind !== "terminal")) return undefined;
+  return {
+    nonce: resolution.nonce,
+    sessionId: resolution.sessionId,
+    sessionName: resolution.sessionName,
+    leaderPid: resolution.leaderPid,
+    kind: resolution.kind,
+  };
 }
 
 
@@ -3165,7 +4548,11 @@ export interface DetachedLaunchDependencies<Binding = unknown, InertSession = un
    */
   abortAndAwaitFinalization?(error: unknown): Promise<DetachedReleaseFailureResolution>;
   attachOrReturn(session: InertSession, shouldAttach: boolean): Promise<void>;
-  rollback(ownedRecord: DetachedActiveRecordOwnership | undefined, report: DetachedBootstrapReport): Promise<void>;
+  rollback(
+    ownedRecord: DetachedActiveRecordOwnership | undefined,
+    report: DetachedBootstrapReport,
+    finalization: DetachedFinalizationAuthority | undefined,
+  ): Promise<void>;
   diagnostic?(error: unknown): void;
 
 }
@@ -3183,6 +4570,7 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
   let released = false;
   let retainedAuthority = false;
   let rollbackAuthorized = false;
+  let finalization: DetachedFinalizationAuthority | undefined;
   try {
     transition("D1");
     binding = await deps.establish();
@@ -3233,10 +4621,8 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
         released = true;
         throw new AggregateError([releaseError, abortError], "detached release and abort publication both failed");
       }
-      rollbackAuthorized = resolution?.acknowledged === true && Boolean(
-        resolution.nonce && resolution.sessionId && resolution.sessionName &&
-        Number.isSafeInteger(resolution.leaderPid) && resolution.kind,
-      );
+      finalization = authenticatedDetachedFinalization(resolution);
+      rollbackAuthorized = finalization !== undefined;
       if (!rollbackAuthorized) released = true;
       throw releaseError;
     }
@@ -3248,12 +4634,8 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
     if (retainedAuthority && !rollbackAuthorized && !released) {
       try {
         const resolution = await deps.abortAndAwaitFinalization?.(error);
-        rollbackAuthorized = resolution?.rollbackAuthorized === true || (
-          resolution?.acknowledged === true && Boolean(
-            resolution.nonce && resolution.sessionId && resolution.sessionName &&
-            Number.isSafeInteger(resolution.leaderPid) && resolution.kind
-          )
-        );
+        finalization = authenticatedDetachedFinalization(resolution);
+        rollbackAuthorized = resolution?.rollbackAuthorized === true || finalization !== undefined;
         if (!rollbackAuthorized) released = true;
       } catch (abortError) {
         released = true;
@@ -3263,14 +4645,14 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
     if (!released) {
       try {
         report.rollback.attempted.push("rollback");
-        await deps.rollback(ownedRecord, report);
+        await deps.rollback(ownedRecord, report, finalization);
       } catch (rollbackError) {
         report.rollback.failures.push({ step: "rollback", status: "failed", code: detachedFailureCode(rollbackError) });
         deps.diagnostic?.(rollbackError);
       }
     }
     if (error instanceof DetachedLaunchSafetyError) {
-      throw new DetachedLaunchSafetyError(error.phase, error.cause, report);
+      throw new DetachedLaunchSafetyError(error.phase, error.cause, report, error.step);
     }
     const phase = report.transitions.at(-1);
     const phaseName = phase === "D1" ? "establishment"
@@ -3380,6 +4762,7 @@ function renderDetachedLaunchSafetyReport(error: DetachedLaunchSafetyError): str
   }));
   return JSON.stringify({
     phase: error.phase,
+    ...(error.step ? { step: error.step } : {}),
     failure: describeDetachedLeaderFailure(error.cause),
     transitions: error.report.transitions,
     ...(establishmentCleanup ? { establishmentCleanup } : {}),
@@ -3679,6 +5062,7 @@ if (command !== "launch" && command !== "resume") {
     if (err instanceof DetachedLaunchSafetyError) {
       console.error(`Error: ${err.message}`);
       console.error(`[omx] detached launch safety report: ${renderDetachedLaunchSafetyReport(err)}`);
+      reportDetachedSessionPointerGuidance(err.cause);
     } else {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
     }
@@ -4933,9 +6317,79 @@ interface DetachedLeaderReport {
   paneId?: string;
   leaderPid?: number;
   error?: string;
+  /** Session-pointer abort code carried from a leader-side SessionPointerLaunchAbort (#3578). */
+  abortCode?: string;
   finalized?: boolean;
   exitStatus?: number;
   hud?: DetachedHudAuthority;
+}
+
+/**
+ * #3578: forward only the bounded machine-readable abort code of a leader-side
+ * session-pointer abort into the failed report. The human reason travels in
+ * `error`; nothing else from the nested error object is copied, so arbitrary
+ * nested errors are never dumped into the report.
+ */
+function detachedSessionPointerAbortCode(failure: unknown): { abortCode?: string } {
+  if (isSessionPointerLaunchAbort(failure)) return { abortCode: failure.code };
+  // #3578: the leader's terminal catch wraps non-finalized failures in an
+  // AggregateError (launch + lifecycle errors). The session-pointer abort can
+  // only be the launch-side member, never the lifecycle error, so a bounded
+  // one-level unwrap keeps the code without copying anything else.
+  if (failure instanceof AggregateError) {
+    for (const member of failure.errors) {
+      if (isSessionPointerLaunchAbort(member)) return { abortCode: member.code };
+    }
+  }
+  return {};
+}
+/**
+ * #3578: rebuild a leader-side session-pointer abort (code + reason only) from
+ * a validated failed report so the outer launcher can present the same
+ * actionable guidance the ordinary launch path prints. Non-abort failures keep
+ * a plain Error carrying the leader's bounded reason.
+ */
+function detachedLeaderFailureError(report: DetachedLeaderReport): Error {
+  const reason = report.error || "detached leader setup failed";
+  if (!report.abortCode) return new Error(reason);
+  const error = new Error(reason) as Error & { code?: string; abortedSessionPointer?: true };
+  error.code = report.abortCode;
+  error.abortedSessionPointer = true;
+  return error;
+}
+
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function detachedLeaderFailureErrorForTest(report: {
+  error?: string;
+  abortCode?: string;
+}): Error {
+  return detachedLeaderFailureError({
+    version: 1, kind: "failed", nonce: "test", sessionId: "test-session", sessionName: "test-name",
+    ...report,
+  });
+}
+/**
+ * #3578: recognize the bounded abort marker set by {@link detachedLeaderFailureError}
+ * directly on an error or on the launch-side member of a wrapping AggregateError.
+ * The D2 completion path wraps the leader's error in an AggregateError before the
+ * outer launcher sees it; without this unwrap the actionable abort code would be
+ * invisible to the guidance printer.
+ */
+function findDetachedSessionPointerAbort(error: unknown): { code: string } | undefined {
+  const candidates: unknown[] = [error];
+  if (error instanceof AggregateError) candidates.push(...error.errors);
+  for (const candidate of candidates) {
+    const marker = candidate as { code?: unknown; abortedSessionPointer?: unknown } | undefined;
+    if (marker && marker.abortedSessionPointer === true && typeof marker.code === "string") {
+      return { code: marker.code };
+    }
+  }
+  return undefined;
+}
+
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function isDetachedSessionPointerAbortCarried(error: unknown): boolean {
+  return findDetachedSessionPointerAbort(error) !== undefined;
 }
 
 export function isDetachedReadyReportAuthorized(
@@ -4948,14 +6402,65 @@ export function isDetachedReadyReportAuthorized(
     leaderPaneId: string | null;
     leaderPanePid: number | null;
   },
+  platform: NodeJS.Platform = process.platform,
 ): boolean {
   if (report?.kind !== "ready" || report.nonce !== expected.nonce
     || report.sessionId !== expected.sessionId || report.sessionName !== expected.sessionName
     || typeof report.leaderPid !== "number" || report.leaderPid <= 0) return false;
+  if (platform === "win32") return report.paneId === expected.leaderPaneId;
   if (expected.shouldAttach && expected.leaderPanePid !== null) {
     return report.leaderPid === expected.leaderPanePid;
   }
   return report.paneId === expected.leaderPaneId;
+}
+
+function isDetachedTerminalReportAuthorized(
+  report: DetachedLeaderReport | null | undefined,
+  expected: {
+    nonce: string;
+    sessionId: string;
+    sessionName: string;
+    shouldAttach: boolean;
+    leaderPaneId: string | null;
+    leaderPanePid: number | null;
+  },
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (report?.kind !== "terminal" || report.finalized !== true) return false;
+  return isDetachedReadyReportAuthorized({ ...report, kind: "ready" }, expected, platform);
+}
+
+function isDetachedFailedReportAuthorized(
+  report: DetachedLeaderReport | null | undefined,
+  expected: {
+    nonce: string;
+    sessionId: string;
+    sessionName: string;
+    leaderPaneId: string | null;
+    leaderPanePid: number | null;
+  },
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return report?.kind === "failed" && report.nonce === expected.nonce
+    && report.sessionId === expected.sessionId && report.sessionName === expected.sessionName
+    && report.paneId === expected.leaderPaneId
+    && typeof report.leaderPid === "number" && report.leaderPid > 0
+    && (platform === "win32" || expected.leaderPanePid === null || report.leaderPid === expected.leaderPanePid);
+}
+
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function isDetachedFailedReportAuthorizedForTest(
+  report: DetachedLeaderReport | null | undefined,
+  expected: {
+    nonce: string;
+    sessionId: string;
+    sessionName: string;
+    leaderPaneId: string | null;
+    leaderPanePid: number | null;
+  },
+  platform: NodeJS.Platform,
+): boolean {
+  return isDetachedFailedReportAuthorized(report, expected, platform);
 }
 
 function writeDetachedLeaderReport(path: string, report: DetachedLeaderReport): void {
@@ -4996,6 +6501,7 @@ function readDetachedLeaderReport(path: string): DetachedLeaderReport | undefine
     if (report.paneId !== undefined && typeof report.paneId !== "string") return undefined;
     if (report.leaderPid !== undefined && (!Number.isSafeInteger(report.leaderPid) || Number(report.leaderPid) <= 0)) return undefined;
     if (report.exitStatus !== undefined && (!Number.isSafeInteger(report.exitStatus) || Number(report.exitStatus) < 0 || Number(report.exitStatus) > 255)) return undefined;
+    if (report.abortCode !== undefined && (typeof report.abortCode !== "string" || report.abortCode.length > 128 || !/^[a-z_]+$/.test(report.abortCode))) return undefined;
     return report as unknown as DetachedLeaderReport;
   } catch { return undefined; }
 }
@@ -6558,11 +8064,13 @@ async function runCodex(
     let detachedHudAuthority: DetachedHudAuthority | null = null;
     let detachedLeaderPid: number | null = null;
     let rollbackFromPreReportAuthority = false;
+    let rollbackFromAuthenticatedFailure = false;
 
     let attachStep: DetachedSessionTmuxStep | null = null;
 
     const launchDetachedSession = async (): Promise<{ postLaunchHandledExternally: boolean }> => {
       let createdSession = false;
+      let detachedLeaderOwnerTagInstalled = false;
       const bootstrapLeader = async (): Promise<void> => {
         if (!nativeWindows) detachedParentEnvFilePath = writeDetachedSessionParentEnvFile(cwd, sessionId, codexEnvWithNotify);
         const bootstrapSteps = buildDetachedSessionBootstrapSteps(
@@ -6593,7 +8101,8 @@ async function runCodex(
             const authority = detachedLeaderAuthority;
             if (!authority) throw new Error("detached leader authority missing before tmux mutation");
             if (step.name === "tag-session") {
-              runDetachedLeaderMutation(authority, step.args, false);
+              runDetachedLeaderTagMutation(authority, sessionId);
+              detachedLeaderOwnerTagInstalled = true;
               // tmux can acknowledge the session tag before the first owner-format
               // evaluation sees it. Retrying this idempotent first owner-guarded
               // mutation once gives the server a command boundary without relaxing
@@ -6627,7 +8136,7 @@ async function runCodex(
               else runDetachedLeaderMutation(authority, finalizeStep.args);
             }
           } catch (error) {
-            throw new DetachedLaunchSafetyError(step.name === "new-session" ? "inert-session" : "pane-id", error, detachedPreflight.report);
+            throw new DetachedLaunchSafetyError(step.name === "new-session" ? "inert-session" : "pane-id", error, detachedPreflight.report, step.name);
           }
         }
         return undefined;
@@ -6652,10 +8161,34 @@ async function runCodex(
                 return { kind: "success" };
               }
               if (report?.nonce === detachedLaunchNonce && report.sessionId === sessionId && report.sessionName === sessionName && report.leaderPid && report.kind === "failed") {
+                if (!isDetachedFailedReportAuthorized(report, {
+                  nonce: detachedLaunchNonce,
+                  sessionId,
+                  sessionName,
+                  leaderPaneId: detachedLeaderPaneId,
+                  leaderPanePid: detachedLeaderAuthority?.panePid ?? null,
+                })) {
+                  throw new Error("detached failed report is not authorized");
+                }
                 detachedLeaderPid = report.leaderPid;
-                return { kind: "failure", operation: "session-instructions", error: new Error(report.error || "detached leader setup failed") };
+                // #3578: a failed leader report is terminal evidence. A leader that
+                // never reached readiness cannot hold pointer authority, so the
+                // outer launcher owns the pre-report tmux topology it created and
+                // may roll it back through the captured authority — never through
+                // the wait-for-finalization path, which only a ready leader can
+                // satisfy and would otherwise stall 30s and skip rollback.
+                rollbackFromPreReportAuthority = detachedLeaderAuthority !== null;
+                rollbackFromAuthenticatedFailure = rollbackFromPreReportAuthority;
+                return { kind: "failure", operation: "session-instructions", error: detachedLeaderFailureError(report) };
               }
-              if (Date.now() >= readyDeadline) return { kind: "failure", operation: "session-instructions", error: new Error("detached leader readiness timed out") };
+              if (Date.now() >= readyDeadline) {
+                // A timeout still owns the created pre-report topology. Keep
+                // the marker and authorize the asynchronous watcher so a
+                // failed report published just after this boundary can trigger
+                // cleanup after the leader exits without blocking completion.
+                rollbackFromPreReportAuthority = detachedLeaderAuthority !== null;
+                return { kind: "failure", operation: "session-instructions", error: new Error("detached leader readiness timed out") };
+              }
               blockMs(20);
             }
           },
@@ -6703,7 +8236,13 @@ async function runCodex(
             // The leader has the retained binding. Publishing abort is the only
             // outer action permitted after a D9 write failure; a mismatched or
             // missing report leaves every artifact and the tmux session intact.
-            if (!detachedLeaderPid) {
+            if (!detachedLeaderPid || rollbackFromPreReportAuthority) {
+              // #3578: either the leader was never observed (classic timeout /
+              // bootstrap abort) or it already reported a terminal failure before
+              // readiness — in both cases it never held pointer authority, so the
+              // pre-report tmux topology the outer launcher created is its own to
+              // roll back. Never wait for finalization here: only a leader that
+              // reached readiness can acknowledge it.
               rollbackFromPreReportAuthority = detachedLeaderAuthority !== null;
               return { acknowledged: false, rollbackAuthorized: rollbackFromPreReportAuthority };
             }
@@ -6737,25 +8276,75 @@ async function runCodex(
             return { acknowledged: false };
           },
           attachOrReturn: async () => { if (attachStep) execTmuxFileSync(attachStep.args, { stdio: "inherit" }); },
-          rollback: async (_ownedRecord, report) => {
+          rollback: async (_ownedRecord, report, finalization) => {
             const attempt = async (step: DetachedRollbackStep, operation: () => Promise<void> | void): Promise<void> => {
               report.rollback.attempted.push(step);
               try { await operation(); } catch (error) { report.rollback.failures.push({ step, status: "failed", code: detachedFailureCode(error) }); }
             };
             await attempt("parent-env", async () => { if (detachedParentEnvFilePath) await rm(detachedParentEnvFilePath, { force: true }); });
             await attempt("runtime-codex-home", () => cleanupRuntimeCodexHome(runtimeCodexHomeForCleanup, projectLocalCodexHomeForCleanup));
-            await attempt("rollback", () => { rmSync(releaseMarkerPath, { force: true }); rmSync(`${releaseMarkerPath}.release`, { force: true }); rmSync(`${releaseMarkerPath}.abort`, { force: true }); });
+            const removeReleaseMarkers = (): void => {
+              rmSync(releaseMarkerPath, { force: true });
+              rmSync(`${releaseMarkerPath}.release`, { force: true });
+              rmSync(`${releaseMarkerPath}.abort`, { force: true });
+            };
+            let sessionCleanupCompleted = !rollbackFromPreReportAuthority;
             if (createdSession) {
+              if (isExactDetachedFinalization(finalization, {
+                nonce: detachedLaunchNonce,
+                sessionId,
+                sessionName,
+                leaderPid: detachedLeaderPid,
+              })) {
+                if (detachedHudAuthority) {
+                  await attempt("session:kill-bootstrap-hud", () => {
+                    if (!cleanupFinalizedDetachedHud(detachedHudAuthority, sessionId)) {
+                      throw new Error("detached bootstrap HUD authority changed before finalized cleanup");
+                    }
+                  });
+                }
+                await attempt("rollback", removeReleaseMarkers);
+                return;
+              }
               for (const step of buildDetachedSessionRollbackSteps(sessionName, null, null, null)) {
                 await attempt(`session:${step.name}`, () => {
-                  if (!detachedLeaderAuthority) throw new Error("detached leader authority missing before rollback");
+                  const leaderAuthority = detachedLeaderAuthority;
+                  if (!leaderAuthority) throw new Error("detached leader authority missing before rollback");
                   if (rollbackFromPreReportAuthority && step.name === "kill-session") {
-                    cleanupDetachedPreReportSession(detachedLeaderAuthority);
+                    const cleanupResult = cleanupDetachedPreReportSession(
+                      leaderAuthority,
+                      !detachedLeaderOwnerTagInstalled,
+                      () => {
+                        const expected = {
+                          nonce: detachedLaunchNonce,
+                          sessionId,
+                          sessionName,
+                          shouldAttach: detachedPreflight.shouldAttach,
+                          leaderPaneId: detachedLeaderPaneId,
+                          leaderPanePid: leaderAuthority.panePid,
+                        };
+                        const report = readDetachedLeaderReport(releaseMarkerPath);
+                        return isDetachedReadyReportAuthorized(report, expected) ||
+                          isDetachedTerminalReportAuthorized(report, expected);
+                      },
+                      () => isDetachedFailedReportAuthorized(readDetachedLeaderReport(releaseMarkerPath), {
+                        nonce: detachedLaunchNonce,
+                        sessionId,
+                        sessionName,
+                        leaderPaneId: detachedLeaderPaneId,
+                        leaderPanePid: leaderAuthority.panePid,
+                      }),
+                      rollbackFromAuthenticatedFailure,
+                    );
+                    sessionCleanupCompleted = cleanupResult === "cleaned";
                     return;
                   }
-                  runDetachedLeaderMutation(detachedLeaderAuthority, step.args);
+                  runDetachedLeaderMutation(leaderAuthority, step.args);
                 });
               }
+            }
+            if (sessionCleanupCompleted) {
+              await attempt("rollback", removeReleaseMarkers);
             }
           },
         },
@@ -6983,10 +8572,12 @@ function parseDetachedHudAuthorityProof(value: unknown): DetachedHudAuthority | 
   const proof = value as Record<string, unknown>;
   if (typeof proof.paneId !== "string" || !/^%[0-9]+$/.test(proof.paneId)) return undefined;
   if (typeof proof.panePid !== "number" || !Number.isSafeInteger(proof.panePid) || proof.panePid <= 0) return undefined;
+  if (typeof proof.sessionName !== "string" || proof.sessionName.length === 0 || proof.sessionName.includes("\t")) return undefined;
   if (typeof proof.sessionId !== "string" || !/^\$[0-9]+$/.test(proof.sessionId)) return undefined;
+  if (typeof proof.sessionCreated !== "string" || !/^\d+$/.test(proof.sessionCreated)) return undefined;
   if (typeof proof.windowId !== "string" || !/^@[0-9]+$/.test(proof.windowId)) return undefined;
   if (typeof proof.operationMarker !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(proof.operationMarker)) return undefined;
-  return { paneId: proof.paneId, panePid: proof.panePid, sessionId: proof.sessionId, windowId: proof.windowId, operationMarker: proof.operationMarker };
+  return { paneId: proof.paneId, panePid: proof.panePid, sessionName: proof.sessionName, sessionId: proof.sessionId, sessionCreated: proof.sessionCreated, windowId: proof.windowId, operationMarker: proof.operationMarker };
 }
 
 function teardownDetachedOwnedHudPane(leaderPaneId: string, payload: DetachedLeaderPayload, hudProof: DetachedHudAuthority | undefined): void {
@@ -6996,17 +8587,61 @@ function teardownDetachedOwnedHudPane(leaderPaneId: string, payload: DetachedLea
   // Contract: only the proven HUD is removed. A pane the user added to the detached
   // session is deliberately preserved, which intentionally keeps that session (and any
   // attached client) alive; natural closure and shell return happen only when no other
-  // panes remain.
-  const discovered = discoverDetachedHudAuthority(payload.sessionName, payload.sessionId);
-  const proof = discovered ?? hudProof;
-  if (!proof) return;
+  // panes remain. The leader pane is removed only after the proven HUD removal is
+  // confirmed; a stale, missing, or changed HUD proof leaves the leader untouched too.
+  if (!hudProof) return;
   try {
-    cleanupDetachedHudPane(proof, discovered ? payload.sessionId : undefined);
+    if (!cleanupDetachedHudPane(hudProof, payload.sessionId)) return;
     execTmuxFileSync(["kill-pane", "-t", leaderPaneId], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
   } catch (error) {
     traceDetachedLeaderPhase(`hud-teardown-error:${describeDetachedLeaderFailure(error)}`);
     logCliOperationFailure(error);
   }
+}
+
+function cleanupDetachedLeaderSessionWithAuthority(
+  authority: DetachedLeaderAuthority,
+  ownerId: string,
+  beforeSink?: () => void,
+): void {
+  try {
+    const owner = `#{||:#{==:#{@omx_instance_id},${ownerId}},#{&&:#{==:#{@omx_instance_id},},#{!=:#{@omx_detached_owner_tag_attempted},1}}}`;
+    const condition = [
+      `#{==:#{session_name},${authority.sessionName}}`,
+      `#{==:#{session_id},${authority.sessionId}}`,
+      `#{==:#{session_created},${authority.sessionCreated}}`,
+      owner,
+    ].reduce((combined, item) => `#{&&:${combined},${item}}`);
+    const receipt = detachedAuthorityReceipt();
+    const success = `kill-session -t ${quoteShellArg(authority.sessionName)} ; display-message -p ${quoteShellArg(receipt)}`;
+    beforeSink?.();
+    const result = execTmuxFileSync([
+      "if-shell", "-F", "-t", authority.sessionName, condition, success, "display-message -p ''",
+    ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (result !== receipt) throw new Error("detached failed leader session authority changed before cleanup");
+  } catch {
+    // The parent retains the report and its own identity-fenced cleanup marker.
+    // A failed leader must never turn an uncertain session lookup into a kill.
+  }
+}
+
+function cleanupDetachedLeaderSessionAfterFailure(paneId: string, payload: DetachedLeaderPayload): void {
+  try {
+    const authority = captureDetachedLeaderAuthority(paneId, payload.sessionName, payload.sessionId);
+    cleanupDetachedLeaderSessionWithAuthority(authority, payload.sessionId);
+  } catch {
+    // The parent retains the report and its own identity-fenced cleanup marker.
+    // A failed leader must never turn an uncertain session lookup into a kill.
+  }
+}
+
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function cleanupDetachedLeaderSessionAfterFailureForTest(
+  authority: DetachedLeaderAuthority,
+  ownerId: string,
+  beforeSink?: () => void,
+): void {
+  cleanupDetachedLeaderSessionWithAuthority(authority, ownerId, beforeSink);
 }
 
 function traceDetachedLeaderPhase(phase: string): void {
@@ -7022,34 +8657,72 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     if (isDetachedLaunchControlPlaneKey(key, process.platform === "win32")) continue;
     process.env[key] = value;
   }
+  const nonce = payload.readyPath?.split(".").at(-2) || payload.sessionId;
   let pane: string;
   const inheritedPane = process.env.TMUX_PANE?.trim();
-  if (payload.preLaunchOptions.shouldAttach === false) {
-    if (!inheritedPane || !/^%[0-9]+$/.test(inheritedPane)) {
-      throw new Error("detached Hermes leader has no tmux pane identity");
+  if (process.platform !== "win32") {
+    if (payload.preLaunchOptions.shouldAttach === false) {
+      if (!inheritedPane || !/^%[0-9]+$/.test(inheritedPane)) throw new Error("detached Hermes leader has no tmux pane identity");
+      pane = inheritedPane;
+    } else {
+      const paneSnapshot = execTmuxFileSync(
+        ["list-panes", "-t", payload.sessionName, "-F", "#{pane_id}\t#{pane_dead}\t#{pane_pid}"],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+      );
+      pane = parseDetachedLeaderPaneIdByPid(paneSnapshot, process.pid);
     }
-    pane = inheritedPane;
   } else {
-    const paneSnapshot = execTmuxFileSync(
-      ["list-panes", "-t", payload.sessionName, "-F", "#{pane_id}\t#{pane_dead}\t#{pane_pid}"],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+    pane = resolveDetachedLeaderPaneIdentity(
+      payload.sessionName,
+      undefined,
+      inheritedPane,
+      process.platform,
+      process.pid,
+      payload.preLaunchOptions.shouldAttach === false,
+      (paneId) => execTmuxFileSync(
+        ["display-message", "-p", "-t", paneId, "#{session_name}\t#{session_id}\t#{pane_id}"],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+      ).trim(),
+      () => execTmuxFileSync(
+        ["list-panes", "-t", payload.sessionName, "-F", "#{pane_id}\t#{pane_dead}\t#{pane_pid}"],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+      ),
     );
-    pane = parseDetachedLeaderPaneIdByPid(paneSnapshot, process.pid);
   }
   process.env.TMUX_PANE = pane;
-  const established = await establishPreLaunchBinding(payload.cwd, payload.sessionId, {
-    tmuxSessionName: payload.sessionName,
-    tmuxPaneId: pane,
-  });
+  // #3578: a pre-binding failure (notably session_pointer_owner_conflict) used to
+  // die with the pane — remain-on-exit is off, so this leader's stderr vanished and
+  // the outer launcher could only report a readiness failure. Record the same
+  // bounded failure string the in-try path records so the parent can surface the
+  // actionable abort instead of a generic detached phase. Keep pane resolution
+  // outside the try so the exact clean-base identity path is preserved.
+  let established: Awaited<ReturnType<typeof establishPreLaunchBinding>> | undefined;
+  try {
+    established = await establishPreLaunchBinding(payload.cwd, payload.sessionId, {
+      tmuxSessionName: payload.sessionName,
+      tmuxPaneId: pane,
+    });
+  } catch (error) {
+    if (payload.readyPath) {
+      writeDetachedLeaderReport(payload.readyPath, {
+        version: 1, kind: "failed", nonce, sessionId: payload.sessionId, sessionName: payload.sessionName,
+        paneId: pane,
+        leaderPid: process.pid, error: describeDetachedLeaderFailure(error),
+        ...detachedSessionPointerAbortCode(error),
+      });
+    }
+    cleanupDetachedLeaderSessionAfterFailure(pane, payload);
+    throw error;
+  }
   const binding = established.binding;
   let ownedRecord: DetachedActiveRecordOwnership | undefined;
   let detachedHudProof: DetachedHudAuthority | undefined;
-  const nonce = payload.readyPath?.split(".").at(-2) || payload.sessionId;
   const contextKey = process.env[OMX_MADMAX_DETACHED_CONTEXT_ENV]?.trim();
+  let externalInterrupt: NodeJS.Signals | undefined;
   const activeRecordPath = contextKey
     ? madmaxDetachedActiveRecordPath(resolveMadmaxRunsRoot(process.env), contextKey)
     : join(omxRoot(payload.cwd), "state", "detached-active-record.json");
-  let externalInterrupt: NodeJS.Signals | undefined;
+  let readyReportWritten = false;
 
   try {
     const completion = await completePreLaunchSetup(
@@ -7083,6 +8756,7 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     });
     if (payload.readyPath) {
       writeDetachedLeaderReport(payload.readyPath, { version: 1, kind: "ready", nonce, sessionId: payload.sessionId, sessionName: payload.sessionName, paneId: pane, leaderPid: process.pid });
+      readyReportWritten = true;
       const releasePath = `${payload.readyPath}.release`;
       const abortPath = `${payload.readyPath}.abort`;
       const releaseDeadline = Date.now() + 30_000;
@@ -7212,8 +8886,11 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     }
     if (payload.readyPath) writeDetachedLeaderReport(payload.readyPath, {
       version: 1, kind: "failed", nonce, sessionId: payload.sessionId, sessionName: payload.sessionName,
+      paneId: pane,
       leaderPid: process.pid, finalized, error: failure instanceof Error ? failure.message : String(failure),
+      ...detachedSessionPointerAbortCode(failure),
     });
+    if (!readyReportWritten) cleanupDetachedLeaderSessionAfterFailure(pane, payload);
     throw failure;
   } finally {
     await closeLaunchSessionBindingOnce(binding);
@@ -8357,6 +10034,19 @@ interface CancellationTestFaults {
   rollbackFailureMode?: string;
 }
 
+interface CancellationFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+export function cancellationFileIdentityMatches(
+  frozen: CancellationFileIdentity,
+  current: CancellationFileIdentity,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return sessionOwnerFileIdentityMatches(frozen, current, platform);
+}
+
 async function cancelModes(
   args: string[] = [],
   options: { cwd?: string; testFaults?: CancellationTestFaults } = {},
@@ -8661,7 +10351,10 @@ async function cancelModes(
         const handle = await open(change.entry.path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
         const currentStat = await handle.stat();
         const currentContent = await handle.readFile({ encoding: "utf-8" });
-        if (!currentStat.isFile() || currentStat.dev !== change.entry.dev || currentStat.ino !== change.entry.ino) {
+        if (
+          !currentStat.isFile()
+          || !cancellationFileIdentityMatches(change.entry, currentStat)
+        ) {
           await handle.close();
           throw new Error(`Refusing cancellation because state identity changed: ${change.entry.path}.`);
         }

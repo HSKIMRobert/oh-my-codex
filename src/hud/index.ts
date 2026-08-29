@@ -18,6 +18,7 @@ import type { HudFlags, HudPreset, HudRenderContext, ResolvedHudConfig } from '.
 import { HUD_TMUX_HEIGHT_LINES } from './constants.js';
 import { sleep } from '../utils/sleep.js';
 import { runHudAuthorityTick } from './authority.js';
+import { isHudWatchSessionAttached } from './session-attached.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 import {
   killTmuxPane,
@@ -25,6 +26,7 @@ import {
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   readActiveTmuxPaneId,
   registerHudResizeHook,
+  clearTmuxPaneHistory,
   resizeTmuxPane,
 } from './tmux.js';
 import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit } from './reconcile.js';
@@ -78,12 +80,14 @@ interface RunWatchModeDependencies {
   renderHudFn: (ctx: HudRenderContext, preset: HudPreset, options?: { maxWidth?: number; maxLines?: number }) => string;
   runAuthorityTickFn: (options: { cwd: string }) => Promise<void>;
   resizeTmuxPaneFn: (paneId: string, heightLines: number) => boolean;
+  clearTmuxPaneHistoryFn: (paneId: string) => boolean;
   registerHudResizeHookFn: (hudPaneId: string, leaderPaneId: string | undefined, heightLines: number) => boolean;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
   registerSigint: (handler: () => void) => void | (() => void);
   setIntervalFn: (handler: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
   clearIntervalFn: (timer: ReturnType<typeof setInterval>) => void;
+  isSessionAttachedFn: () => boolean;
 }
 
 export interface ResolveHudWatchCwdDependencies {
@@ -181,6 +185,7 @@ export async function runWatchMode(
       await runHudAuthorityTick({ cwd: authorityCwd });
     }),
     resizeTmuxPaneFn: deps.resizeTmuxPaneFn ?? resizeTmuxPane,
+    clearTmuxPaneHistoryFn: deps.clearTmuxPaneHistoryFn ?? clearTmuxPaneHistory,
     registerHudResizeHookFn: deps.registerHudResizeHookFn ?? registerHudResizeHook,
     writeStdout: deps.writeStdout ?? ((text: string) => process.stdout.write(text)),
     writeStderr: deps.writeStderr ?? ((text: string) => process.stderr.write(text)),
@@ -190,6 +195,7 @@ export async function runWatchMode(
     }),
     setIntervalFn: deps.setIntervalFn ?? ((handler: () => void, intervalMs: number) => setInterval(handler, intervalMs)),
     clearIntervalFn: deps.clearIntervalFn ?? ((timer: ReturnType<typeof setInterval>) => clearInterval(timer)),
+    isSessionAttachedFn: deps.isSessionAttachedFn ?? (() => isHudWatchSessionAttached({ env: dependencies.env })),
   };
 
   if (!dependencies.isTTY && !dependencies.env.CI) {
@@ -229,27 +235,54 @@ export async function runWatchMode(
       return;
     }
     inFlight = true;
+    let renderedThisTick: 'rendered' | 'suppressed' | 'stopped' = 'suppressed';
     try {
-      if (firstRender) {
-        dependencies.writeStdout('\x1b[2J\x1b[H');
-        firstRender = false;
-      } else {
-        dependencies.writeStdout('\x1b[H');
+      // A detached session has no client to receive stdout, so skip the
+      // render-only work (state reads with git subprocess spawns, tmux height
+      // reconciliation, stdout writes) while still running the authority
+      // tick below. Fail-open: an unknown attachment answer renders.
+      // (closes #3577)
+      let attached = true;
+      try {
+        attached = dependencies.isSessionAttachedFn();
+      } catch {
+        // Fail-open: an unknown attachment answer renders.
+        attached = true;
       }
       const frameCwd = dependencies.resolveWatchCwdFn(cwd);
-      const config = await dependencies.readHudConfigFn(frameCwd);
-      const ctx = await dependencies.readAllStateFn(frameCwd, config);
-      const preset = flags.preset ?? config.preset;
-      const maxLines = getHudRenderMaxLines(ctx);
-      if (maxLines !== lastDesiredHeight) {
-        reconcileRunningHudPaneHeight(maxLines, dependencies);
-        lastDesiredHeight = maxLines;
+      if (firstRender || attached) {
+        const config = await dependencies.readHudConfigFn(frameCwd);
+        const ctx = await dependencies.readAllStateFn(frameCwd, config);
+        const preset = flags.preset ?? config.preset;
+        const maxLines = getHudRenderMaxLines(ctx);
+        const line = dependencies.renderHudFn(ctx, preset, {
+          maxWidth: process.stdout.columns ?? undefined,
+          maxLines,
+        });
+        const hudPaneId = dependencies.env.TMUX_PANE?.trim();
+        const ownedHudPane = Boolean(
+          dependencies.env.TMUX
+          && dependencies.env[OMX_TMUX_HUD_OWNER_ENV] === '1'
+          && hudPaneId?.startsWith('%'),
+        );
+        const changingHeight = maxLines !== lastDesiredHeight;
+        const clearFrame = ownedHudPane && changingHeight
+          ? '\x1b[3J\x1b[2J\x1b[H'
+          : '\x1b[2J\x1b[H';
+        if (changingHeight) {
+          // Clear before a pane resize so tmux cannot reflow stale HUD rows
+          // into visible output or scrollback while changing the pane height.
+          dependencies.writeStdout(clearFrame);
+          reconcileRunningHudPaneHeight(maxLines, dependencies);
+          if (ownedHudPane && hudPaneId) dependencies.clearTmuxPaneHistoryFn(hudPaneId);
+          lastDesiredHeight = maxLines;
+          dependencies.writeStdout(`\x1b[H${line}\x1b[K\x1b[J`);
+        } else {
+          dependencies.writeStdout(`${clearFrame}${line}\x1b[K\x1b[J`);
+        }
+        firstRender = false;
+        renderedThisTick = 'rendered';
       }
-      const line = dependencies.renderHudFn(ctx, preset, {
-        maxWidth: process.stdout.columns ?? undefined,
-        maxLines,
-      });
-      dependencies.writeStdout(line + '\x1b[K\x1b[J');
       try {
         await dependencies.runAuthorityTickFn({ cwd: frameCwd });
       } catch (authorityError) {
@@ -260,12 +293,13 @@ export async function runWatchMode(
       const message = error instanceof Error ? error.message : String(error);
       dependencies.writeStderr(`HUD watch render failed: ${message}\n`);
       process.exitCode = 1;
+      renderedThisTick = 'stopped';
       stop();
-      return;
     } finally {
-      inFlight = false;
+      if (renderedThisTick !== 'stopped') inFlight = false;
     }
 
+    if (renderedThisTick === 'stopped') return;
     if (queued) {
       queued = false;
       await renderTick();

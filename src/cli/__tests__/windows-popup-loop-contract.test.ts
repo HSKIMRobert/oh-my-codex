@@ -43,22 +43,51 @@ describe('detached tmux authority contract', () => {
       cliIndex,
       /function captureDetachedLeaderAuthority[\s\S]*?#\{session_name\}\\t#\{session_id\}\\t#\{session_created\}\\t#\{window_index\}\\t#\{window_id\}\\t#\{pane_id\}\\t#\{pane_pid\}/,
     );
-    assert.match(cliIndex, /type DetachedHudAuthority = \{[\s\S]*?panePid: number;[\s\S]*?sessionId: string;[\s\S]*?windowId: string;[\s\S]*?operationMarker: string;/);
-    assert.match(cliIndex, /splitArgs\[formatIndex \+ 1\] = `#\{pane_id\}\\t#\{pane_pid\}\\t#\{session_id\}\\t#\{window_id\}\\t\$\{receipt\}`/);
-    assert.match(cliIndex, /function detachedHudAuthorityCondition[\s\S]*?#\{==:#\{pane_pid\},\$\{authority\.panePid\}\}[\s\S]*?#\{==:#\{session_id\},\$\{authority\.sessionId\}\}[\s\S]*?#\{==:#\{window_id\},\$\{authority\.windowId\}\}[\s\S]*?OMX_DETACHED_HUD_OPERATION=\$\{authority\.operationMarker\}/);
+    assert.match(cliIndex, /type DetachedHudAuthority = \{[\s\S]*?panePid: number;[\s\S]*?sessionName: string;[\s\S]*?sessionId: string;[\s\S]*?sessionCreated: string;[\s\S]*?windowId: string;[\s\S]*?operationMarker: string;/);
+    assert.match(cliIndex, /splitArgs\[formatIndex \+ 1\] = `#\{pane_id\}\\t#\{pane_pid\}\\t#\{session_name\}\\t#\{session_id\}\\t#\{session_created\}\\t#\{window_id\}\\t\$\{receipt\}`/);
+    assert.match(cliIndex, /function detachedHudAuthorityCondition[\s\S]*?#\{==:#\{pane_pid\},\$\{authority\.panePid\}\}[\s\S]*?#\{==:#\{session_name\},\$\{authority\.sessionName\}\}[\s\S]*?#\{==:#\{session_id\},\$\{authority\.sessionId\}\}[\s\S]*?#\{==:#\{session_created\},\$\{authority\.sessionCreated\}\}[\s\S]*?#\{==:#\{window_id\},\$\{authority\.windowId\}\}[\s\S]*?OMX_DETACHED_HUD_OPERATION=\$\{authority\.operationMarker\}/);
     assert.match(cliIndex, /function runDetachedHudMutation[\s\S]*?if-shell -F -t \$\{quoteShellArg\(hudAuthority\.paneId\)\}[\s\S]*?detachedLeaderAuthorityCondition\(leaderAuthority\)/);
     assert.match(cliIndex, /function guardDetachedHudDeferredMutation[\s\S]*?buildDeferredDetachedHudGuard\(leaderAuthority, hudAuthority/);
     assert.match(cliIndex, /let detachedHudAuthority: DetachedHudAuthority \| null = null;/);
     assert.match(cliIndex, /detachedHudAuthority = runDetachedLeaderSplit\(authority, step\.args\)/);
     assert.match(cliIndex, /if \(targetsHudPane\) runDetachedHudMutation\(authority, detachedHudAuthority, guardDetachedHudDeferredMutation\(authority, detachedHudAuthority, finalizeStep\.args\)\)/);
     assert.match(cliIndex, /publishDetachedReleaseMarker\(releaseMarkerPath, detachedLaunchNonce, sessionId, sessionName, detachedLeaderPid, detachedHudAuthority \?\? undefined\)/);
-    assert.match(cliIndex, /runDetachedLeaderMutation\(detachedLeaderAuthority, step\.args\)/);
+    assert.match(cliIndex, /runDetachedLeaderMutation\(leaderAuthority, step\.args\)/);
+    assert.match(cliIndex, /function removeDetachedHudPaneIfAuthorized[\s\S]*?if-shell[\s\S]*?detachedHudAuthorityCondition\(authority, true, ownerId\)[\s\S]*?kill-pane/);
     assert.ok(cliIndex.includes('splitArgs[commandIndex] = `env OMX_DETACHED_HUD_OPERATION=${operationMarker} ${splitArgs[commandIndex]}`;'));
   });
 
   it('does not route runtime detached HUD or rollback mutations through raw step arguments', () => {
     assert.doesNotMatch(cliIndex, /execTmuxFileSync\(step\.args, \{ stdio: "ignore" \}\)/);
     assert.doesNotMatch(cliIndex, /execTmuxFileSync\(finalizeStep\.args, \{ stdio: "ignore" \}\)/);
+  });
+
+  it('keeps the detached report visible until the session cleanup decision is complete', () => {
+    const rollback = cliIndex.slice(cliIndex.indexOf('rollback: async (_ownedRecord'));
+    const cleanupDecision = rollback.indexOf('cleanupDetachedPreReportSession(');
+    const markerRemoval = rollback.lastIndexOf('await attempt("rollback", removeReleaseMarkers)');
+    assert.ok(cleanupDecision >= 0, 'rollback must perform the authenticated pre-report cleanup decision');
+    assert.ok(markerRemoval > cleanupDecision, 'release marker removal must follow the cleanup decision');
+    assert.match(rollback, /readDetachedLeaderReport\(releaseMarkerPath\)/);
+    assert.match(rollback, /isDetachedReadyReportAuthorized\(report, expected\)/);
+    assert.match(rollback, /isDetachedTerminalReportAuthorized\(report, expected\)/);
+  });
+
+  it('does not extend ordinary timeout rollback with the failed-report retry wait', () => {
+    const cleanup = cliIndex.slice(cliIndex.indexOf('function cleanupDetachedPreReportSessionWithRetry'));
+    assert.match(cleanup, /result === "cleaned" \|\| !retryAuthenticatedFailure \|\| !authenticatedFailedReportProbe\?\.\(\)/);
+  });
+
+  it('authenticates failed reports before complete and delegates late cleanup to the leader', () => {
+    const complete = cliIndex.slice(cliIndex.indexOf('complete: async () =>'));
+    assert.match(complete, /if \(!isDetachedFailedReportAuthorized\(report,/);
+    assert.match(complete, /rollbackFromPreReportAuthority = detachedLeaderAuthority !== null/);
+    assert.doesNotMatch(cliIndex, /scheduleDetachedPreReportCleanupRetry\(/);
+    assert.match(cliIndex, /@omx_detached_owner_tag_attempted/);
+    const failureCleanup = cliIndex.slice(cliIndex.indexOf('function cleanupDetachedLeaderSessionWithAuthority'));
+    assert.doesNotMatch(failureCleanup, /show-options/);
+    assert.match(failureCleanup, /@omx_detached_owner_tag_attempted/);
+    assert.match(cliIndex, /cleanupDetachedLeaderSessionAfterFailure\(pane, payload\)/);
   });
 
   it('executes a created-HUD recycling denial fixture rather than only declaring one', () => {

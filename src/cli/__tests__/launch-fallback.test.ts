@@ -142,7 +142,7 @@ if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
   esac
   [ -n "$receipt" ] || exit 1
   case "$success" in
-    *split-window*) printf '%%99\t456\t$1\t@1\t%s\n' "$receipt" ;;
+    *split-window*) printf '%%99\t456\t$1\t$2\t1\t@1\t%s\n' "$receipt" ;;
     *) printf '%s\n' "$receipt" ;;
   esac
   exit 0
@@ -266,7 +266,7 @@ if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
   esac
   [ -n "$receipt" ] || exit 1
   case "$success" in
-    *split-window*) printf '%%99\t456\t$1\t@1\t%s\n' "$receipt" ;;
+    *split-window*) printf '%%99\t456\t$1\t$2\t1\t@1\t%s\n' "$receipt" ;;
     *) printf '%s\n' "$receipt" ;;
   esac
   exit 0
@@ -346,10 +346,27 @@ function parseShimTmuxArgv(contents: string): string[][] {
     .map((record) => record.split('\nend tmux argv')[0]!.split('\n').filter(Boolean));
 }
 
+// The detached HUD pane runs its own `omx hud --watch` loop, which probes
+// attach state with `display-message ... #{session_attached}` roughly once per
+// second through the fixture tmux shim. That heartbeat is intentional attach
+// detection independent of the launch/ownership machinery under test, so
+// quiescence comparisons must ignore it; otherwise a 1s poll can land inside
+// a 250ms quiet window and spuriously fail the launch/ownership assertion.
+function normalizeShimLogForQuiescence(contents: string): string {
+  return parseShimTmuxArgv(contents)
+    .filter((argv) => !(argv[0] === 'display-message' && argv.includes('#{session_attached}')))
+    .map((argv) => `tmux argv:\n${argv.join('\n')}\nend tmux argv\n`)
+    .join('');
+}
+
 async function assertShimLogQuiescent(path: string, quietPeriodMs: number, message: string): Promise<void> {
   const before = await readFile(path, 'utf-8').catch(() => '');
   await new Promise((resolve) => setTimeout(resolve, quietPeriodMs));
-  assert.equal(await readFile(path, 'utf-8').catch(() => ''), before, message);
+  assert.equal(
+    normalizeShimLogForQuiescence(await readFile(path, 'utf-8').catch(() => '')),
+    normalizeShimLogForQuiescence(before),
+    message,
+  );
 }
 
 async function waitForServerLogSubstring(
