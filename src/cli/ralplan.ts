@@ -4,8 +4,14 @@ import {
 } from './codex-feature-probe.js';
 
 import { resolveInstalledRoleName } from '../subagents/tracker.js';
-import { readModeState, readModeStateForExplicitSession, startMode } from '../modes/base.js';
+import { readModeState, readModeStateForExplicitSession, startMode, updateModeState } from '../modes/base.js';
 import { runRalplanConsensus, type RalplanConsensusExecutor } from '../ralplan/runtime.js';
+import { resolveWritableStateScope } from '../mcp/state-paths.js';
+import {
+  projectAdvisoryReviewLifecycle,
+  type AdvisoryArtifactBaselines,
+} from '../ralplan/advisory-evidence.js';
+import { readCurrentRalplanAdvisory, terminalizeRalplanAdvisory } from '../ralplan/advisory.js';
 
 export const RALPLAN_HELP = `omx ralplan - consensus planning runtime and adapted-authority diagnostics
 
@@ -20,6 +26,8 @@ Usage:
                 State-preserving diagnostic only. Ordinary work remains under its own workflow gates.
   omx ralplan role-intent write --role <role> --parent-thread <id> [--session <id>] [--ttl-ms <n>] [--json]
                 Compatibility diagnostic only: installed roles are denied with unsupported_documented_leader_proof.
+  omx ralplan advisory complete [--json]
+                Close a standalone Advisory generation. Reconstructs canonical review evidence; accepts no evidence input.
 `;
 
 type RoleIntentFailureReason = 'unknown_role' | 'unsupported_documented_leader_proof';
@@ -42,6 +50,7 @@ export interface RalplanCommandDependencies {
   resolveInstalledRoleName?: typeof resolveInstalledRoleName;
   probeCodexVersionDetailed?: () => CodexVersionProbeResult | null | undefined;
   consensusExecutor?: RalplanConsensusExecutor;
+  beforeAdvisoryProjection?: (phase: 'initial' | 'revalidation') => void | Promise<void>;
 }
 
 const REVIEWED_ROOT_IDENTITY_ABSENT_VERSIONS = new Set([
@@ -137,17 +146,44 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
           : `Ralplan ${result.status}: ${result.error ?? result.phase}`);
         return;
       }
-      await startMode('ralplan', task.trim(), 5, cwd, sessionId);
+      const existing = sessionId
+        ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
+        : await readModeState('ralplan', cwd);
+      const advisorySessionId = sessionId ?? (typeof existing?.session_id === 'string' ? existing.session_id : undefined);
+      const advisory = advisorySessionId ? await readCurrentRalplanAdvisory(cwd, advisorySessionId) : null;
+      const advisoryNeedsResume = Boolean(advisory
+        && (!advisory.fence || !['closed', 'abandoned', 'released'].includes(advisory.fence.state)));
+      // The shell bootstrap has no consensus executor and therefore cannot
+      // reconstruct Advisory provenance. Preserve the existing Advisory
+      // binding instead of laundering it through a Standard startMode write.
+      const unprojectedActiveAdvisory = existing?.workflow_variant === 'advisory' && existing.active === true && !advisory;
+      if (!unprojectedActiveAdvisory && !advisoryNeedsResume) {
+        await startMode('ralplan', task.trim(), 5, cwd, sessionId);
+      }
     }
-    const state = sessionId
+    const storedState = sessionId
       ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
       : await readModeState('ralplan', cwd);
-    if (!state) throw new Error('No Ralplan state found.');
-    const instruction = [
-      `Run the Ralplan consensus runtime for ${JSON.stringify(String(state.task_description ?? ''))}.`,
-      'Execute Planner first, await Architect approval second, then await Critic approval third.',
-      'Persist the execution-ready plan, sequential review evidence, and bound ralplan_execution_handoff in this exact session.',
-    ].join('\n');
+    if (!storedState) throw new Error('No Ralplan state found.');
+    const stateSessionId = sessionId ?? (typeof storedState.session_id === 'string' ? storedState.session_id : undefined);
+    const projection = stateSessionId ? await readCurrentRalplanAdvisory(cwd, stateSessionId) : null;
+    const resumeAdvisory = Boolean(projection
+      && (!projection.fence || !['closed', 'abandoned', 'released'].includes(projection.fence.state)));
+    const state = resumeAdvisory && projection
+      ? { ...storedState, workflow_variant: 'advisory' as const, advisory_generation_id: projection.activation.generation_id }
+      : storedState;
+    const instruction = resumeAdvisory || state.workflow_variant === 'advisory'
+      ? [
+        `Resume the non-authorizing Ralplan Advisory lifecycle for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'This Advisory is non-authoritative and cannot grant execution authority.',
+        'Complete Planner, Architect, and Critic review in order and preserve their immutable evidence baselines.',
+        'Close the Advisory lifecycle and return control to the caller; the result remains non-authorizing.',
+      ].join('\n')
+      : [
+        `Run the Ralplan consensus runtime for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'Execute Planner first, await Architect approval second, then await Critic approval third.',
+        'Persist the execution-ready plan, sequential review evidence, and bound ralplan_execution_handoff in this exact session.',
+      ].join('\n');
     if (json) stdout(JSON.stringify({ ok: true, state, instruction }));
     else stdout(instruction);
     return;
@@ -167,6 +203,102 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     process.exitCode = 1;
     return;
   }
+  if (args[0] === 'advisory' && args[1] === 'complete') {
+    const json = args.length === 3 && args[2] === '--json';
+    if (args.length !== 2 && !json) throw new Error(`Unknown ralplan advisory complete argument: ${args.slice(2).join(' ')}`);
+    const cwd = (deps.cwd ?? process.cwd)();
+    const scope = await resolveWritableStateScope(cwd);
+    if (!scope.sessionId) throw new Error('ralplan_advisory_session_scope_required');
+    const state = await readModeStateForExplicitSession('ralplan', scope.sessionId, cwd);
+    if (!state || state.workflow_variant !== 'advisory') throw new Error('ralplan_advisory_not_active');
+    const sessionId = requiredStateString(state.session_id, 'session_id');
+    const generationId = requiredStateString(state.advisory_generation_id, 'advisory_generation_id');
+    const current = await readCurrentRalplanAdvisory(cwd, sessionId);
+    if (!current || current.corruption || current.activation.generation_id !== generationId) {
+      throw new Error(`ralplan_advisory_current_invalid:${current?.corruption ?? 'missing_or_mismatched'}`);
+    }
+    const activationTurnId = current.activation.activation_turn_id;
+    const closingTurnId = requiredStateString(current.fence?.closing_turn_id ?? state.advisory_closing_turn_id ?? state.turn_id, 'closing_turn_id');
+    const iteration = typeof state.iteration === 'number' && state.iteration > 0 ? state.iteration : 1;
+    const history = Array.isArray(state.review_history) ? state.review_history : [];
+    const item = (history.find((entry) => objectState(entry)?.iteration === iteration)
+      ?? history[iteration - 1]) as Record<string, unknown> | undefined;
+    const draft = objectState(item?.draft);
+    const architect = objectState(item?.architect_review);
+    const critic = objectState(item?.critic_review);
+    const planPath = requiredStateString(draft?.planPath ?? state.latest_plan_path, 'plan_path');
+    const architectArtifactPath = requiredStateString(architect?.artifact_path, 'architect_artifact_path');
+    const criticArtifactPath = requiredStateString(critic?.artifact_path, 'critic_artifact_path');
+    const planBaseline = requiredStateString(draft?.advisory_plan_manifest_sha256, 'advisory_plan_manifest_sha256');
+    const architectBaseline = requiredStateString(architect?.advisory_artifact_manifest_sha256, 'architect_artifact_manifest_sha256');
+    const criticBaseline = requiredStateString(critic?.advisory_artifact_manifest_sha256, 'critic_artifact_manifest_sha256');
+    const artifactBaselines: AdvisoryArtifactBaselines = {
+      planManifestSha256: planBaseline,
+      architectArtifactManifestSha256: architectBaseline,
+      criticArtifactManifestSha256: criticBaseline,
+    };
+    await deps.beforeAdvisoryProjection?.('initial');
+    const lifecycle = await projectAdvisoryReviewLifecycle({
+      cwd, sessionId, generationId,
+      activationTurnId, activationCreatedAt: current.activation.created_at, rootThreadId: current.activation.root_thread_id, iteration,
+      planPaths: [planPath], artifactBaselines,
+      architect: {
+        threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'),
+        artifactPath: architectArtifactPath,
+        verdict: requiredStateString(architect?.verdict, 'architect_verdict'),
+        sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
+      },
+      critic: {
+        threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'),
+        artifactPath: criticArtifactPath,
+        verdict: requiredStateString(critic?.verdict, 'critic_verdict'),
+        sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
+      },
+    });
+    let updated = false;
+    const terminalModeUpdates = {
+      active: false, current_phase: 'complete', planning_complete: true, completed_at: new Date().toISOString(),
+      workflow_variant: 'advisory' as const, advisory_generation_id: generationId,
+      ralplan_review_lifecycle: lifecycle, execution_handoff_authorized: false, host_verified: false,
+      ralplan_consensus_gate: { complete: false },
+    };
+    const result = await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId, closingTurnId, iteration, outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      terminalModeUpdates,
+      revalidateEvidence: async () => {
+        await deps.beforeAdvisoryProjection?.('revalidation');
+        return (await projectAdvisoryReviewLifecycle({
+          cwd, sessionId, generationId, activationTurnId, activationCreatedAt: current.activation.created_at,
+          rootThreadId: current.activation.root_thread_id, iteration, planPaths: [planPath], artifactBaselines,
+          architect: {
+            threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'), artifactPath: architectArtifactPath,
+            verdict: requiredStateString(architect?.verdict, 'architect_verdict'), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
+          },
+          critic: {
+            threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'), artifactPath: criticArtifactPath,
+            verdict: requiredStateString(critic?.verdict, 'critic_verdict'), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
+          },
+        })).evidence_bundle_sha256;
+      },
+      applyStep: async (step, storedPatch) => {
+        if (step === 'session_mode' && !updated) {
+          await updateModeState('ralplan', storedPatch ?? terminalModeUpdates, cwd, sessionId);
+          updated = true;
+        }
+      },
+    });
+    if (result.corruption || result.fence?.state !== 'closed') throw new Error(`ralplan_advisory_closeout_failed:${result.corruption ?? result.fence?.state ?? 'missing'}`);
+    const output = {
+      ok: true,
+      status: result.fence.state,
+      host_verified: false,
+      consensus_gate_complete: false,
+      execution_handoff_authorized: false,
+      return_to_caller: true,
+    };
+    stdout(json ? JSON.stringify(output) : 'Ralplan Advisory complete. Control returned to the caller without an automatic execution handoff; later user instructions follow normal host rules.');
+    return;
+  }
   if (args[0] !== 'role-intent' || args[1] !== 'write') throw new Error(`Unknown ralplan command: ${args.join(' ')}\n${RALPLAN_HELP}`);
 
   const parsed = parseRoleIntentWriteArgs(args.slice(2));
@@ -177,6 +309,15 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     return;
   }
   emitRoleIntentFailure('unsupported_documented_leader_proof', parsed.json, stdout, stderr);
+}
+
+function objectState(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function requiredStateString(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`ralplan_advisory_${name}_missing`);
+  return value.trim();
 }
 
 function parseRoleIntentWriteArgs(args: string[]): ParsedRoleIntentWriteArgs {

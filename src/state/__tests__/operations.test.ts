@@ -3393,6 +3393,7 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
       await writeFile(join(sessionDir, 'native-stop-state.json'), JSON.stringify({ sessions: { [sessionId]: {} } }));
       installScopeTakeover(stateDir, [2, 'native-stop.root'], JSON.stringify({ session_id: 'sess-replacement', cwd: wd, state_root: stateDir }));
       const rejected = await executeStateOperation('state_clear', { workingDirectory: wd, mode: 'autoresearch' });
+      assert.equal(rejected.isError, true);
       assert.deepEqual(rejected.payload, { error: WRITABLE_STATE_SCOPE_ERRORS.scopeChangedDuringWrite });
     } finally {
       __setWritableStateScopeTestHooksForTests({});
@@ -3543,4 +3544,3 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
     }
   });
 });
-

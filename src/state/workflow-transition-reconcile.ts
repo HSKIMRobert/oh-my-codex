@@ -164,7 +164,7 @@ async function completeSourceModeState(
     await mkdir(dirname(candidatePath), { recursive: true });
     const payload = JSON.stringify(nextState, null, 2);
     await beforeCommit?.({ site: 'transition.source-mode-detail', kind: 'write', path: candidatePath });
-    await writeStateFile(candidatePath, payload);
+    await writeStateFile(candidatePath, payload, baseStateDir);
     completedPaths.push(candidatePath);
   }
 

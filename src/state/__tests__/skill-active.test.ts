@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import {
   listActiveSkills,
   listTransitionActiveSkills,
+  mergeRootSkillStateForExactSession,
   readVisibleSkillActiveState,
   SkillActiveStateWriteError,
   syncCanonicalSkillStateForMode,
@@ -387,6 +388,36 @@ describe('skill-active state helpers', () => {
       compact({ active: true, skill: 'team', active_skills: entries }, 'foreign-session'),
       [{ skill: 'ralph', phase: 'executing', session_id: 'foreign-session' }],
     );
+  });
+
+  it('excludes Advisory Ralplan from generic workflow supersession', () => {
+    assert.deepEqual(listTransitionActiveSkills({
+      active: true,
+      skill: 'ralplan',
+      session_id: 'session-a',
+      workflow_variant: 'advisory',
+      active_skills: [
+        { skill: 'ralplan', active: true, session_id: 'session-a' },
+        { skill: 'team', active: true, session_id: 'session-a' },
+      ],
+    }, 'session-a').map((entry) => entry.skill), ['team']);
+  });
+
+  it('replaces a legacy unscoped owner entry when merging its scoped session projection', () => {
+    const merged = mergeRootSkillStateForExactSession({
+      active: true,
+      active_skills: [
+        { skill: 'ralplan', active: true, owner_codex_session_id: 'session-a' },
+        { skill: 'team', active: true, session_id: 'session-b' },
+      ],
+    }, {
+      active: true,
+      active_skills: [{ skill: 'ralplan', active: true, session_id: 'session-a', owner_codex_session_id: 'session-a' }],
+    }, 'session-a');
+    assert.deepEqual(listActiveSkills(merged).map((entry) => [entry.skill, entry.session_id, entry.owner_codex_session_id]), [
+      ['team', 'session-b', undefined],
+      ['ralplan', 'session-a', 'session-a'],
+    ]);
   });
   it('does not treat active_skills as active when the canonical state is terminal', async () => {
     await withTempRepo('omx-skill-active-terminal-overrides-entries-', async (cwd) => {

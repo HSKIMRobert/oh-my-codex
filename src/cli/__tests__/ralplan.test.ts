@@ -34,6 +34,50 @@ test('starts a session-scoped executable Ralplan runtime entry', async () => {
   }
 });
 
+test('preserves an existing Advisory binding when bootstrap has no consensus executor', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-cli-advisory-resume-'));
+  const sessionId = 'sess-ralplan-cli-advisory-resume';
+  const statePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+  try {
+    await mkdir(join(statePath, '..'), { recursive: true });
+    await writeFile(join(cwd, '.omx', 'state', 'session.json'), JSON.stringify({
+      session_id: sessionId,
+      cwd,
+      state_root: join(cwd, '.omx', 'state'),
+    }));
+    const advisory = {
+      mode: 'ralplan',
+      active: true,
+      current_phase: 'architect-review',
+      task_description: 'original advisory task',
+      session_id: sessionId,
+      workflow_variant: 'advisory',
+      advisory_generation_id: 'generation-a',
+      execution_handoff_authorized: false,
+      host_verified: false,
+    };
+    const before = `${JSON.stringify(advisory, null, 2)}\n`;
+    await writeFile(statePath, before);
+
+    const result = await invoke(
+      ['run', '--task', 'must not replace advisory', '--session', sessionId, '--json'],
+      { cwd: () => cwd },
+    );
+
+    assert.equal(result.exitCode, undefined);
+    assert.equal(await readFile(statePath, 'utf8'), before);
+    const output = JSON.parse(result.stdout[0]) as { state: Record<string, unknown>; instruction: string };
+    assert.equal(output.state.workflow_variant, 'advisory');
+    assert.equal(output.state.advisory_generation_id, 'generation-a');
+    assert.match(output.instruction, /original advisory task/);
+    assert.match(output.instruction, /non-authoritative/);
+    assert.doesNotMatch(output.instruction, /handoff/i);
+    assert.doesNotMatch(output.instruction, /authorize execution/i);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('executes the injected consensus runtime from the production Ralplan command path', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-cli-runtime-'));
   const sessionId = 'sess-ralplan-cli-runtime';

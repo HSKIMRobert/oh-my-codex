@@ -51,6 +51,8 @@ import {
   isAutopilotSuccessfulTerminalState,
   type AutopilotCompletionAdvisory,
 } from '../autopilot/completion-gate.js';
+import { isDirectRalplanAdvisoryInvocation, parseRalplanAdvisoryInvocation, readCurrentRalplanAdvisory } from '../ralplan/advisory.js';
+import { activateOrResumeRalplanAdvisory } from '../ralplan/advisory-activation.js';
 import {
   preflightSelectedTargetOwner,
   extractSelectedTargetOwnerEvidence,
@@ -149,6 +151,8 @@ export interface SkillActiveState {
   transition_error?: string;
   transition_message?: string;
   transition_messages?: string[];
+  workflow_variant?: 'advisory';
+  advisory_generation_id?: string;
   requested_skills?: string[];
   deferred_skills?: string[];
   [key: string]: unknown;
@@ -167,6 +171,11 @@ export interface RecordSkillActivationInput {
   allowSecondaryAutopilot?: boolean;
   resolvedPromptTurnContext?: ResolvedPromptTurnContext;
   onProvenanceRejected?: (diagnostic: PromptDiagnosticDescriptor) => void | Promise<void>;
+}
+
+interface RecordSkillActivationDependencies {
+  advisoryActivationFailpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer' | 'intent_committed') => void | Promise<void>;
+  advisoryAfterModeBindingFailpoint?: () => void | Promise<void>;
 }
 
 export interface DeepInterviewModeStatePersistenceInput {
@@ -523,6 +532,28 @@ function buildActiveSkills(state: SkillActiveState): SkillActiveEntry[] | undefi
   }];
 }
 
+function listPromptVisibleEntries(
+  previous: SkillActiveState | null,
+  sessionId?: string,
+): SkillActiveEntry[] {
+  const entries = listActiveSkills(previous ?? {});
+  const requestedSessionId = safeString(sessionId).trim();
+  const outerSessionId = safeString(previous?.session_id).trim();
+  const visible = requestedSessionId
+    ? entries.filter((entry) => {
+        const entrySessionId = safeString(entry.session_id).trim();
+        return entrySessionId === requestedSessionId
+          || (entrySessionId.length === 0 && outerSessionId === requestedSessionId);
+      })
+    : entries.filter((entry) => safeString(entry.session_id).trim().length === 0);
+  return visible;
+}
+
+function isAdvisoryRalplanEntry(entry: SkillActiveEntry, previous: SkillActiveState | null): boolean {
+  return entry.skill === 'ralplan'
+    && (entry.workflow_variant === 'advisory' || previous?.workflow_variant === 'advisory');
+}
+
 async function readExistingDeepInterviewState(statePath: string): Promise<DeepInterviewModeState | null> {
   try {
     const raw = await readFile(statePath, 'utf-8');
@@ -595,7 +626,7 @@ export async function persistDeepInterviewModeState(
       },
       { nowIso },
     );
-    await writeStateFile(statePath, JSON.stringify(nextState, null, 2));
+    await writeStateFile(statePath, JSON.stringify(nextState, null, 2), stateDir);
     return;
   }
 
@@ -628,7 +659,7 @@ export async function persistDeepInterviewModeState(
         }
       : {}),
   };
-  await writeStateFile(statePath, JSON.stringify(nextState, null, 2));
+  await writeStateFile(statePath, JSON.stringify(nextState, null, 2), stateDir);
 }
 
 function resolveSeedStateFilePath(
@@ -676,7 +707,12 @@ async function persistStatefulSkillSeedState(
   previousSkill: SkillActiveState | null,
   activationText: string,
   sourceCwd: string,
-  options: { activeContinuation?: boolean; forceSessionScope?: boolean } = {},
+  options: {
+    activeContinuation?: boolean; forceSessionScope?: boolean;
+    advisoryActivationFailpoint?: RecordSkillActivationDependencies['advisoryActivationFailpoint'];
+    advisoryAfterModeBindingFailpoint?: RecordSkillActivationDependencies['advisoryAfterModeBindingFailpoint'];
+    advisoryThreadKind?: 'root-or-drift' | 'unknown';
+  } = {},
 ): Promise<SkillActiveState> {
   const config = STATEFUL_SKILL_SEED_CONFIG[nextSkill.skill as StatefulSkillMode];
   if (!config) return nextSkill;
@@ -738,6 +774,54 @@ async function persistStatefulSkillSeedState(
 
   if (config.mode === 'deep-interview') {
     Object.assign(baseState, buildDeepInterviewConfigStateFields(nextSkill.deep_interview_config));
+  }
+
+  const advisoryInvocation = config.mode === 'ralplan'
+    && isDirectRalplanAdvisoryInvocation(activationText);
+  if (config.mode === 'ralplan' && advisoryInvocation) {
+    const sessionId = safeString(nextSkill.session_id).trim();
+    const rootThreadId = safeString(nextSkill.thread_id).trim();
+    const activationTurnId = safeString(nextSkill.turn_id).trim();
+    if (!sessionId || !rootThreadId || !activationTurnId) throw new Error('ralplan_advisory_canonical_turn_identity_required');
+    const prior = await readCurrentRalplanAdvisory(sourceCwd, sessionId);
+    const pendingRecovery = prior?.corruption === 'rollover_pending_admin'
+      || prior?.corruption === 'current_missing_with_advisory_state';
+    if (prior?.corruption && !pendingRecovery) throw new Error(`ralplan_advisory_${prior.corruption}`);
+    const activated = await activateOrResumeRalplanAdvisory({
+      cwd: sourceCwd, sessionId, rootThreadId, activationTurnId,
+      producer: 'native', threadKind: options.advisoryThreadKind ?? 'unknown',
+      ...(prior?.activation?.generation_id ? { predecessorGenerationId: prior.activation.generation_id } : {}),
+      nowIso, prompt: activationText,
+      failpoint: async (checkpoint) => {
+        if (checkpoint === 'after_intent' && !pendingRecovery) {
+          await options.advisoryActivationFailpoint?.('rollover_intent');
+        }
+        if (checkpoint === 'after_mode') await options.advisoryAfterModeBindingFailpoint?.();
+        if (checkpoint === 'intent_committed') await options.advisoryActivationFailpoint?.('intent_committed');
+      },
+    });
+    const activation = activated.activation;
+    baseState.workflow_variant = 'advisory';
+    baseState.advisory_generation_id = activation.generation_id;
+    baseState.execution_handoff_authorized = false;
+    baseState.host_verified = false;
+    baseState.ralplan_consensus_gate = { complete: false };
+  }
+
+  if (baseState.workflow_variant === 'advisory') {
+    const advisoryGenerationId = safeString(baseState.advisory_generation_id);
+    return {
+      ...nextSkill,
+      initialized_mode: config.mode,
+      initialized_state_path: relativePath,
+      workflow_variant: 'advisory',
+      advisory_generation_id: advisoryGenerationId,
+      active_skills: nextSkill.active_skills?.map((entry) => (
+        entry.skill === 'ralplan' && entry.session_id === nextSkill.session_id
+          ? { ...entry, workflow_variant: 'advisory' as const, advisory_generation_id: advisoryGenerationId }
+          : entry
+      )),
+    };
   }
 
   if (config.mode === 'autopilot') {
@@ -831,12 +915,16 @@ async function persistStatefulSkillSeedState(
   }
 
   await mkdir(dirname(absolutePath), { recursive: true });
-  await writeStateFile(absolutePath, JSON.stringify(baseState, null, 2));
+  await writeStateFile(absolutePath, JSON.stringify(baseState, null, 2), stateDir);
 
   return {
     ...nextSkill,
     initialized_mode: config.mode,
     initialized_state_path: relativePath,
+    ...(baseState.workflow_variant === 'advisory' ? {
+      workflow_variant: 'advisory' as const,
+      advisory_generation_id: safeString(baseState.advisory_generation_id),
+    } : {}),
   };
 }
 
@@ -3794,6 +3882,7 @@ async function preflightKeywordTargetState(
 
 export async function recordSkillActivation(
   input: RecordSkillActivationInput,
+  dependencies: RecordSkillActivationDependencies = {},
 ): Promise<SkillActiveState | null> {
 
   const classification = input.classification ?? classifyKeywordInput(input.text);
@@ -3804,6 +3893,10 @@ export async function recordSkillActivation(
   const resolvedPromptTurnContext = input.resolvedPromptTurnContext;
   if (resolvedPromptTurnContext && resolvedPromptTurnContext.status !== 'authorized') return null;
   if (resolvedPromptTurnContext && input.sessionId !== resolvedPromptTurnContext.authorization.targetSessionId) return null;
+  const authenticatedRootPrompt = resolvedPromptTurnContext?.status === 'authorized'
+    && resolvedPromptTurnContext.authorization.targetRelation !== 'explicit-independent'
+    && resolvedPromptTurnContext.authorization.thread.kind === 'root-or-drift';
+  if (isDirectRalplanAdvisoryInvocation(input.text) && !authenticatedRootPrompt) return null;
   const suppressRootMutation = resolvedPromptTurnContext?.authorization.globalSideEffects === 'suppress';
   const provenanceOwnerCodexSessionId = resolvedPromptTurnContext?.authorization.ownerCodexSessionId;
   const applyProvenanceOwner = (state: SkillActiveState): SkillActiveState => (
@@ -3873,6 +3966,13 @@ export async function recordSkillActivation(
     classification,
   );
   if (!match) return null;
+
+  const advisoryInvocation = parseRalplanAdvisoryInvocation(input.text);
+  if (advisoryInvocation === 'invalid'
+    || (advisoryInvocation === 'valid'
+      && (match.skill !== 'ralplan' || classification.matches.some((candidate) => candidate.skill !== 'ralplan')))) {
+    return null;
+  }
   const hadDeepInterviewLock = previous?.skill === 'deep-interview' && previous?.input_lock?.active === true;
   const matches = filterMatchesForTeamMode(classification.matches, teamMode.enabled);
 
@@ -3904,6 +4004,7 @@ export async function recordSkillActivation(
       );
       await persistDeepInterviewModeState(input.stateDir, applyProvenanceOwner(state), nowIso, previous, input);
     } catch (error) {
+      if (isDirectRalplanAdvisoryInvocation(input.text)) throw error;
       console.warn('[omx] warning: failed to persist keyword activation state', error);
     }
 
@@ -3931,7 +4032,9 @@ export async function recordSkillActivation(
   if (classification.reservedInput === 'omx-question-answered' && matchedModeTerminal) return null;
   const preserveActivatedAt = sameSkill && !matchedModeTerminal && (sameKeyword || sameSkillContinuation);
   const previousEntries = listActiveSkills(previous ?? {});
-  const previousWorkflowEntries = previousEntries.filter((entry) => (
+  const visibleEntries = listPromptVisibleEntries(previous, input.sessionId);
+  const protectedAdvisoryEntries = visibleEntries.filter((entry) => isAdvisoryRalplanEntry(entry, previous));
+  const previousWorkflowEntries = visibleEntries.filter((entry) => !isAdvisoryRalplanEntry(entry, previous)).filter((entry) => (
     isTrackedWorkflowMode(entry.skill)
     && (input.allowSecondaryAutopilot !== false || entry.skill !== 'autopilot' || entry.skill === match.skill)
     && (
@@ -4137,7 +4240,7 @@ export async function recordSkillActivation(
       session_id: input.sessionId,
       thread_id: input.threadId,
       turn_id: input.turnId,
-      active_skills: nextWorkflowEntries,
+      active_skills: [...protectedAdvisoryEntries, ...nextWorkflowEntries],
       ...(transitionMessages[0] ? { transition_message: transitionMessages[0] } : {}),
       ...(transitionMessages.length > 0 ? { transition_messages: [...new Set(transitionMessages)] } : {}),
       ...(requestedWorkflowSkills.length > 1 ? { requested_skills: requestedWorkflowSkills } : {}),
@@ -4168,6 +4271,9 @@ export async function recordSkillActivation(
           {
             activeContinuation: requestedEntry.skill === 'autopilot' && sameSkillContinuation,
             forceSessionScope: suppressRootMutation,
+            advisoryActivationFailpoint: dependencies.advisoryActivationFailpoint,
+            advisoryAfterModeBindingFailpoint: dependencies.advisoryAfterModeBindingFailpoint,
+            advisoryThreadKind: authenticatedRootPrompt ? 'root-or-drift' : 'unknown',
           },
         );
         if (requestedEntry.skill === workflowState.skill) {
@@ -4175,6 +4281,9 @@ export async function recordSkillActivation(
             ...ownedWorkflowState,
             initialized_mode: seeded.initialized_mode,
             initialized_state_path: seeded.initialized_state_path,
+            ...(seeded.active_skills ? { active_skills: seeded.active_skills } : {}),
+            ...(seeded.workflow_variant ? { workflow_variant: seeded.workflow_variant } : {}),
+            ...(seeded.advisory_generation_id ? { advisory_generation_id: seeded.advisory_generation_id } : {}),
           };
         }
       }
@@ -4189,6 +4298,7 @@ export async function recordSkillActivation(
       await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
       return nextState;
     } catch (error) {
+      if (isDirectRalplanAdvisoryInvocation(input.text)) throw error;
       console.warn('[omx] warning: failed to persist keyword activation state', error);
     }
 
@@ -4233,6 +4343,9 @@ export async function recordSkillActivation(
       {
         activeContinuation: match.skill === 'autopilot' && sameSkillContinuation,
         forceSessionScope: suppressRootMutation,
+        advisoryActivationFailpoint: dependencies.advisoryActivationFailpoint,
+        advisoryAfterModeBindingFailpoint: dependencies.advisoryAfterModeBindingFailpoint,
+        advisoryThreadKind: authenticatedRootPrompt ? 'root-or-drift' : 'unknown',
       },
     );
     const ownedNextState = applyProvenanceOwner(nextState);

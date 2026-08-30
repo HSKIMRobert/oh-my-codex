@@ -13,10 +13,19 @@ Ralplan is the canonical consensus-planning stage used by Autopilot between `$de
 $ralplan "task description"
 ```
 
+Standalone advisory planning is explicitly opt-in:
+
+```text
+$ralplan --advisory "task description"
+```
+
+Advisory runs the same sequential Planner → Architect → Critic review lifecycle, binds the plan and both review artifacts to exact bytes and one tracker-backed iteration, then returns to the caller with `active:false`. It is a cooperative workflow pause, not a security fence or permission system. It never emits a `PreToolUse` allow/block decision, never completes the host consensus gate, never authorizes execution, and never suppresses unrelated host behavior. Terminal state must carry explicit `false` values for the consensus gate, host verification, and execution handoff rather than omitting them. A later concrete affirmative execution request may produce non-authoritative routing context, but it does not persist a permission, rewrite terminal evidence, or create an automatic handoff; quotations, code, examples, documentation, questions, modal requests, negations, and vague approval remain classifier negatives. `approved+proven` requires complete lifecycle digests plus post-write revalidation. Administrative abandonment is append-only, idempotent for prepared or committed journals, and records a separate byte-bound admin event without rewriting the original closeout journal. Real enforcement requires an explicit host-issued, host-verified receipt or capability on a non-user-mintable surface; local Advisory files, prompts, session/thread fields, tracker records, and HERDR observability cannot substitute for it. On Darwin, each Advisory evidence artifact is limited to 128 KiB by the pinned-directory reader; other supported platforms allow up to 8 MiB.
+
 ## Flags
 
 - `--interactive`: Enables user prompts at key decision points (draft review in step 2 and final approval in step 6). Without this flag the workflow runs fully automated — Planner → Architect → Critic loop — and outputs the final plan without asking for confirmation.
 - `--deliberate`: Forces deliberate mode for high-risk work. Adds pre-mortem (3 scenarios) and expanded test planning (unit/integration/e2e/observability). Without this flag, deliberate mode can still auto-enable when the request explicitly signals high risk (auth/security, migrations, destructive changes, production incidents, compliance/PII, public API breakage).
+- `--advisory`: Standalone only. It cannot be combined with Autopilot, Pipeline, Team, Ralph, Ultragoal, execution flags, or unknown flags. Activation requires canonical session, root thread, and turn identity.
 
 ## Ontology-heavy review
 
@@ -194,7 +203,7 @@ The gate auto-passes when it detects **any** concrete signal. You do not need al
 | Gate fires on a well-specified prompt | Add a file reference, function name, or issue number to anchor the request |
 | Want to bypass the gate | Prefix with `force:` or `!` (e.g., `force: ralph fix it`) |
 | Gate does not fire on a vague prompt | The gate only catches prompts with <=15 effective words and no concrete anchors; add more detail or use `$ralplan` explicitly |
-| Redirected to ralplan but want to skip planning | In the ralplan workflow, say "just do it" or "skip planning" to transition directly to execution |
+| Redirected to ralplan but want to stop planning | Cancel or abandon through the workflow's administrative path. Advisory is cooperative and does not enforce host permissions; a real security gate would require an explicit host-issued, host-verified receipt. |
 
 ## Scenario Examples
 
