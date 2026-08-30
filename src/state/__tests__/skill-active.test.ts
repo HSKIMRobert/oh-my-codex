@@ -752,8 +752,6 @@ describe('skill-active state helpers', () => {
         stdio: 'ignore',
       });
       const done = new Promise<number | null>((resolve) => worker.once('close', resolve));
-      await waitForPath(readyPath);
-      await writeFile(releasePath, 'release-root');
       await waitForPath(sessionReadyPath);
 
       const lockPath = `${rootPath}.lock`;
@@ -765,13 +763,13 @@ describe('skill-active state helpers', () => {
       await mkdir(lockPath);
       await writeFile(sessionReleasePath, 'release-session');
 
-      assert.equal(await done, 0);
+      assert.equal(await done, 1);
       assert.deepEqual(await readdir(lockPath), []);
       const successorToken = 'successor-token';
       await writeFile(join(lockPath, `owner-${successorToken}`), successorToken);
       assert.equal(await readFile(join(lockPath, `owner-${successorToken}`), 'utf8'), successorToken);
       assert.equal(await readFile(join(successorPath, ownerEntry), 'utf8'), ownerToken);
-      assert.equal(existsSync(errorPath), false);
+      assert.equal(existsSync(errorPath), true);
       await rm(lockPath, { recursive: true, force: true });
       await rm(successorPath, { recursive: true, force: true });
     });

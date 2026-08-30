@@ -463,13 +463,16 @@ export async function prepareRalplanAdvisoryActivationInternal(input: Omit<Advis
 export async function readAuthorizedPendingRalplanActivation(input: {
   cwd: string; sessionId: string; producer: string; threadKind: string;
   rootThreadId: string; activationTurnId: string; prompt: string;
+  allowLaterTurnRecovery?: boolean;
 }): Promise<AdvisoryActivation | null> {
   const cwd = await canonicalCwd(input.cwd);
   const pending = await readStrictJson(join(advisoryRoot(cwd, input.sessionId), 'rollover-intent.json'));
   if (!pending) return null;
   const authorized = input.producer === 'native' && input.threadKind === 'root-or-drift'
     && pending.schema_version === 1 && pending.session_id === input.sessionId && pending.canonical_cwd === cwd
-    && pending.root_thread_id === input.rootThreadId && pending.activation_turn_id === input.activationTurnId
+    && pending.root_thread_id === input.rootThreadId
+    && (pending.activation_turn_id === input.activationTurnId
+      || (input.allowLaterTurnRecovery === true && typeof pending.activation_turn_id === 'string' && safeId(pending.activation_turn_id)))
     && typeof pending.activation_prompt_sha256 === 'string'
     && pending.activation_prompt_sha256 === sha256(input.prompt)
     && typeof pending.generation_id === 'string' && safeId(pending.generation_id)
@@ -479,7 +482,7 @@ export async function readAuthorizedPendingRalplanActivation(input: {
     schema_version: 1, generation_id: String(pending.generation_id),
     ...(typeof pending.predecessor_generation_id === 'string' ? { predecessor_generation_id: pending.predecessor_generation_id } : {}),
     canonical_cwd: cwd, session_id: input.sessionId, root_thread_id: input.rootThreadId,
-    activation_turn_id: input.activationTurnId,
+    activation_turn_id: String(pending.activation_turn_id),
     activation_prompt_sha256: String(pending.activation_prompt_sha256),
     created_at: String(pending.created_at),
   };

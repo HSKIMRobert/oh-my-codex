@@ -67,6 +67,27 @@ describe('central Ralplan Advisory activation owner', () => {
     }
   });
 
+  it('recovers a crash intent from a later authenticated root turn only', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-later-turn-recovery-'));
+    roots.push(cwd);
+    const prompt = '$ralplan --advisory later turn recovery';
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt, generationId: 'generation-a',
+      failpoint: (checkpoint) => { if (checkpoint === 'after_intent') throw new Error('crash:after_intent'); },
+    }), /crash:after_intent/);
+
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-foreign', activationTurnId: 'turn-b', prompt,
+    }), /pending_activation_authority_mismatch/);
+    const recovered = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-b', prompt,
+    });
+    assert.equal(recovered.activation.generation_id, 'generation-a');
+    assert.equal(recovered.activation.activation_turn_id, 'turn-a');
+    assert.equal(recovered.projection.corruption, null);
+  });
+
   it('preserves foreign-session Team root state while repairing Advisory mirrors and retrying', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-root-merge-'));
     roots.push(cwd);
@@ -295,6 +316,44 @@ describe('central Ralplan Advisory activation owner', () => {
     await assert.rejects(activateOrResumeRalplanAdvisory(input), /malformed-session|unreadable session/);
     assert.equal(await readFile(targetPath, 'utf8'), targetBytes);
     assert.equal(await readFile(rootPath, 'utf8'), rootBytes);
+  });
+
+  it('rejects a symlinked session mirror before first activation publishes any skill root', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-initial-session-symlink-'));
+    roots.push(cwd);
+    const outside = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-initial-session-target-'));
+    roots.push(outside);
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionDir = join(stateDir, 'sessions', 'session-a');
+    const sessionPath = join(sessionDir, 'skill-active-state.json');
+    const targetPath = join(outside, 'target.json');
+    const targetBytes = '{"sentinel":"unchanged"}\n';
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(targetPath, targetBytes);
+    await symlink(targetPath, sessionPath);
+
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory initial session symlink', generationId: 'generation-a',
+    }), /malformed-session|unreadable session/);
+    assert.equal(await readFile(targetPath, 'utf8'), targetBytes);
+    assert.equal(existsSync(join(stateDir, 'skill-active-state.json')), false);
+  });
+
+  it('rejects a symlinked session state authority before creating an activation intent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-session-authority-symlink-'));
+    roots.push(cwd);
+    const outside = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-session-authority-target-'));
+    roots.push(outside);
+    const sessionsDir = join(cwd, '.omx', 'state', 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+    await symlink(outside, join(sessionsDir, 'session-a'));
+
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory unsafe session authority', generationId: 'generation-a',
+    }), /state_authority_unsafe/);
+    assert.equal(existsSync(join(outside, 'ralplan-advisory')), false);
   });
 
   it('keeps fast repair atomic when a Standard writer wins immediately after the mirror transaction', async () => {

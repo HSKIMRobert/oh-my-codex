@@ -11,6 +11,7 @@ import { startMode, updateModeState } from '../../modes/base.js';
 import {
   __setWritableStateScopeTestHooksForTests,
   getBaseStateDir,
+  resolveWritableStateScope,
   type WritableCommitSite,
   WRITABLE_STATE_SCOPE_ERRORS,
 } from '../../mcp/state-paths.js';
@@ -3330,8 +3331,8 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
       const sessionDir = join(stateDir, 'sessions', sessionId);
       assertPrefix(events, [
         [1, 'mode.primary', 'write', join(sessionDir, 'autoresearch-state.json')],
-        [2, 'skill-active.root-copy', 'write', join(stateDir, 'skill-active-state.json')],
-        [3, 'skill-active.session-copy', 'write', join(sessionDir, 'skill-active-state.json')],
+        [2, 'skill-active.session-copy', 'write', join(sessionDir, 'skill-active-state.json')],
+        [3, 'skill-active.root-copy', 'write', join(stateDir, 'skill-active-state.json')],
       ]);
     } finally {
       __setWritableStateScopeTestHooksForTests({});
@@ -3358,7 +3359,7 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-t6-'));
     try {
       const { stateDir, sessionId } = await seedWritableScope(wd);
-      installScopeTakeover(stateDir, [2, 'skill-active.root-copy'], JSON.stringify({ session_id: 'sess-replacement', cwd: wd, state_root: stateDir }));
+      installScopeTakeover(stateDir, [2, 'skill-active.session-copy'], JSON.stringify({ session_id: 'sess-replacement', cwd: wd, state_root: stateDir }));
       const response = await executeStateOperation('state_write', { workingDirectory: wd, mode: 'autoresearch', active: true });
       assert.deepEqual(response.payload, { error: WRITABLE_STATE_SCOPE_ERRORS.scopeChangedDuringWrite });
       // Earlier multi-file commits are not rolled back; each later site still performs its own point-in-time check, without closing the post-check race.
@@ -3385,8 +3386,8 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
         [1, 'state-clear.primary', 'unlink', join(sessionDir, 'autoresearch-state.json')],
         [2, 'native-stop.root', 'write', join(stateDir, 'native-stop-state.json')],
         [3, 'native-stop.session', 'write', join(sessionDir, 'native-stop-state.json')],
-        [4, 'skill-active.root-copy', 'write', join(stateDir, 'skill-active-state.json')],
-        [5, 'skill-active.session-copy', 'write', join(sessionDir, 'skill-active-state.json')],
+        [4, 'skill-active.session-copy', 'write', join(sessionDir, 'skill-active-state.json')],
+        [5, 'skill-active.root-copy', 'write', join(stateDir, 'skill-active-state.json')],
       ]);
       await executeStateOperation('state_write', { workingDirectory: wd, mode: 'autoresearch', active: true });
       await writeFile(join(stateDir, 'native-stop-state.json'), JSON.stringify({ sessions: { [sessionId]: {} } }));
@@ -3394,6 +3395,33 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
       installScopeTakeover(stateDir, [2, 'native-stop.root'], JSON.stringify({ session_id: 'sess-replacement', cwd: wd, state_root: stateDir }));
       const rejected = await executeStateOperation('state_clear', { workingDirectory: wd, mode: 'autoresearch' });
       assert.deepEqual(rejected.payload, { error: WRITABLE_STATE_SCOPE_ERRORS.scopeChangedDuringWrite });
+    } finally {
+      __setWritableStateScopeTestHooksForTests({});
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects state_clear when a new workflow binding wins after clear selection', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-cas-'));
+    try {
+      const { stateDir, sessionId } = await seedWritableScope(wd);
+      const path = join(stateDir, 'sessions', sessionId, 'autoresearch-state.json');
+      await writeFile(path, JSON.stringify({ active: true, mode: 'autoresearch', current_phase: 'running', session_id: sessionId }));
+      const winner = { active: true, mode: 'autoresearch', current_phase: 'replacement', session_id: sessionId };
+      __setWritableStateScopeTestHooksForTests({
+        beforeScopeRevalidation: async (event) => {
+          if (event.site === 'state-clear.primary') await writeFile(path, JSON.stringify(winner));
+        },
+      });
+
+      const response = await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'autoresearch',
+      });
+      assert.equal(response.isError, true);
+      assert.match(String((response.payload as { error?: string }).error), /state_file_write_cas_mismatch/);
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), winner);
     } finally {
       __setWritableStateScopeTestHooksForTests({});
       await rm(wd, { recursive: true, force: true });
@@ -3454,6 +3482,38 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
       await assert.rejects(() => completeRalplanSession({ cwd: wd, baseStateDir: getBaseStateDir(wd), state: { active: true, current_phase: 'planning' }, beforeCommit }), new Error('completeRalplanSession requires capturedScope when beforeCommit is provided'));
     } finally {
       __setWritableStateScopeTestHooksForTests({});
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a stale Ralplan completion after a new Advisory binding wins', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-ralplan-terminal-cas-'));
+    try {
+      const { stateDir, sessionId } = await seedWritableScope(wd);
+      const sessionPath = join(stateDir, 'sessions', sessionId, 'ralplan-state.json');
+      const staleTerminal = {
+        active: false, mode: 'ralplan', current_phase: 'complete', session_id: sessionId,
+        workflow_variant: 'standard', ralplan_consensus_gate: { complete: true },
+      };
+      await writeFile(sessionPath, JSON.stringify(staleTerminal));
+      const advisoryWinner = {
+        active: true, mode: 'ralplan', current_phase: 'starting', session_id: sessionId,
+        workflow_variant: 'advisory', advisory_generation_id: 'generation-new',
+      };
+      const capturedScope = await resolveWritableStateScope(wd, sessionId);
+
+      await assert.rejects(completeRalplanSession({
+        cwd: wd,
+        baseStateDir: stateDir,
+        state: staleTerminal,
+        explicitSessionId: sessionId,
+        capturedScope,
+        beforeCommit: async (event) => {
+          if (event.site === 'ralplan.session-state') await writeFile(sessionPath, JSON.stringify(advisoryWinner));
+        },
+      }), /state_file_write_cas_mismatch/);
+      assert.deepEqual(JSON.parse(await readFile(sessionPath, 'utf8')), advisoryWinner);
+    } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });

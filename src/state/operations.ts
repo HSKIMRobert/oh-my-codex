@@ -1,5 +1,5 @@
 import { constants as fsConstants, existsSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
@@ -198,6 +198,9 @@ async function readStateFileRecord(path: string, requireCurrentRecord: boolean):
 async function acquireStateFileWriteLock(path: string): Promise<Awaited<ReturnType<typeof open>>> {
   const lockPath = `${path}.write-lock`;
   await mkdir(dirname(path), { recursive: true });
+  if (await realpath(dirname(path)) !== dirname(path)) {
+    throw new Error('state_file_write_parent_unsafe');
+  }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const handle = await open(
@@ -268,12 +271,39 @@ export async function writeStateFile(path: string, data: string): Promise<void> 
   await writeStateFileTransaction(path, data);
 }
 
+async function writeStateFileCas(
+  path: string,
+  data: string,
+  expected: Record<string, unknown> | null,
+): Promise<void> {
+  await writeStateFileTransaction(path, data, {
+    requireCurrentRecord: expected !== null,
+    validateCurrent: (current) => {
+      if (JSON.stringify(current) !== JSON.stringify(expected)) {
+        throw new Error('state_file_write_cas_mismatch');
+      }
+    },
+  });
+}
+
+async function unlinkStateFileCas(path: string, expectedInput?: Awaited<ReturnType<typeof lstat>>): Promise<void> {
+  const expected = expectedInput ?? await lstat(path);
+  await withStateFileWriteLock(path, async () => {
+    const current = await lstat(path);
+    if (current.dev !== expected.dev || current.ino !== expected.ino || current.mtimeMs !== expected.mtimeMs) {
+      throw new Error('state_file_write_cas_mismatch');
+    }
+    await unlink(path);
+  });
+}
+
 async function writeClearedSessionScopedModeState(
   path: string,
   mode: string,
   sessionId: string,
   beforeCommit?: BeforeWritableCommit,
 ): Promise<void> {
+  const expected = await readStateFileRecord(path, false);
   const nowIso = new Date().toISOString();
   const clearedState = withModeRuntimeContext({}, {
     mode,
@@ -285,7 +315,7 @@ async function writeClearedSessionScopedModeState(
   });
   const payload = JSON.stringify(clearedState, null, 2);
   await beforeCommit?.({ site: 'state-clear.primary', kind: 'write', path });
-  await writeStateFile(path, payload);
+  await writeStateFileCas(path, payload, expected);
 }
 
 async function clearSessionNativeStopState(
@@ -669,19 +699,20 @@ export async function completeRalplanSession(options: {
   const existingRootState = await readJsonRecordIfExists(rootStatePath);
   const shouldWriteRootState = shouldWriteRootRalplanTerminalState(existingRootState, sessionId);
 
-  if (shouldWriteRootState) {
-    const rootStatePayload = serializeAtomicJson(rootState);
-    await mkdir(dirname(rootStatePath), { recursive: true });
-    await beforeCommit({ site: 'ralplan.root-state', kind: 'write', path: rootStatePath });
-    await writeAtomicJson(rootStatePath, rootStatePayload);
-  }
   if (sessionId) {
     const sessionStatePath = join(writableScope.stateDir, getStateFilename('ralplan'));
+    const existingSessionState = await readJsonRecordIfExists(sessionStatePath);
     const sessionState = buildRalplanTerminalState(options.state, sessionId, nowIso);
     const sessionStatePayload = serializeAtomicJson(sessionState);
     await mkdir(dirname(sessionStatePath), { recursive: true });
     await beforeCommit({ site: 'ralplan.session-state', kind: 'write', path: sessionStatePath });
-    await writeAtomicJson(sessionStatePath, sessionStatePayload);
+    await writeStateFileCas(sessionStatePath, sessionStatePayload, existingSessionState);
+  }
+  if (shouldWriteRootState) {
+    const rootStatePayload = serializeAtomicJson(rootState);
+    await mkdir(dirname(rootStatePath), { recursive: true });
+    await beforeCommit({ site: 'ralplan.root-state', kind: 'write', path: rootStatePath });
+    await writeStateFileCas(rootStatePath, rootStatePayload, existingRootState);
   }
 
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(options.baseStateDir, sessionId);
@@ -1158,7 +1189,7 @@ export async function executeStateOperation(
           const paths = await getAllScopedStatePaths(mode, cwd);
           for (const path of paths) {
             if (!existsSync(path)) continue;
-            await withStateFileWriteLock(path, () => unlink(path));
+            await unlinkStateFileCas(path);
             removedPaths.push(path);
           }
           const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
@@ -1205,8 +1236,9 @@ export async function executeStateOperation(
         ) {
           await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
         } else if (existsSync(path)) {
+          const expected = await lstat(path);
           await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
-          await withStateFileWriteLock(path, () => unlink(path));
+          await unlinkStateFileCas(path, expected);
         }
         const nativeStopCleared = effectiveSessionId
           ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)

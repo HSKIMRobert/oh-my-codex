@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { mkdir, open, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startMode } from '../modes/base.js';
 import { getBaseStateDir } from '../mcp/state-paths.js';
@@ -158,9 +158,17 @@ export async function activateOrResumeRalplanAdvisory(
     if (input.resumeOnly) return null;
     throw new Error('ralplan_advisory_activation_authority_required');
   }
+  const authorityStateDir = getBaseStateDir(input.cwd);
+  const authoritySessionDir = join(authorityStateDir, 'sessions', input.sessionId);
+  await mkdir(authoritySessionDir, { recursive: true });
+  if (await realpath(authorityStateDir) !== authorityStateDir
+    || await realpath(authoritySessionDir) !== authoritySessionDir) {
+    throw new Error('ralplan_advisory_activation_state_authority_unsafe');
+  }
   const authority = {
     cwd: input.cwd, sessionId: input.sessionId, producer: input.producer, threadKind: input.threadKind,
     rootThreadId: input.rootThreadId, activationTurnId: input.activationTurnId, prompt: input.prompt,
+    allowLaterTurnRecovery: true,
   };
   let activation = await readAuthorizedPendingRalplanActivation(authority);
   if (!activation && input.resumeOnly) return null;
@@ -219,7 +227,7 @@ export async function activateOrResumeRalplanAdvisory(
   let committedProjection: AdvisoryProjection | null = null;
   await startMode('ralplan', input.prompt, input.maxIterations ?? 50, input.cwd, input.sessionId, {
     kind: 'ralplan-advisory', sessionId: input.sessionId, generationId: preparedActivation.generation_id,
-    rootThreadId: input.rootThreadId, activationTurnId: input.activationTurnId,
+    rootThreadId: input.rootThreadId, activationTurnId: preparedActivation.activation_turn_id,
     activationPrompt: input.prompt,
     afterBindingWrite: async () => {
       await syncExplicitSessionModeState('ralplan', input.cwd, input.sessionId);
@@ -252,7 +260,7 @@ export async function activateOrResumeRalplanAdvisory(
       await commitPreparedRalplanAdvisoryActivationInternal({
         cwd: input.cwd, sessionId: input.sessionId,
         producer: input.producer, threadKind: input.threadKind, rootThreadId: input.rootThreadId,
-        activationTurnId: input.activationTurnId,
+        activationTurnId: preparedActivation.activation_turn_id,
         failpoint: (name) => name === 'intent_committed' ? input.failpoint?.('intent_committed') : undefined,
       });
       committedProjection = await reconcileRalplanAdvisory(input.cwd, input.sessionId);
