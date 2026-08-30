@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { appendFile, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
 import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
@@ -359,6 +359,35 @@ async function canonicalCwd(cwd: string): Promise<string> {
   return realpath(cwd);
 }
 
+const INCOMPLETE_ADVISORY_LOCK_STALE_MS = 30_000;
+
+async function reclaimIncompleteAdvisoryLock(lockPath: string): Promise<boolean> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return false;
+  }
+  try {
+    const opened = await handle.stat();
+    const before = await lstat(lockPath);
+    if (!opened.isFile() || opened.nlink !== 1 || !before.isFile() || before.isSymbolicLink()
+      || before.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino
+      || Date.now() - before.mtimeMs < INCOMPLETE_ADVISORY_LOCK_STALE_MS) {
+      return false;
+    }
+    const after = await lstat(lockPath);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs
+      || after.size !== before.size) {
+      return false;
+    }
+  } finally {
+    await handle.close();
+  }
+  await rm(lockPath, { force: false });
+  return true;
+}
+
 async function acquireAdvisoryLock(lockPath: string, directory: string, heldError: string): Promise<Awaited<ReturnType<typeof open>>> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -373,7 +402,12 @@ async function acquireAdvisoryLock(lockPath: string, directory: string, heldErro
       const pid = owner?.schema_version === 1 && Number.isSafeInteger(owner.pid) && Number(owner.pid) > 0
         ? Number(owner.pid)
         : null;
-      if (attempt > 0 || pid === null) throw new Error(heldError);
+      if (pid === null) {
+        if (attempt > 0 || !await reclaimIncompleteAdvisoryLock(lockPath)) throw new Error(heldError);
+        await syncDirectory(directory);
+        continue;
+      }
+      if (attempt > 0) throw new Error(heldError);
       try {
         process.kill(pid, 0);
         throw new Error(heldError);

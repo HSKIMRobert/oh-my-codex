@@ -2,7 +2,7 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -997,6 +997,44 @@ describe('ralplan advisory fence and journal', () => {
       prompt: '$ralplan --advisory dead lock recovery', generationId: 'generation-dead',
     });
     assert.equal(activation.generation_id, 'generation-dead');
+  });
+
+  it('reclaims only safely aged incomplete current and generation locks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-incomplete-lock-'));
+    roots.push(cwd);
+    const root = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-advisory');
+    await mkdir(root, { recursive: true });
+    const currentLock = join(root, 'current.lock');
+    await writeFile(currentLock, '');
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory recent incomplete lock', generationId: 'generation-a',
+    }), /current_lock_held/);
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(currentLock, stale, stale);
+    const activated = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory recent incomplete lock', generationId: 'generation-a',
+    });
+    assert.equal(activated.activation.generation_id, 'generation-a');
+
+    const { cwd: terminalCwd, sessionId, lifecycle } = await fixture();
+    const generationLock = join(
+      terminalCwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'generation-a', 'generation.lock',
+    );
+    await writeFile(generationLock, '{');
+    await assert.rejects(terminalizeRalplanAdvisory({
+      cwd: terminalCwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    }), /generation_lock_held/);
+    await utimes(generationLock, stale, stale);
+    const closed = await terminalizeRalplanAdvisory({
+      cwd: terminalCwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    assert.equal(closed.fence?.state, 'closed');
   });
 });
 

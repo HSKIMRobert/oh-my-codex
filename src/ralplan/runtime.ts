@@ -8,7 +8,7 @@ import {
 import { resolveWritableStateScope } from '../mcp/state-paths.js';
 import { requirePersistedHandoffCarrier } from '../state/handoff-carrier.js';
 import { readSubagentTrackingState, recordSubagentTurnForSession } from '../subagents/tracker.js';
-import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
+import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle, type AdvisoryManifest, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import {
   administrativelyAbandonRalplanAdvisory,
   isCanonicalInactiveAdvisoryBinding,
@@ -628,6 +628,8 @@ export async function runRalplanConsensus(
         ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
         review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
       }, runtimeSessionId);
+      let architectArtifactManifest: AdvisoryManifest | undefined;
+      let criticArtifactManifest: AdvisoryManifest | undefined;
       const architectReview = normalizeReviewForLane(await executor.architectReview({
         ...iterationContext,
         draft,
@@ -635,6 +637,15 @@ export async function runRalplanConsensus(
       if (advisory && latestPlanPath
         && (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256 !== advisoryPlanDigestBeforeReviews) {
         throw new Error('ralplan_advisory_plan_changed_during_architect_review');
+      }
+      if (advisory) {
+        architectArtifactManifest = await digestAdvisoryArtifacts(cwd, [
+          requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path'),
+        ]);
+        if (architectArtifactManifest.entries[0]?.path
+          === (await digestAdvisoryArtifacts(cwd, [latestPlanPath!])).entries[0]?.path) {
+          throw new Error('ralplan_advisory_architect_artifact_reuses_plan_path');
+        }
       }
       assertRoleLaneReuse(reusableRoleLanes.architect, architectReview, 'architect');
       architectReviews.push(architectReview);
@@ -729,6 +740,18 @@ export async function runRalplanConsensus(
         && (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256 !== advisoryPlanDigestBeforeReviews) {
         throw new Error('ralplan_advisory_plan_changed_during_critic_review');
       }
+      if (advisory) {
+        const architectPath = requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path');
+        if ((await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256) {
+          throw new Error('ralplan_advisory_architect_artifact_changed_during_critic_review');
+        }
+        criticArtifactManifest = await digestAdvisoryArtifacts(cwd, [
+          requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path'),
+        ]);
+        if (criticArtifactManifest.entries[0]?.path === architectArtifactManifest?.entries[0]?.path) {
+          throw new Error('ralplan_advisory_review_artifact_path_reused');
+        }
+      }
       assertRoleLaneReuse(reusableRoleLanes.critic, criticReview, 'critic');
       criticReviews.push(criticReview);
       if (criticReview.artifacts) Object.assign(aggregatedArtifacts, criticReview.artifacts);
@@ -748,6 +771,12 @@ export async function runRalplanConsensus(
           || await hasCompletedNativeReviewEvidence(cwd, runtimeSessionId, architectReview, criticReview),
       });
       if (advisory && architectReview.verdict === 'approve' && criticReview.verdict === 'approve') {
+        const architectPath = requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path');
+        const criticPath = requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path');
+        if ((await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256
+          || (await digestAdvisoryArtifacts(cwd, [criticPath])).sha256 !== criticArtifactManifest?.sha256) {
+          throw new Error('ralplan_advisory_review_artifact_changed_before_lifecycle');
+        }
         advisoryLifecycle = await projectAdvisoryReviewLifecycle({
           cwd,
           sessionId: advisorySessionId!,
@@ -781,7 +810,14 @@ export async function runRalplanConsensus(
       }, runtimeSessionId);
 
       if (advisory && advisoryLifecycle) {
-        const revalidate = async () => (await projectAdvisoryReviewLifecycle({
+        const revalidate = async () => {
+          const architectPath = requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path');
+          const criticPath = requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path');
+          if ((await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256
+            || (await digestAdvisoryArtifacts(cwd, [criticPath])).sha256 !== criticArtifactManifest?.sha256) {
+            throw new Error('ralplan_advisory_review_artifact_changed_during_closeout');
+          }
+          return (await projectAdvisoryReviewLifecycle({
           cwd,
           sessionId: advisorySessionId!,
           generationId: advisoryGenerationId!,
@@ -802,7 +838,8 @@ export async function runRalplanConsensus(
             verdict: criticReview.verdict,
             sessionId: criticReview.session_id,
           },
-        })).evidence_bundle_sha256;
+          })).evidence_bundle_sha256;
+        };
         await terminalizeRuntimeAdvisory({
           cwd, sessionId: advisorySessionId!, generationId: advisoryGenerationId!,
           closingTurnId: advisoryClosingTurnId!, iteration, outcome: 'approved', lifecycle: advisoryLifecycle,

@@ -466,6 +466,56 @@ describe('ralplan advisory runtime', () => {
     }
   });
 
+  it('rejects Architect mutation during Critic review and reused reviewer artifact paths', async () => {
+    for (const scenario of ['mutated-architect', 'reused-path'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-ralplan-advisory-review-artifact-${scenario}-`));
+      const sessionId = `sess-advisory-${scenario}`;
+      try {
+        await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+        await writeSessionPointer(cwd, sessionId);
+        await writeNativeSubagentTracking(cwd, sessionId, true);
+        await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+        await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+        await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+        const result = await runRalplanConsensus({
+          async draft() {
+            await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+            const planPath = join(cwd, '.omx', 'plans', 'advisory.md');
+            await writeFile(planPath, '# approved plan\n');
+            return { planPath, summary: 'draft' };
+          },
+          async architectReview() {
+            return {
+              verdict: 'approve', agent_role: 'architect', provenance_kind: 'native_subagent',
+              session_id: sessionId, thread_id: 'thread-architect', artifact_path: '.omx/artifacts/architect.md',
+            };
+          },
+          async criticReview() {
+            if (scenario === 'mutated-architect') {
+              await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'REPLACED\n');
+            }
+            return {
+              verdict: 'approve', agent_role: 'critic', provenance_kind: 'native_subagent',
+              session_id: sessionId, thread_id: 'thread-critic',
+              artifact_path: scenario === 'reused-path' ? '.omx/artifacts/architect.md' : '.omx/artifacts/critic.md',
+            };
+          },
+        }, {
+          task: `reject ${scenario}`, cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
+          workflowVariant: 'advisory', advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift',
+          rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
+        });
+        assert.equal(result.status, 'failed');
+        assert.match(result.error ?? '', scenario === 'mutated-architect'
+          ? /architect_artifact_changed_during_critic_review/
+          : /review_artifact_path_reused/);
+        assert.equal(result.planningComplete, false);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('recovers a stored approved journal in the runtime catch path', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-runtime-catch-'));
     const sessionId = 'sess-advisory-runtime-catch';
