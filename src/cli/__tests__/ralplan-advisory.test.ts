@@ -6,10 +6,17 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { ralplanCommand } from '../ralplan.js';
 import { cancelModesForTest } from '../index.js';
-import { activateRalplanAdvisory, prepareAdvisoryCloseout, readCurrentRalplanAdvisory } from '../../ralplan/advisory.js';
+import { prepareAdvisoryCloseout, readCurrentRalplanAdvisory } from '../../ralplan/advisory.js';
 import { reconcileRalplanAdvisory } from '../../ralplan/advisory.js';
+import { activateOrResumeRalplanAdvisory } from '../../ralplan/advisory-activation.js';
 
 const roots: string[] = [];
+const activateRalplanAdvisory = async (input: {
+  cwd: string; sessionId: string; rootThreadId: string; activationTurnId: string;
+  generationId?: string; nowIso?: string;
+}) => (await activateOrResumeRalplanAdvisory({
+  ...input, prompt: '$ralplan --advisory cli fixture', producer: 'native', threadKind: 'root-or-drift',
+})).activation;
 afterEach(async () => Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
 async function commitActivation(cwd: string, sessionId: string, activation: Awaited<ReturnType<typeof activateRalplanAdvisory>>): Promise<void> {

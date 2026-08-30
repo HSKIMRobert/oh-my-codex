@@ -33,11 +33,11 @@ import {
 
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
 import {
-  readAuthorizedPendingRalplanActivation,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
   observeRalplanAdvisoryPrompt,
 } from "../ralplan/advisory.js";
+import { activateOrResumeRalplanAdvisory } from "../ralplan/advisory-activation.js";
 import {
   resolveCanonicalTeamStateRoot,
   resolveWorkerTeamStateRootPath,
@@ -22311,12 +22311,6 @@ export async function dispatchCodexNativeHook(
     && (hookEventName === "SessionStart" || hookEventName === "Stop" || hookEventName === "UserPromptSubmit")
     ? await detectRalplanAdvisoryState(policyCwd, canonicalSessionId)
     : null;
-  let advisoryActivationBlocked = hookEventName === "UserPromptSubmit" && (advisoryStateDetection?.status === "normal"
-    || advisoryStateDetection?.status === "missing"
-    || advisoryStateDetection?.status === "unreadable");
-  if (advisoryStateDetection?.status === "missing" || advisoryStateDetection?.status === "unreadable") {
-    allowGlobalSideEffects = false;
-  }
   if ((hookEventName === "SessionStart" || hookEventName === "Stop") && canonicalSessionId
     && advisoryStateDetection?.status === "normal") {
     try {
@@ -22325,9 +22319,7 @@ export async function dispatchCodexNativeHook(
         || reconciledAdvisory?.corruption === "live_session_binding_unreadable") {
         throw new Error(reconciledAdvisory.corruption);
       }
-      if (reconciledAdvisory?.corruption) allowGlobalSideEffects = false;
     } catch (error) {
-      allowGlobalSideEffects = false;
       const diagnostic = `Ralplan Advisory lifecycle reconciliation reported a non-authoritative diagnostic: ${error instanceof Error ? error.message : String(error)}. It does not grant or deny host tool permission.`;
       if (hookEventName === "SessionStart") {
         advisoryAdditionalContext = diagnostic;
@@ -22346,39 +22338,17 @@ export async function dispatchCodexNativeHook(
 
   if (hookEventName === "UserPromptSubmit") {
     const prompt = readPromptText(payload);
+    const advisoryThreadKind = promptTurnContext?.status === "authorized"
+      && promptTurnContext.authorization.targetRelation !== "explicit-independent"
+      && promptTurnContext.authorization.thread.kind === "root-or-drift"
+      ? "root-or-drift" : "unknown";
     if (!isSubagentPromptSubmit) promptClassification = classifyKeywordInput(prompt);
     if (canonicalSessionId && !isSubagentPromptSubmit && advisoryStateDetection?.status === "normal") {
       try {
-        const pendingActivation = await readAuthorizedPendingRalplanActivation({
-          cwd: policyCwd, sessionId: canonicalSessionId, producer: "native",
-          threadKind: promptTurnContext?.status === "authorized"
-            && promptTurnContext.authorization.targetRelation !== "explicit-independent"
-            ? "root-or-drift" : "unknown",
-          rootThreadId: threadId, activationTurnId: turnId, prompt,
+        await activateOrResumeRalplanAdvisory({
+          cwd: policyCwd, sessionId: canonicalSessionId, rootThreadId: threadId,
+          activationTurnId: turnId, prompt, resumeOnly: true, producer: "native", threadKind: advisoryThreadKind,
         });
-        if (pendingActivation) {
-          await updateModeState("ralplan", {
-            active: true, current_phase: "draft", workflow_variant: "advisory",
-            advisory_generation_id: pendingActivation.generation_id, turn_id: turnId, thread_id: threadId,
-            execution_handoff_authorized: false, host_verified: false, planning_complete: false,
-            completed_at: undefined, error: undefined, ralplan_review_lifecycle: undefined,
-          }, policyCwd, canonicalSessionId);
-          const pendingBindingHandle = await open(
-            join(getBaseStateDir(policyCwd), "sessions", canonicalSessionId, "ralplan-state.json"),
-            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-          );
-          try { await pendingBindingHandle.sync(); } finally { await pendingBindingHandle.close(); }
-          const committedPending = await reconcileAdvisory(policyCwd, canonicalSessionId, {
-            producer: "native",
-            threadKind: promptTurnContext?.status === "authorized"
-              && promptTurnContext.authorization.targetRelation !== "explicit-independent"
-              ? "root-or-drift" : "unknown",
-            rootThreadId: threadId, activationTurnId: turnId,
-          });
-          if (!committedPending || committedPending.corruption) {
-            throw new Error(`ralplan_advisory_activation_commit_failed:${committedPending?.corruption ?? "missing"}`);
-          }
-        }
         const advisory = await observeRalplanAdvisoryPrompt({
           cwd: policyCwd,
           sessionId: canonicalSessionId,
@@ -22397,58 +22367,19 @@ export async function dispatchCodexNativeHook(
             || payload.auto_nudge === true
             || safeString(payload.source).toLowerCase().includes("nudge"),
           reservedInput: promptClassification?.reservedInput ?? null,
-          activationFailpoint: async (name) => {
-            if (process.env.NODE_ENV === "test" && process.env.OMX_RALPLAN_ADVISORY_ACTIVATION_FAILPOINT === name) {
-              throw new Error(`ralplan_advisory_test_failpoint:${name}`);
-            }
-          },
         });
-        if (
-          advisory.projection
-          && (advisory.intent === "replan" || advisory.intent === "new_advisory")
-          && advisory.projection.activation.predecessor_generation_id
-        ) {
-          await updateModeState("ralplan", {
-            active: true,
-            current_phase: "draft",
-            workflow_variant: "advisory",
-            advisory_generation_id: advisory.projection.activation.generation_id,
-            turn_id: turnId,
-            thread_id: threadId,
-            execution_handoff_authorized: false,
-            host_verified: false,
-            planning_complete: false,
-            completed_at: undefined,
-            error: undefined,
-            ralplan_review_lifecycle: undefined,
-          }, policyCwd, canonicalSessionId);
-          const bindingHandle = await open(
-            join(getBaseStateDir(policyCwd), "sessions", canonicalSessionId, "ralplan-state.json"),
-            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-          );
-          try { await bindingHandle.sync(); } finally { await bindingHandle.close(); }
-          const committed = await reconcileAdvisory(policyCwd, canonicalSessionId, {
-            producer: "native",
-            threadKind: promptTurnContext?.status === "authorized"
-              && promptTurnContext.authorization.targetRelation !== "explicit-independent"
-              ? "root-or-drift" : "unknown",
-            rootThreadId: threadId, activationTurnId: turnId,
+        if ((advisory.intent === "replan" || advisory.intent === "new_advisory")
+          && advisory.projection?.activation) {
+          const activated = await activateOrResumeRalplanAdvisory({
+            cwd: policyCwd, sessionId: canonicalSessionId, rootThreadId: threadId,
+            activationTurnId: turnId, prompt, producer: "native", threadKind: advisoryThreadKind,
+            predecessorGenerationId: advisory.projection.activation.generation_id,
           });
-          if (!committed || committed.corruption) {
-            throw new Error(`ralplan_advisory_activation_commit_failed:${committed?.corruption ?? "missing"}`);
-          }
+          if (activated) advisory.projection = activated.projection;
         }
         const advisoryBinding = await readModeStateForSession("ralplan", canonicalSessionId, policyCwd);
         advisoryAdditionalContext = buildRalplanAdvisoryRoutingObservation(advisory.intent, advisory.projection, advisoryBinding);
-        advisoryActivationBlocked = !(
-          advisory.projection
-          && advisory.projection.corruption === null
-          && ["closed", "abandoned"].includes(advisory.projection.fence?.state ?? "")
-        );
-        if (advisoryActivationBlocked) allowGlobalSideEffects = false;
       } catch (error) {
-        advisoryActivationBlocked = true;
-        allowGlobalSideEffects = false;
         advisoryAdditionalContext = `Ralplan Advisory lifecycle reconciliation reported a non-authoritative diagnostic: ${error instanceof Error ? error.message : String(error)}. It does not grant or deny host tool permission.`;
       }
     }
@@ -22466,8 +22397,7 @@ export async function dispatchCodexNativeHook(
     // session-scoped state even when global side effects (HUD/root mirrors) are
     // suppressed because a stale selected pointer exists.
     let suppressActivationSeeding = !allowImplicitSessionSideEffects
-      || advisoryActivationBlocked
-      || (!advisoryActivationBlocked && !allowGlobalSideEffects
+      || (!allowGlobalSideEffects
         && promptTurnContext?.status !== "authorized");
     if (promptTurnContext?.status === "authorized") {
       sessionIdForState = promptTurnContext.authorization.targetSessionId;
@@ -22657,7 +22587,7 @@ export async function dispatchCodexNativeHook(
     });
   }
   if (hookEventName === "UserPromptSubmit" && !isSubagentPromptSubmit && teamNoticeTargetKey
-    && allowGlobalSideEffects && !advisoryActivationBlocked) {
+    && allowGlobalSideEffects) {
     const reconciled = await reconcileTeamNoticeLedger({ stateRoot: stateDir, targetKey: teamNoticeTargetKey }).catch(() => null);
     if (!reconciled || reconciled.context.length === 0) {
       teamNoticeAdditionalContext = "OMX invalidated this queued Team wake immediately before model input because no active source-proven Team notices remain. Do not infer or reference a removed Team from the generic wake.";

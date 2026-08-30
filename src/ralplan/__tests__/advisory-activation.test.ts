@@ -1,0 +1,222 @@
+import { afterEach, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import {
+  activateOrResumeRalplanAdvisory as activateRalplanAdvisoryWithProvenance,
+  type ActivateOrResumeRalplanAdvisoryInput,
+  type AdvisoryActivationCheckpoint,
+} from '../advisory-activation.js';
+import { listTransitionActiveSkills } from '../../state/skill-active.js';
+import { commitPreparedRalplanAdvisoryActivationInternal } from '../advisory.js';
+
+const roots: string[] = [];
+const activateOrResumeRalplanAdvisory = (
+  input: Omit<ActivateOrResumeRalplanAdvisoryInput, 'producer' | 'threadKind' | 'resumeOnly'>,
+) => activateRalplanAdvisoryWithProvenance({ ...input, producer: 'native', threadKind: 'root-or-drift' });
+afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+
+describe('central Ralplan Advisory activation owner', () => {
+  it('keeps activation preparation and commit imports behind the central owner boundary', async () => {
+    const advisorySource = await readFile(join(process.cwd(), 'src', 'ralplan', 'advisory.ts'), 'utf8');
+    assert.doesNotMatch(advisorySource, /export async function activateRalplanAdvisory\b/);
+    assert.doesNotMatch(advisorySource, /consumeActivationIntent|beforeActivationCommit/);
+    for (const relative of [
+      ['src', 'ralplan', 'runtime.ts'],
+      ['src', 'hooks', 'keyword-detector.ts'],
+      ['src', 'scripts', 'codex-native-hook.ts'],
+    ]) {
+      const source = await readFile(join(process.cwd(), ...relative), 'utf8');
+      assert.doesNotMatch(source, /prepareRalplanAdvisoryActivationInternal|readAuthorizedPendingRalplanActivation|commitPreparedRalplanAdvisoryActivationInternal/);
+    }
+  });
+
+  it('keeps one generation recoverable across every publication checkpoint', async () => {
+    const checkpoints: AdvisoryActivationCheckpoint[] = [
+      'after_intent', 'after_mode', 'after_run_state',
+      'after_session_skill', 'after_root_skill', 'before_mode_fsync', 'before_commit',
+    ];
+    for (const checkpoint of checkpoints) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-${checkpoint}-`));
+      roots.push(cwd);
+      const input = {
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a',
+        activationTurnId: 'turn-a', prompt: '$ralplan --advisory planificá',
+      };
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        ...input,
+        failpoint: (name) => { if (name === checkpoint) throw new Error(`crash:${name}`); },
+      }), /crash/);
+      const root = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-advisory');
+      const intent = JSON.parse(await readFile(join(root, 'rollover-intent.json'), 'utf8'));
+      const recovered = await activateOrResumeRalplanAdvisory(input);
+      assert.equal(recovered.activation.generation_id, intent.generation_id, checkpoint);
+      assert.equal(recovered.projection.corruption, null, checkpoint);
+      assert.equal(JSON.parse(await readFile(join(root, 'current.json'), 'utf8')).generation_id, intent.generation_id, checkpoint);
+      const binding = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json'), 'utf8'));
+      assert.equal(binding.advisory_generation_id, intent.generation_id, checkpoint);
+      assert.equal(binding.execution_handoff_authorized, false, checkpoint);
+      assert.equal(binding.host_verified, false, checkpoint);
+    }
+  });
+
+  it('preserves foreign-session Team root state while repairing Advisory mirrors and retrying', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-root-merge-'));
+    roots.push(cwd);
+    const stateDir = join(cwd, '.omx', 'state');
+    await mkdir(stateDir, { recursive: true });
+    const foreignTeam = {
+      version: 1, active: true, skill: 'ralplan', phase: 'architect-review', session_id: 'session-b',
+      workflow_variant: 'standard', marker: 'foreign-top-level',
+      active_skills: [
+        { skill: 'team', active: true, phase: 'executing', session_id: 'session-b' },
+        { skill: 'ralplan', active: true, phase: 'architect-review', session_id: 'session-b', workflow_variant: 'standard' },
+      ],
+    };
+    await writeFile(join(stateDir, 'skill-active-state.json'), `${JSON.stringify(foreignTeam, null, 2)}\n`);
+    const input = { cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', prompt: '$ralplan --advisory planificá' };
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input, failpoint: (checkpoint) => { if (checkpoint === 'after_root_skill') throw new Error('crash:root'); },
+    }), /crash:root/);
+    for (const phase of ['failed activation', 'retry']) {
+      const root = JSON.parse(await readFile(join(stateDir, 'skill-active-state.json'), 'utf8'));
+      assert.ok(root.active_skills.some((entry: Record<string, unknown>) => entry.skill === 'team' && entry.session_id === 'session-b'), phase);
+      assert.equal(root.skill, foreignTeam.skill, phase);
+      assert.equal(root.session_id, foreignTeam.session_id, phase);
+      assert.equal(root.workflow_variant, foreignTeam.workflow_variant, phase);
+      assert.equal(root.marker, foreignTeam.marker, phase);
+      assert.deepEqual(
+        listTransitionActiveSkills(root, 'session-b').map((entry) => [entry.skill, entry.workflow_variant]),
+        [['team', undefined], ['ralplan', 'standard']],
+        phase,
+      );
+      if (phase === 'failed activation') await activateOrResumeRalplanAdvisory(input);
+    }
+  });
+
+  it('rejects a regular-file replacement between pinned validation and fsync without consuming the intent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-pinned-replace-'));
+    roots.push(cwd);
+    const input = { cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', prompt: '$ralplan --advisory planificá' };
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    const replacement = `${bindingPath}.replacement`;
+    const replacementBytes = '{"active":true,"mode":"ralplan","session_id":"session-a","workflow_variant":"standard"}\n';
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input,
+      failpoint: async (checkpoint) => {
+        if (checkpoint !== 'before_mode_fsync') return;
+        await writeFile(replacement, replacementBytes);
+        await rename(replacement, bindingPath);
+      },
+    }), /projection_(?:identity|content)_changed/);
+    assert.equal(await readFile(bindingPath, 'utf8'), replacementBytes);
+    await readFile(join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-advisory', 'rollover-intent.json'));
+  });
+
+  it('rejects a same-inode overwrite after validation without consuming the intent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-pinned-overwrite-'));
+    roots.push(cwd);
+    const input = { cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', prompt: '$ralplan --advisory planificá' };
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input,
+      failpoint: async (checkpoint) => {
+        if (checkpoint === 'before_mode_fsync') await writeFile(bindingPath, '{"active":false}\n');
+      },
+    }), /projection_content_changed/);
+    await readFile(join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-advisory', 'rollover-intent.json'));
+  });
+
+  it('revalidates every runtime mirror under the activation lock immediately before consuming intent', async () => {
+    for (const target of ['run-state.json', 'skill-active-state.json', 'root-skill'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-precommit-${target}-`));
+      roots.push(cwd);
+      const input = { cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a', prompt: '$ralplan --advisory planificá' };
+      const stateDir = join(cwd, '.omx', 'state');
+      const targetPath = target === 'root-skill'
+        ? join(stateDir, 'skill-active-state.json')
+        : join(stateDir, 'sessions', 'session-a', target);
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        ...input,
+        failpoint: async (checkpoint) => {
+          if (checkpoint === 'before_commit') await writeFile(targetPath, '{"active":false}\n');
+        },
+      }), /projection_mismatch/);
+      await readFile(join(stateDir, 'sessions', 'session-a', 'ralplan-advisory', 'rollover-intent.json'));
+      const recovered = await activateOrResumeRalplanAdvisory(input);
+      assert.equal(recovered.projection.corruption, null, target);
+    }
+  });
+
+  it('does not prepare or consume activation state without authenticated root provenance', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-auth-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory authenticated activation',
+    };
+    await assert.rejects(activateRalplanAdvisoryWithProvenance({
+      ...input, producer: 'native', threadKind: 'unknown',
+    }), /activation_authority_required/);
+    assert.equal(await activateRalplanAdvisoryWithProvenance({
+      ...input, producer: 'native', threadKind: 'unknown', resumeOnly: true,
+    }), null);
+    assert.equal(existsSync(join(cwd, '.omx')), false);
+
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input, failpoint: (checkpoint) => { if (checkpoint === 'after_intent') throw new Error('crash:intent'); },
+    }), /crash:intent/);
+    const intentPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-advisory', 'rollover-intent.json');
+    const before = await readFile(intentPath, 'utf8');
+    assert.equal(await activateRalplanAdvisoryWithProvenance({
+      ...input, producer: 'native', threadKind: 'unknown', resumeOnly: true,
+    }), null);
+    assert.equal(await readFile(intentPath, 'utf8'), before);
+  });
+
+  it('returns the same committed generation after a crash at the post-commit boundary', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-postcommit-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory idempotent activation', generationId: 'generation-a',
+    };
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input, failpoint: (checkpoint) => { if (checkpoint === 'intent_committed') throw new Error('crash:committed'); },
+    }), /crash:committed/);
+    const retried = await activateOrResumeRalplanAdvisory(input);
+    assert.equal(retried.activation.generation_id, 'generation-a');
+    assert.equal(retried.projection.activation.generation_id, 'generation-a');
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input, prompt: '$ralplan --advisory different prompt',
+    }), /committed_activation_authority_mismatch/);
+  });
+
+  it('rejects direct commit when any required mirror is missing and retains the intent', async () => {
+    for (const target of ['ralplan-state.json', 'run-state.json', 'session-skill', 'root-skill'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-commit-bypass-${target}-`));
+      roots.push(cwd);
+      const input = {
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: '$ralplan --advisory commit boundary',
+      };
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        ...input, failpoint: (checkpoint) => { if (checkpoint === 'after_root_skill') throw new Error('crash:prepared'); },
+      }), /crash:prepared/);
+      const stateDir = join(cwd, '.omx', 'state');
+      const targetPath = target === 'root-skill'
+        ? join(stateDir, 'skill-active-state.json')
+        : target === 'session-skill'
+          ? join(stateDir, 'sessions', 'session-a', 'skill-active-state.json')
+          : join(stateDir, 'sessions', 'session-a', target);
+      await rm(targetPath);
+      await assert.rejects(commitPreparedRalplanAdvisoryActivationInternal({
+        cwd, sessionId: 'session-a', producer: 'native', threadKind: 'root-or-drift',
+        rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      }), /binding_conflict|ENOENT|projection_/);
+      await readFile(join(stateDir, 'sessions', 'session-a', 'ralplan-advisory', 'rollover-intent.json'));
+    }
+  });
+});

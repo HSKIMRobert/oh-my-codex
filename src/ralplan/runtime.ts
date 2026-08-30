@@ -7,20 +7,18 @@ import {
 } from '../modes/base.js';
 import { resolveWritableStateScope } from '../mcp/state-paths.js';
 import { requirePersistedHandoffCarrier } from '../state/handoff-carrier.js';
-import { syncExplicitSessionModeState } from '../state/operations.js';
 import { readSubagentTrackingState, recordSubagentTurnForSession } from '../subagents/tracker.js';
 import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import {
   administrativelyAbandonRalplanAdvisory,
   isCanonicalInactiveAdvisoryBinding,
-  prepareRalplanAdvisoryActivation,
-  readAuthorizedPendingRalplanActivation,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
   terminalizeRalplanAdvisory,
   type AdvisoryProjection,
   type AdvisoryOutcome,
 } from './advisory.js';
+import { activateOrResumeRalplanAdvisory } from './advisory-activation.js';
 
 export const RALPLAN_ACTIVE_PHASES = [
   'draft',
@@ -123,6 +121,8 @@ export interface RunRalplanConsensusOptions {
   rootThreadId?: string;
   activationTurnId?: string;
   closingTurnId?: string;
+  advisoryProducer?: 'native' | string;
+  advisoryThreadKind?: 'root-or-drift' | string;
 }
 
 export interface RalplanRuntimeResult {
@@ -524,7 +524,7 @@ export async function runRalplanConsensus(
   const existing = runtimeSessionId
     ? await readModeStateForExplicitSession('ralplan', runtimeSessionId, cwd)
     : await readModeState('ralplan', cwd);
-  if (existing?.active && !(advisory && existing.workflow_variant === 'advisory')) {
+  if (existing?.active && !advisory) {
     throw new Error('ralplan_active_mode_exists');
   }
   if (advisory) {
@@ -532,34 +532,16 @@ export async function runRalplanConsensus(
     advisoryActivationTurnId = requiredAdvisoryIdentity(options.activationTurnId ?? String(existing?.turn_id ?? ''), 'activation_turn_id');
     advisoryClosingTurnId = requiredAdvisoryIdentity(options.closingTurnId ?? advisoryActivationTurnId, 'closing_turn_id');
     advisoryRootThreadId = requiredAdvisoryIdentity(options.rootThreadId ?? String(existing?.thread_id ?? ''), 'root_thread_id');
-    const activationAuthority = {
-      cwd, sessionId: advisorySessionId, producer: 'native', threadKind: 'root-or-drift',
-      rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId, prompt: options.task,
-    };
-    let pendingActivation = await readAuthorizedPendingRalplanActivation(activationAuthority);
-    if (pendingActivation) {
-      advisoryGenerationId = pendingActivation.generation_id;
-      if (existing?.active === true && (
-        existing.workflow_variant !== 'advisory'
-        || existing.advisory_generation_id !== advisoryGenerationId
-        || existing.session_id !== advisorySessionId
-      )) {
-        throw new Error('ralplan_advisory_start_binding_conflict');
-      }
-      if (!existing?.active) {
-        await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId, {
-          kind: 'ralplan-advisory', sessionId: advisorySessionId, generationId: advisoryGenerationId,
-          rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId,
-          activationPrompt: options.task,
-        });
-      }
-      await syncExplicitSessionModeState('ralplan', cwd, advisorySessionId);
-      advisoryStartupFailpoint('after_mode');
-      const committedActivation = await reconcileRalplanAdvisory(cwd, advisorySessionId, {
-        producer: 'native', threadKind: 'root-or-drift', rootThreadId: advisoryRootThreadId,
-        activationTurnId: advisoryActivationTurnId,
-      });
-      if (committedActivation?.corruption) throw new Error(`ralplan_advisory_${committedActivation.corruption}`);
+    const resumed = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId,
+      activationTurnId: advisoryActivationTurnId, prompt: options.task, maxIterations, resumeOnly: true,
+      producer: options.advisoryProducer ?? 'unknown', threadKind: options.advisoryThreadKind ?? 'unknown',
+      failpoint: (checkpoint) => {
+        if (checkpoint === 'after_intent' || checkpoint === 'after_mode') advisoryStartupFailpoint(checkpoint);
+      },
+    });
+    if (resumed) {
+      advisoryGenerationId = resumed.activation.generation_id;
     } else if (existing?.active && existing.workflow_variant === 'advisory') {
       advisoryGenerationId = requiredAdvisoryIdentity(String(existing.advisory_generation_id ?? ''), 'generation_id');
       const current = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
@@ -582,31 +564,16 @@ export async function runRalplanConsensus(
       if (prior && (!prior.fence || !['closed', 'abandoned', 'recovery_required'].includes(prior.fence.state))) {
         throw new Error('ralplan_advisory_existing_generation_not_terminal');
       }
-      // Reconcile/read the previous generation before replacing its mode
-      // binding. A crash can leave a pending journal while the mode is already
-      // inactive; startMode first would poison the generation binding and
-      // strand the closeout forever.
-      await prepareRalplanAdvisoryActivation({
+      const activated = await activateOrResumeRalplanAdvisory({
         cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId,
-        activationTurnId: advisoryActivationTurnId, activationPrompt: options.task,
+        activationTurnId: advisoryActivationTurnId, prompt: options.task, maxIterations,
+        producer: options.advisoryProducer ?? 'unknown', threadKind: options.advisoryThreadKind ?? 'unknown',
         ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),
+        failpoint: (checkpoint) => {
+          if (checkpoint === 'after_intent' || checkpoint === 'after_mode') advisoryStartupFailpoint(checkpoint);
+        },
       });
-      advisoryStartupFailpoint('after_intent');
-      pendingActivation = await readAuthorizedPendingRalplanActivation(activationAuthority);
-      if (!pendingActivation) throw new Error('ralplan_advisory_activation_intent_missing');
-      advisoryGenerationId = pendingActivation.generation_id;
-      await startMode('ralplan', options.task, maxIterations, cwd, advisorySessionId, {
-        kind: 'ralplan-advisory', sessionId: advisorySessionId, generationId: advisoryGenerationId,
-        rootThreadId: advisoryRootThreadId, activationTurnId: advisoryActivationTurnId,
-        activationPrompt: options.task,
-      });
-      await syncExplicitSessionModeState('ralplan', cwd, advisorySessionId);
-      advisoryStartupFailpoint('after_mode');
-      const committedActivation = await reconcileRalplanAdvisory(cwd, advisorySessionId, {
-        producer: 'native', threadKind: 'root-or-drift', rootThreadId: advisoryRootThreadId,
-        activationTurnId: advisoryActivationTurnId,
-      });
-      if (committedActivation?.corruption) throw new Error(`ralplan_advisory_${committedActivation.corruption}`);
+      advisoryGenerationId = activated.activation.generation_id;
     }
   } else {
     await startMode('ralplan', options.task, maxIterations, cwd, runtimeSessionId);

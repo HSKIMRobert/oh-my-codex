@@ -297,7 +297,7 @@ describe('ralplan advisory runtime', () => {
       };
       const options = {
         task: 'retry advisory startup', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
-        workflowVariant: 'advisory' as const, rootThreadId: 'thread-leader', activationTurnId: 'turn-intent', closingTurnId: 'turn-intent',
+        workflowVariant: 'advisory' as const, advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift', rootThreadId: 'thread-leader', activationTurnId: 'turn-intent', closingTurnId: 'turn-intent',
       };
 
       await assert.rejects(() => runRalplanConsensus(executor, options), /startup_test_failpoint:after_intent/);
@@ -343,7 +343,7 @@ describe('ralplan advisory runtime', () => {
       };
       const options = {
         task: 'retry bound advisory startup', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
-        workflowVariant: 'advisory' as const, rootThreadId: 'thread-leader', activationTurnId: 'turn-mode', closingTurnId: 'turn-mode',
+        workflowVariant: 'advisory' as const, advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift', rootThreadId: 'thread-leader', activationTurnId: 'turn-mode', closingTurnId: 'turn-mode',
       };
 
       await assert.rejects(() => runRalplanConsensus(executor, options), /startup_test_failpoint:after_mode/);
@@ -382,7 +382,7 @@ describe('ralplan advisory runtime', () => {
           };
           const options = {
             task: `race ${competitor}`, cwd, sessionId, maxIterations: 1,
-            workflowVariant: 'advisory' as const, rootThreadId: 'thread-leader',
+            workflowVariant: 'advisory' as const, advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift', rootThreadId: 'thread-leader',
             activationTurnId: 'turn-race', closingTurnId: 'turn-race',
           };
           process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT = 'after_intent';
@@ -402,7 +402,7 @@ describe('ralplan advisory runtime', () => {
 
           await assert.rejects(
             () => runRalplanConsensus(executor, options),
-            competitor === 'standard' ? /ralplan_active_mode_exists/ : /ralplan_advisory_start_binding_conflict/,
+            /ralplan_advisory_start_binding_conflict/,
           );
           assert.equal(await readFile(sessionStatePath(cwd, sessionId), 'utf-8'), competingBytes);
         } finally {
@@ -446,7 +446,7 @@ describe('ralplan advisory runtime', () => {
         },
       }, {
         task: 'produce advisory only', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
-        workflowVariant: 'advisory', rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
+        workflowVariant: 'advisory', advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift', rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
       });
       assert.equal(result.status, 'completed', result.error ?? 'advisory runtime did not complete');
       assert.equal(result.planningComplete, true);
@@ -495,7 +495,7 @@ describe('ralplan advisory runtime', () => {
         },
       }, {
         task: 'recover approved advisory', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
-        workflowVariant: 'advisory', rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
+        workflowVariant: 'advisory', advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift', rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
       });
       assert.equal(result.status, 'completed', result.error ?? 'runtime did not recover approved journal');
       const projection = await readCurrentRalplanAdvisory(cwd, sessionId);

@@ -5,12 +5,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
-  activateRalplanAdvisory,
   readCurrentRalplanAdvisory,
   reconcileRalplanAdvisory,
   observeRalplanAdvisoryPrompt,
   terminalizeRalplanAdvisory,
 } from '../../ralplan/advisory.js';
+import { activateOrResumeRalplanAdvisory } from '../../ralplan/advisory-activation.js';
 import {
   buildRalplanAdvisoryRoutingObservation,
   dispatchCodexNativeHook,
@@ -39,8 +39,9 @@ async function terminalFixture(prefix: string) {
       },
     },
   }));
-  const activation = await activateRalplanAdvisory({
+  const { activation } = await activateOrResumeRalplanAdvisory({
     cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a',
+    prompt: '$ralplan --advisory hook fixture', producer: 'native', threadKind: 'root-or-drift',
   });
   const activeMode = {
     active: true, mode: 'ralplan', current_phase: 'draft', iteration: 1,
@@ -49,9 +50,6 @@ async function terminalFixture(prefix: string) {
     execution_handoff_authorized: false, host_verified: false, planning_complete: false,
   };
   await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(activeMode));
-  await reconcileRalplanAdvisory(cwd, sessionId, {
-    producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'root-a', activationTurnId: 'turn-a',
-  });
   await terminalizeRalplanAdvisory({
     cwd, sessionId, generationId: activation.generation_id, closingTurnId: 'turn-close', iteration: 1,
     outcome: 'cancelled', integrityStatus: 'proven',
@@ -71,17 +69,15 @@ async function conflictingReplayFixture(prefix: string, standardPhase = 'archite
   // Replace the committed cancellation fixture with a fresh generation whose
   // journal is deliberately left prepared before any mirror replay.
   await rm(join(fixture.sessionDir, 'ralplan-advisory'), { recursive: true, force: true });
-  const activation = await activateRalplanAdvisory({
+  const { activation } = await activateOrResumeRalplanAdvisory({
     cwd: fixture.cwd, sessionId: fixture.sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-replay', generationId: 'generation-replay',
+    prompt: '$ralplan --advisory replay fixture', producer: 'native', threadKind: 'root-or-drift',
   });
   const advisoryMode = {
     active: true, mode: 'ralplan', current_phase: 'draft', session_id: fixture.sessionId, thread_id: 'root-a', turn_id: 'turn-replay',
     workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
   };
   await writeFile(join(fixture.sessionDir, 'ralplan-state.json'), JSON.stringify(advisoryMode));
-  await reconcileRalplanAdvisory(fixture.cwd, fixture.sessionId, {
-    producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'root-a', activationTurnId: 'turn-replay',
-  });
   await assert.rejects(terminalizeRalplanAdvisory({
     cwd: fixture.cwd, sessionId: fixture.sessionId, generationId: activation.generation_id,
     closingTurnId: 'turn-close-replay', iteration: 1, outcome: 'cancelled', integrityStatus: 'proven',

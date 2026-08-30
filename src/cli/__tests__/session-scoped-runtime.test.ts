@@ -8,9 +8,10 @@ import { tmpdir as osTmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { readModeState, readModeStateForSession } from '../../modes/base.js';
-import { readSkillActiveState } from '../../state/skill-active.js';
+import { listActiveSkills, readSkillActiveState } from '../../state/skill-active.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
-import { activateRalplanAdvisory, readCurrentRalplanAdvisory, reconcileRalplanAdvisory } from '../../ralplan/advisory.js';
+import { readCurrentRalplanAdvisory, reconcileRalplanAdvisory } from '../../ralplan/advisory.js';
+import { activateOrResumeRalplanAdvisory } from '../../ralplan/advisory-activation.js';
 import { cancelModesForTest } from '../index.js';
 
 const tmpdir = (): string => realpathSync(osTmpdir());
@@ -94,6 +95,20 @@ case "$1" in
       fi
       : > "$FAKE_TMUX_SWAP_MARKER"
     fi
+    mutate_threshold="\${FAKE_TMUX_MUTATE_AFTER_COUNT:-0}"
+    if [ -n "$FAKE_TMUX_MUTATE_SESSION_SKILL" ] && [ "$count" -gt "$mutate_threshold" ] && [ ! -e "$FAKE_TMUX_MUTATE_SESSION_SKILL_MARKER" ]; then
+      first_skill=$(grep -m1 '"skill"' "$FAKE_TMUX_MUTATE_SESSION_SKILL" 2>/dev/null || true)
+      case "$first_skill" in
+        *'"team"'*)
+          if [ -n "$FAKE_TMUX_MUTATE_SESSION_SKILL_FIELD" ]; then
+            node -e 'const fs=require("fs");const p=process.argv[1];const f=process.env.FAKE_TMUX_MUTATE_SESSION_SKILL_FIELD;const v=JSON.parse(fs.readFileSync(p,"utf8"));const mutations={active:()=>{v.active=false},skill:()=>{v.skill="attacker"},phase:()=>{v.phase="attacker";v.current_phase="attacker"},source:()=>{v.source="attacker"},identity:()=>{v.thread_id="attacker";v.turn_id="attacker"},timestamp:()=>{v.updated_at="2000-01-01T00:00:00.000Z"},terminal:()=>{v.terminal_reason="attacker"}};mutations[f]();fs.writeFileSync(p,JSON.stringify(v)+"\\n")' "$FAKE_TMUX_MUTATE_SESSION_SKILL"
+          else
+            printf '{"version":1,"active":false,"skill":"ralplan","session_id":"%s","workflow_variant":"advisory","advisory_generation_id":"generation-detached","active_skills":[]}\n' "$FAKE_OMX_SESSION_ID" > "$FAKE_TMUX_MUTATE_SESSION_SKILL"
+          fi
+          : > "$FAKE_TMUX_MUTATE_SESSION_SKILL_MARKER"
+          ;;
+      esac
+    fi
     printf '%%42\\t0\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$FAKE_TMUX_PANE_PID" "$FAKE_TMUX_SESSION_NAME" "$FAKE_TMUX_INTERNAL_SESSION_ID" "$created" "$FAKE_OMX_SESSION_ID"
     ;;
   *) exit 1 ;;
@@ -147,12 +162,13 @@ async function writeDetachedAdvisoryState(options: {
     cwd: options.runDir,
     state_root: stateDir,
   }));
-  const activation = await activateRalplanAdvisory({
+  const { activation, projection: committed } = await activateOrResumeRalplanAdvisory({
     cwd: options.runDir,
     sessionId: options.sessionId,
     rootThreadId: 'root-detached',
     activationTurnId: 'turn-detached',
     generationId: 'generation-detached',
+    prompt: '$ralplan --advisory detached fixture', producer: 'native', threadKind: 'root-or-drift',
   });
   const mode = {
     active: true,
@@ -166,13 +182,7 @@ async function writeDetachedAdvisoryState(options: {
     advisory_generation_id: activation.generation_id,
   };
   await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify(mode));
-  const committed = await reconcileRalplanAdvisory(options.runDir, options.sessionId, {
-    producer: 'native',
-    threadKind: 'root-or-drift',
-    rootThreadId: 'root-detached',
-    activationTurnId: 'turn-detached',
-  });
-  assert.equal(committed?.corruption, null);
+  assert.equal(committed.corruption, null);
   if (options.boundGenerationId && options.boundGenerationId !== activation.generation_id) {
     await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
       ...mode,
@@ -1435,9 +1445,112 @@ describe('CLI session-scoped state parity', () => {
       assert.equal(projection?.journal?.outcome, 'cancelled');
       const mode = JSON.parse(await readFile(join(runDir, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), 'utf8'));
       assert.equal(mode.active, false);
+      const sessionSkill = JSON.parse(await readFile(join(runDir, '.omx', 'state', 'sessions', sessionId, 'skill-active-state.json'), 'utf8'));
+      assert.equal(listActiveSkills(sessionSkill).some((entry) => (
+        entry.skill === 'ralplan' && entry.active !== false && entry.session_id === sessionId
+      )), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects concurrent deletion of unrelated session-skill entries and metadata during detached closeout', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-skill-race-source-'));
+    const runsRoot = await mkdtemp(join(tmpdir(), 'omx-cli-detached-advisory-skill-race-runs-'));
+    try {
+      if (process.platform === 'win32') return;
+      const sessionId = 'sess-detached-advisory-skill-race';
+      const tmuxSessionName = 'omx-detached-advisory-skill-race';
+      const runDir = join(runsRoot, 'run-advisory');
+      const fakeBin = await createFakeTmuxBin(wd);
+      const mutationMarker = join(wd, 'skill-mutated');
+      const counterPath = join(wd, 'tmux-count');
+      await mkdir(runDir, { recursive: true });
+      await writeDetachedAdvisoryState({ runDir, sessionId });
+      const sessionSkillPath = join(runDir, '.omx', 'state', 'sessions', sessionId, 'skill-active-state.json');
+      const sessionSkill = JSON.parse(await readFile(sessionSkillPath, 'utf8'));
+      sessionSkill.foreign_owner_metadata = { owner: 'team-owner', marker: 'preserve-exactly' };
+      sessionSkill.active_skills.push({
+        skill: 'team', active: true, phase: 'executing', session_id: sessionId,
+        owner_codex_session_id: sessionId, marker: 'preserve-team-entry',
+      });
+      await writeFile(sessionSkillPath, `${JSON.stringify(sessionSkill, null, 2)}\n`);
+      await writeActiveRunRecord({
+        runsRoot, contextKey: 'detached-advisory-skill-race-context', sourceCwd: wd,
+        runDir, sessionId, tmuxSessionName,
+      });
+
+      const result = runOmxWithEnv(wd, {
+        OMX_RUNS_DIR: runsRoot,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+        FAKE_OMX_SESSION_ID: sessionId,
+        FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+        FAKE_TMUX_MUTATE_SESSION_SKILL: sessionSkillPath,
+        FAKE_TMUX_MUTATE_SESSION_SKILL_MARKER: mutationMarker,
+        FAKE_TMUX_COUNTER_FILE: counterPath,
+        FAKE_TMUX_MUTATE_AFTER_COUNT: '16',
+      }, 'cancel');
+      assert.notEqual(result.status, 0);
+      assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
+      assert.match(result.stderr, /canonical (?:terminal payload|writer)/i);
+      assert.equal(existsSync(mutationMarker), true);
+      const projection = await readCurrentRalplanAdvisory(runDir, sessionId);
+      assert.notEqual(projection?.fence?.state, 'closed');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects every canonical top-level session-skill field class mutated during detached closeout', async () => {
+    if (process.platform === 'win32') return;
+    const fieldClasses = ['active', 'skill', 'phase', 'source', 'identity', 'timestamp', 'terminal'];
+    for (const fieldClass of fieldClasses) {
+      const wd = await mkdtemp(join(tmpdir(), `omx-cli-detached-advisory-${fieldClass}-race-source-`));
+      const runsRoot = await mkdtemp(join(tmpdir(), `omx-cli-detached-advisory-${fieldClass}-race-runs-`));
+      try {
+        const sessionId = `sess-detached-advisory-${fieldClass}-race`;
+        const tmuxSessionName = `omx-detached-advisory-${fieldClass}-race`;
+        const runDir = join(runsRoot, 'run-advisory');
+        const fakeBin = await createFakeTmuxBin(wd);
+        const mutationMarker = join(wd, 'skill-mutated');
+        const counterPath = join(wd, 'tmux-count');
+        await mkdir(runDir, { recursive: true });
+        await writeDetachedAdvisoryState({ runDir, sessionId });
+        const sessionSkillPath = join(runDir, '.omx', 'state', 'sessions', sessionId, 'skill-active-state.json');
+        const sessionSkill = JSON.parse(await readFile(sessionSkillPath, 'utf8'));
+        sessionSkill.active_skills.push({
+          skill: 'team', active: true, phase: 'executing', session_id: sessionId,
+          owner_codex_session_id: sessionId,
+        });
+        await writeFile(sessionSkillPath, `${JSON.stringify(sessionSkill, null, 2)}\n`);
+        await writeActiveRunRecord({
+          runsRoot, contextKey: `detached-advisory-${fieldClass}-race-context`, sourceCwd: wd,
+          runDir, sessionId, tmuxSessionName,
+        });
+
+        const result = runOmxWithEnv(wd, {
+          OMX_RUNS_DIR: runsRoot,
+          PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          FAKE_OMX_SESSION_ID: sessionId,
+          FAKE_TMUX_SESSION_NAME: tmuxSessionName,
+          FAKE_TMUX_MUTATE_SESSION_SKILL: sessionSkillPath,
+          FAKE_TMUX_MUTATE_SESSION_SKILL_MARKER: mutationMarker,
+          FAKE_TMUX_MUTATE_SESSION_SKILL_FIELD: fieldClass,
+          FAKE_TMUX_COUNTER_FILE: counterPath,
+          FAKE_TMUX_MUTATE_AFTER_COUNT: '16',
+        }, 'cancel');
+        assert.notEqual(result.status, 0, fieldClass);
+        assert.doesNotMatch(result.stdout, /Cancelled: ralplan/, fieldClass);
+        assert.match(result.stderr, /canonical terminal payload/i, fieldClass);
+        assert.equal(existsSync(mutationMarker), true, fieldClass);
+        const projection = await readCurrentRalplanAdvisory(runDir, sessionId);
+        assert.notEqual(projection?.fence?.state, 'closed', fieldClass);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+        await rm(runsRoot, { recursive: true, force: true });
+      }
     }
   });
 

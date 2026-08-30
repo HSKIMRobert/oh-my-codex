@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -12,7 +13,6 @@ import {
 } from '../advisory-evidence.js';
 import {
   administrativelyAbandonRalplanAdvisory,
-  activateRalplanAdvisory,
   classifyAdvisoryPrompt,
   prepareAdvisoryCloseout,
   ralplanAdvisoryEventsPath,
@@ -23,8 +23,15 @@ import {
   validateAdvisoryInactiveState,
 } from '../advisory.js';
 import { updateModeState } from '../../modes/base.js';
+import {
+  activateOrResumeRalplanAdvisory as activateRalplanAdvisoryWithProvenance,
+  type ActivateOrResumeRalplanAdvisoryInput,
+} from '../advisory-activation.js';
 
 const roots: string[] = [];
+const activateOrResumeRalplanAdvisory = (
+  input: Omit<ActivateOrResumeRalplanAdvisoryInput, 'producer' | 'threadKind' | 'resumeOnly'>,
+) => activateRalplanAdvisoryWithProvenance({ ...input, producer: 'native', threadKind: 'root-or-drift' });
 
 async function snapshotBytes(root: string): Promise<Array<[string, string]>> {
   const snapshot: Array<[string, string]> = [];
@@ -69,16 +76,11 @@ async function fixture(): Promise<{ cwd: string; sessionId: string; lifecycle: A
       },
     },
   }));
-  const activation = await activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a', nowIso: '2026-08-27T23:59:59.000Z' });
-  await mkdir(join(cwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
-  await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), JSON.stringify({
-    active: true, mode: 'ralplan', current_phase: 'draft', session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-a',
-    workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
-  }));
-  const committed = await reconcileRalplanAdvisory(cwd, sessionId, {
-    producer: 'native', threadKind: 'root-or-drift', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+  const { activation, projection: committed } = await activateOrResumeRalplanAdvisory({
+    cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a',
+    prompt: '$ralplan --advisory fixture', generationId: 'generation-a', nowIso: '2026-08-27T23:59:59.000Z',
   });
-  if (committed?.corruption) throw new Error(committed.corruption);
+  if (committed.corruption) throw new Error(committed.corruption);
   const lifecycle = await projectAdvisoryReviewLifecycle({
     cwd, sessionId, generationId: activation.generation_id, activationTurnId: 'turn-a', activationCreatedAt: activation.created_at, rootThreadId: 'root-a', iteration: 1,
     planPaths: ['.omx/plans/plan.md'],
@@ -88,22 +90,13 @@ async function fixture(): Promise<{ cwd: string; sessionId: string; lifecycle: A
   return { cwd, sessionId, lifecycle };
 }
 
-async function bindAndCommitActivation(
-  cwd: string,
-  sessionId: string,
-  activation: { generation_id: string; root_thread_id: string; activation_turn_id: string },
-): Promise<Awaited<ReturnType<typeof reconcileRalplanAdvisory>>> {
-  const path = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
-  await mkdir(join(cwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
-  let state: Record<string, unknown> = {};
-  try { state = JSON.parse(await readFile(path, 'utf8')); } catch {}
-  await writeFile(path, JSON.stringify({ ...state, active: true, mode: 'ralplan', session_id: sessionId,
-    thread_id: activation.root_thread_id, turn_id: activation.activation_turn_id,
-    workflow_variant: 'advisory', advisory_generation_id: activation.generation_id }));
-  return reconcileRalplanAdvisory(cwd, sessionId, {
-    producer: 'native', threadKind: 'root-or-drift', rootThreadId: activation.root_thread_id,
-    activationTurnId: activation.activation_turn_id,
-  });
+async function ensureTerminalInactiveBinding(cwd: string, sessionId: string): Promise<void> {
+  await updateModeState('ralplan', {
+    active: false,
+    execution_handoff_authorized: false,
+    host_verified: false,
+    ralplan_consensus_gate: { complete: false },
+  }, cwd, sessionId);
 }
 
 afterEach(async () => {
@@ -609,10 +602,10 @@ describe('ralplan advisory fence and journal', () => {
       const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-binding-corrupt-${index}-`));
       roots.push(cwd);
       const sessionId = `session-${index}`;
-      const activation = await activateRalplanAdvisory({
-        cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: `generation-${index}`,
+      await activateOrResumeRalplanAdvisory({
+        cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: '$ralplan --advisory binding fixture', generationId: `generation-${index}`,
       });
-      await bindAndCommitActivation(cwd, sessionId, activation);
       await mutate(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'));
       const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
       assert.equal(projection?.denyProductWrites, false);
@@ -766,12 +759,24 @@ describe('ralplan advisory fence and journal', () => {
   it('rolls over with CAS and preserves the predecessor generation', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
-    const result = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: 'replanificá el plan', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+    await ensureTerminalInactiveBinding(cwd, sessionId);
+    const prompt = 'replanificá el plan';
+    const observed = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt, producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+    const activated = await activateOrResumeRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', prompt, predecessorGenerationId: observed.projection!.activation.generation_id });
+    const result = { intent: observed.intent, projection: activated.projection };
     assert.equal(result.intent, 'replan');
     assert.equal(result.projection?.activation.predecessor_generation_id, 'generation-a');
-    assert.equal(result.projection?.corruption, 'rollover_pending_admin');
-    assert.equal((await bindAndCommitActivation(cwd, sessionId, result.projection!.activation))?.corruption, null);
-    await assert.rejects(activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-c', predecessorGenerationId: 'generation-a' }), /cas_mismatch/);
+    assert.equal(result.projection?.corruption, null);
+    const binding = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json'), 'utf8'));
+    assert.equal(binding.active, true);
+    assert.equal(binding.advisory_generation_id, result.projection?.activation.generation_id);
+    await assert.rejects(
+      activateOrResumeRalplanAdvisory({
+        cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-c',
+        prompt: '$ralplan --advisory stale predecessor', predecessorGenerationId: 'generation-a',
+      }),
+      /start_binding_conflict|cas_mismatch|committed_activation_authority_mismatch/,
+    );
   });
 
   it('processes replan and abandon against the exact terminal inactive Advisory binding', async () => {
@@ -793,6 +798,7 @@ describe('ralplan advisory fence and journal', () => {
         cwd, sessionId, turnId: `turn-terminal-${index}`, threadId: 'root-a', prompt,
         producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
       });
+      if (index === 0) result.projection = (await activateOrResumeRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: `turn-terminal-${index}`, prompt, predecessorGenerationId: result.projection!.activation.generation_id })).projection;
       assert.equal(result.intent, index === 0 ? 'replan' : 'abandon');
       if (index === 0) assert.equal(result.projection?.activation.predecessor_generation_id, 'generation-a');
       else assert.equal(result.projection?.fence?.state, 'abandoned');
@@ -800,29 +806,33 @@ describe('ralplan advisory fence and journal', () => {
   });
 
   it('recovers the single-owner rollover intent after every durable checkpoint', async () => {
-    for (const failpoint of ['rollover_intent', 'rollover_activation', 'rollover_pointer'] as const) {
+    for (const failpoint of ['after_intent', 'after_mode', 'after_run_state'] as const) {
       const { cwd, sessionId, lifecycle } = await fixture();
       await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
-      await assert.rejects(activateRalplanAdvisory({
-        cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', predecessorGenerationId: 'generation-a',
-        failpoint: (name) => { if (name === failpoint) throw new Error(`crash:${name}`); },
+      await ensureTerminalInactiveBinding(cwd, sessionId);
+      const prompt = '$ralplan --advisory retry checkpoint';
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', prompt,
+        predecessorGenerationId: 'generation-a', failpoint: (name) => { if (name === failpoint) throw new Error(`crash:${name}`); },
       }), /crash/);
       assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.denyProductWrites, false);
       const intent = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'rollover-intent.json'), 'utf8'));
-      const recovered = await bindAndCommitActivation(cwd, sessionId, {
-        generation_id: intent.generation_id, root_thread_id: intent.root_thread_id, activation_turn_id: intent.activation_turn_id,
+      const recovered = await activateOrResumeRalplanAdvisory({
+        cwd, sessionId, rootThreadId: intent.root_thread_id, activationTurnId: intent.activation_turn_id,
+        prompt, predecessorGenerationId: 'generation-a',
       });
-      assert.equal(recovered?.activation.predecessor_generation_id, 'generation-a');
-      assert.equal(recovered?.corruption, null);
+      assert.equal(recovered.projection.activation.predecessor_generation_id, 'generation-a');
+      assert.equal(recovered.projection.corruption, null);
     }
   });
 
   it('never auto-authorizes a forged or unauthenticated pending rollover intent', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
-    await assert.rejects(activateRalplanAdvisory({
-      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', predecessorGenerationId: 'generation-a',
-      failpoint: (name) => { if (name === 'rollover_activation') throw new Error('crash'); },
+    await ensureTerminalInactiveBinding(cwd, sessionId);
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', prompt: '$ralplan --advisory forged',
+      predecessorGenerationId: 'generation-a', failpoint: (name) => { if (name === 'after_intent') throw new Error('crash'); },
     }), /crash/);
     const intentPath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory', 'rollover-intent.json');
     const forged = JSON.parse(await readFile(intentPath, 'utf8'));
@@ -841,10 +851,12 @@ describe('ralplan advisory fence and journal', () => {
   it('allows only one concurrent new-advisory root request to own G+1', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
-    const requests = await Promise.allSettled([
-      observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-b', threadId: 'root-a', prompt: '$ralplan --advisory nuevo advisory', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false }),
-      observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-c', threadId: 'root-a', prompt: '$ralplan --advisory otro advisory', producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false }),
-    ]);
+    await ensureTerminalInactiveBinding(cwd, sessionId);
+    const request = async (turnId: string, prompt: string) => {
+      const observed = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId, threadId: 'root-a', prompt, producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+      return activateOrResumeRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: turnId, prompt, predecessorGenerationId: observed.projection!.activation.generation_id });
+    };
+    const requests = await Promise.allSettled([request('turn-b', '$ralplan --advisory nuevo advisory'), request('turn-c', '$ralplan --advisory otro advisory')]);
     assert.equal(requests.filter((result) => result.status === 'fulfilled').length, 1);
     assert.equal(requests.filter((result) => result.status === 'rejected').length, 1);
     const current = await readCurrentRalplanAdvisory(cwd, sessionId);
@@ -852,12 +864,52 @@ describe('ralplan advisory fence and journal', () => {
     assert.ok(current?.activation.activation_turn_id === 'turn-b' || current?.activation.activation_turn_id === 'turn-c');
   });
 
+  it('preserves a competing binding inserted before G+1 bind and recovers the same intent after it terminalizes', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    await ensureTerminalInactiveBinding(cwd, sessionId);
+    const prompt = 'replanificá el plan';
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+    const competitor = '{\n  "active": true,\n  "mode": "ralplan",\n  "session_id": "session-a",\n  "workflow_variant": "standard",\n  "current_phase": "draft"\n}\n';
+
+    const observed = await observeRalplanAdvisoryPrompt({ cwd, sessionId, turnId: 'turn-race', threadId: 'root-a', prompt, producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false });
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-race', prompt,
+      predecessorGenerationId: observed.projection!.activation.generation_id,
+      failpoint: async (checkpoint) => {
+        if (checkpoint !== 'after_intent') return;
+        await writeFile(bindingPath, competitor);
+      },
+    }), /ralplan_advisory_start_binding_conflict/);
+
+    assert.equal(await readFile(bindingPath, 'utf8'), competitor);
+    const root = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory');
+    const intent = JSON.parse(await readFile(join(root, 'rollover-intent.json'), 'utf8'));
+    assert.equal(JSON.parse(await readFile(join(root, 'current.json'), 'utf8')).generation_id, 'generation-a');
+    assert.equal(existsSync(join(root, intent.generation_id)), false);
+
+    await writeFile(bindingPath, competitor.replace('"active": true', '"active": false'));
+    const recovered = await activateOrResumeRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-race', prompt, predecessorGenerationId: 'generation-a' });
+    assert.equal(recovered.projection.corruption, null);
+    assert.equal(recovered.projection.activation.generation_id, intent.generation_id);
+    const rebound = JSON.parse(await readFile(bindingPath, 'utf8'));
+    assert.equal(rebound.active, true);
+    assert.equal(rebound.workflow_variant, 'advisory');
+    assert.equal(rebound.advisory_generation_id, intent.generation_id);
+    await assert.rejects(readFile(join(root, 'rollover-intent.json')), /ENOENT/);
+  });
+
   it('persists generation-one activation intent before publication without granting authority', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-g1-intent-'));
     roots.push(cwd);
-    await assert.rejects(activateRalplanAdvisory({
-      cwd, sessionId: 'session-g1', rootThreadId: 'root-g1', activationTurnId: 'turn-g1', generationId: 'generation-g1',
-      failpoint: (name) => { if (name === 'rollover_intent') throw new Error('crash-after-intent'); },
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-g1', rootThreadId: 'root-g1', activationTurnId: 'turn-g1',
+      prompt: '$ralplan --advisory generation one', generationId: 'generation-g1',
+      failpoint: (name) => { if (name === 'after_intent') throw new Error('crash-after-intent'); },
     }), /crash-after-intent/);
     const projection = await readCurrentRalplanAdvisory(cwd, 'session-g1');
     assert.equal(projection?.denyProductWrites, false);
@@ -866,7 +918,7 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(recovered?.denyProductWrites, false);
   });
 
-  it('keeps a published G+1 lifecycle-incomplete until its session mode is bound', async () => {
+  it('keeps G+1 as recoverable intent until central activation binds every mirror', async () => {
     const { cwd, sessionId, lifecycle } = await fixture();
     const stateDir = join(cwd, '.omx', 'state');
     const sessionDir = join(stateDir, 'sessions', sessionId);
@@ -876,13 +928,20 @@ describe('ralplan advisory fence and journal', () => {
       active: true, mode: 'ralplan', session_id: sessionId, workflow_variant: 'advisory', advisory_generation_id: 'generation-a',
     }));
     await terminalizeRalplanAdvisory({ cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1, outcome: 'approved', integrityStatus: 'proven', lifecycle, revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 });
-    const next = await activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', predecessorGenerationId: 'generation-a' });
+    await ensureTerminalInactiveBinding(cwd, sessionId);
+    const prompt = '$ralplan --advisory recoverable rollover';
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', prompt,
+      predecessorGenerationId: 'generation-a', failpoint: (name) => { if (name === 'after_intent') throw new Error('crash'); },
+    }), /crash/);
     const denied = await readCurrentRalplanAdvisory(cwd, sessionId);
-    assert.equal(denied?.activation.generation_id, next.generation_id);
+    assert.equal(denied?.activation.generation_id, 'generation-a');
     assert.equal(denied?.corruption, 'rollover_pending_admin');
     assert.equal(denied?.denyProductWrites, false);
-    const committed = await bindAndCommitActivation(cwd, sessionId, next);
-    assert.equal(committed?.corruption, null);
+    const committed = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-b', prompt, predecessorGenerationId: 'generation-a',
+    });
+    assert.equal(committed.projection.corruption, null);
   });
 
   it('does not roll over a pending closeout and recovers a dead-process lock', async () => {
@@ -898,8 +957,9 @@ describe('ralplan advisory fence and journal', () => {
     const deadSessionRoot = join(cwd, '.omx', 'state', 'sessions', 'session-dead', 'ralplan-advisory');
     await mkdir(deadSessionRoot, { recursive: true });
     await writeFile(join(deadSessionRoot, 'current.lock'), JSON.stringify({ schema_version: 1, pid: 2_147_483_647, created_at: new Date().toISOString() }));
-    const activation = await activateRalplanAdvisory({
-      cwd, sessionId: 'session-dead', rootThreadId: 'root-a', activationTurnId: 'turn-c', generationId: 'generation-dead',
+    const { activation } = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-dead', rootThreadId: 'root-a', activationTurnId: 'turn-c',
+      prompt: '$ralplan --advisory dead lock recovery', generationId: 'generation-dead',
     });
     assert.equal(activation.generation_id, 'generation-dead');
   });

@@ -48,6 +48,8 @@ export interface SkillActiveEntry {
   thread_id?: string;
   turn_id?: string;
   owner_codex_session_id?: string;
+  workflow_variant?: 'advisory';
+  advisory_generation_id?: string;
 }
 
 export interface SkillActiveStateLike {
@@ -262,12 +264,31 @@ export function isTransitionCanonicalStateOwned(raw: unknown, sessionId?: string
 
 export function listTransitionActiveSkills(raw: unknown, sessionId?: string): SkillActiveEntry[] {
   if (!isTransitionCanonicalStateOwned(raw, sessionId)) return [];
-  const entries = listActiveSkills(raw);
+  const advisoryRalplan = safeString((raw as SkillActiveStateLike).workflow_variant).trim() === 'advisory';
+  const entries = listActiveSkills(raw).filter((entry) => !(entry.skill === 'ralplan'
+    && (advisoryRalplan || entry.workflow_variant === 'advisory')));
   const normalizedSessionId = safeString(sessionId).trim();
   if (normalizedSessionId) {
     return entries.filter((entry) => safeString(entry.session_id).trim() === normalizedSessionId);
   }
   return entries.filter((entry) => safeString(entry.session_id).trim().length === 0);
+}
+
+/** Merge one authenticated session projection without replacing foreign-session root entries. */
+export function mergeRootSkillStateForExactSession(
+  currentRoot: SkillActiveStateLike | null,
+  sessionState: SkillActiveStateLike,
+  sessionId: string,
+): SkillActiveStateLike {
+  const normalizedSessionId = safeString(sessionId).trim();
+  const currentEntries = listActiveSkills(currentRoot ?? {});
+  const incomingEntries = listActiveSkills(sessionState)
+    .filter((entry) => entryMatchesSessionOrOwner(entry, normalizedSessionId));
+  const mergedEntries = [
+    ...currentEntries.filter((entry) => !entryMatchesSessionOrOwner(entry, normalizedSessionId)),
+    ...incomingEntries,
+  ];
+  return stateWithActiveEntries(currentRoot ?? sessionState, mergedEntries, sessionState.skill || 'skill-active');
 }
 
 /**

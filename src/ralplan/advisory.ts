@@ -4,6 +4,7 @@ import { appendFile, mkdir, open, readFile, realpath, rename, rm, stat } from 'n
 import { dirname, join, relative } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
 import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
+import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
 
 export const RALPLAN_ADVISORY_SCHEMA_VERSION = 1;
 export type AdvisoryFenceState = 'pending_closeout' | 'recovery_required' | 'closed' | 'abandoned' | 'released';
@@ -62,6 +63,7 @@ export interface AdvisoryActivation {
   session_id: string;
   root_thread_id: string;
   activation_turn_id: string;
+  activation_prompt_sha256?: string;
   created_at: string;
 }
 
@@ -258,6 +260,8 @@ function activationValid(value: Record<string, unknown>, cwd: string, sessionId:
     && value.canonical_cwd === cwd && typeof value.root_thread_id === 'string' && safeId(value.root_thread_id)
     && typeof value.activation_turn_id === 'string' && safeId(value.activation_turn_id)
     && typeof value.created_at === 'string'
+    && (value.activation_prompt_sha256 === undefined
+      || (typeof value.activation_prompt_sha256 === 'string' && /^[a-f0-9]{64}$/i.test(value.activation_prompt_sha256)))
     && (value.predecessor_generation_id === undefined || (typeof value.predecessor_generation_id === 'string' && safeId(value.predecessor_generation_id)));
 }
 
@@ -274,6 +278,7 @@ function fenceValid(value: Record<string, unknown>, activation: AdvisoryActivati
 const FENCE_INHERITED_FIELDS = [
   'schema_version', 'generation_id', 'predecessor_generation_id', 'canonical_cwd', 'session_id',
   'root_thread_id', 'activation_turn_id', 'created_at', 'closing_turn_id', 'iteration',
+  'activation_prompt_sha256',
   'iteration_id', 'plan_manifest_sha256', 'architect_review_sha256', 'critic_review_sha256',
   'evidence_bundle_sha256',
 ] as const;
@@ -410,7 +415,7 @@ async function withGenerationLock<T>(cwd: string, sessionId: string, generationI
 interface AdvisoryActivationInput {
   cwd: string; sessionId: string; rootThreadId: string; activationTurnId: string;
   predecessorGenerationId?: string; generationId?: string; nowIso?: string; activationPrompt?: string;
-  failpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer') => void | Promise<void>;
+  failpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer' | 'intent_committed') => void | Promise<void>;
 }
 
 async function prepareActivationIntentUnlocked(
@@ -441,40 +446,18 @@ async function prepareActivationIntentUnlocked(
     schema_version: 1, generation_id: generationId,
     ...(expectedPredecessor ? { predecessor_generation_id: expectedPredecessor } : {}),
     canonical_cwd: cwd, session_id: input.sessionId, root_thread_id: input.rootThreadId,
-    activation_turn_id: input.activationTurnId, created_at: createdAt,
+    activation_turn_id: input.activationTurnId,
+    ...(input.activationPrompt !== undefined ? { activation_prompt_sha256: sha256(input.activationPrompt) } : {}),
+    created_at: createdAt,
   };
 }
 
-export async function prepareRalplanAdvisoryActivation(input: Omit<AdvisoryActivationInput, 'failpoint'>): Promise<AdvisoryActivation> {
+/** @internal Intent-store primitive. Only the central activation owner may call this. */
+export async function prepareRalplanAdvisoryActivationInternal(input: Omit<AdvisoryActivationInput, 'failpoint'>): Promise<AdvisoryActivation> {
   const cwd = await canonicalCwd(input.cwd);
   if (![input.sessionId, input.rootThreadId, input.activationTurnId].every(safeId)) throw new Error('ralplan_advisory_identity_missing');
   const root = advisoryRoot(cwd, input.sessionId);
   return withCurrentLock(root, () => prepareActivationIntentUnlocked(cwd, root, input));
-}
-
-export async function activateRalplanAdvisory(input: AdvisoryActivationInput): Promise<AdvisoryActivation> {
-  const cwd = await canonicalCwd(input.cwd);
-  if (![input.sessionId, input.rootThreadId, input.activationTurnId].every(safeId)) throw new Error('ralplan_advisory_identity_missing');
-  const root = advisoryRoot(cwd, input.sessionId);
-  return withCurrentLock(root, async () => {
-    const pointerPath = join(root, 'current.json');
-    const activation = await prepareActivationIntentUnlocked(cwd, root, input);
-    await input.failpoint?.('rollover_intent');
-    const generationId = activation.generation_id;
-    const dir = generationDir(cwd, input.sessionId, generationId);
-    await mkdir(dir, { recursive: false });
-    await writeExclusive(join(dir, 'activation.json'), activation);
-    await input.failpoint?.('rollover_activation');
-    const pointer: AdvisoryCurrentPointer = {
-      schema_version: 1, generation_id: generationId,
-      ...(activation.predecessor_generation_id ? { predecessor_generation_id: activation.predecessor_generation_id } : {}),
-      session_id: input.sessionId, canonical_cwd: cwd, updated_at: activation.created_at,
-    };
-    await writeAtomic(pointerPath, pointer);
-    await input.failpoint?.('rollover_pointer');
-    await syncDirectory(root);
-    return activation;
-  });
 }
 
 export async function readAuthorizedPendingRalplanActivation(input: {
@@ -496,7 +479,9 @@ export async function readAuthorizedPendingRalplanActivation(input: {
     schema_version: 1, generation_id: String(pending.generation_id),
     ...(typeof pending.predecessor_generation_id === 'string' ? { predecessor_generation_id: pending.predecessor_generation_id } : {}),
     canonical_cwd: cwd, session_id: input.sessionId, root_thread_id: input.rootThreadId,
-    activation_turn_id: input.activationTurnId, created_at: String(pending.created_at),
+    activation_turn_id: input.activationTurnId,
+    activation_prompt_sha256: String(pending.activation_prompt_sha256),
+    created_at: String(pending.created_at),
   };
 }
 
@@ -504,6 +489,8 @@ async function commitBoundActivationIntent(
   cwd: string,
   sessionId: string,
   pending: Record<string, unknown>,
+  failpoint?: AdvisoryActivationInput['failpoint'],
+  beforeCommit?: () => void | Promise<void>,
 ): Promise<AdvisoryActivation> {
   const root = advisoryRoot(cwd, sessionId);
   return withCurrentLock(root, async () => {
@@ -512,6 +499,7 @@ async function commitBoundActivationIntent(
     if (!currentIntent || JSON.stringify(currentIntent) !== JSON.stringify(pending)) {
       throw new Error('ralplan_advisory_rollover_intent_changed');
     }
+    await beforeCommit?.();
     const generationId = String(pending.generation_id ?? '');
     const rootThreadId = String(pending.root_thread_id ?? '');
     const activationTurnId = String(pending.activation_turn_id ?? '');
@@ -527,11 +515,15 @@ async function commitBoundActivationIntent(
         schema_version: 1, generation_id: generationId,
         ...(typeof pending.predecessor_generation_id === 'string' ? { predecessor_generation_id: pending.predecessor_generation_id } : {}),
         canonical_cwd: cwd, session_id: sessionId, root_thread_id: rootThreadId,
-        activation_turn_id: activationTurnId, created_at: String(pending.created_at ?? ''),
+        activation_turn_id: activationTurnId,
+        ...(typeof pending.activation_prompt_sha256 === 'string'
+          ? { activation_prompt_sha256: pending.activation_prompt_sha256 } : {}),
+        created_at: String(pending.created_at ?? ''),
       };
       await writeExclusive(join(dir, 'activation.json'), activation);
       activationRaw = activation as unknown as Record<string, unknown>;
     }
+    await failpoint?.('rollover_activation');
     if (!activationValid(activationRaw, cwd, sessionId, generationId)) throw new Error('ralplan_advisory_rollover_activation_invalid');
     const pointerPath = join(root, 'current.json');
     const current = await readStrictJson(pointerPath);
@@ -545,10 +537,51 @@ async function commitBoundActivationIntent(
         session_id: sessionId, canonical_cwd: cwd, updated_at: String(pending.created_at ?? ''),
       } satisfies AdvisoryCurrentPointer);
     }
+    await failpoint?.('rollover_pointer');
     await rm(intentPath, { force: false });
     await syncDirectory(root);
+    await failpoint?.('intent_committed');
     return activationRaw as unknown as AdvisoryActivation;
   });
+}
+
+async function verifyPreparedActivationMirrors(
+  cwd: string,
+  sessionId: string,
+  generationId: string,
+): Promise<void> {
+  const projections = describeAdvisoryActivationProjections(getBaseStateDir(cwd), sessionId, generationId);
+  for (const projection of [projections.mode, projections.run, projections.sessionSkill, projections.rootSkill]) {
+    await verifyPinnedJsonAndSync(projection.path, projection.predicate);
+  }
+}
+
+/** @internal Activation-store primitive. Only the central activation owner may call this. */
+export async function commitPreparedRalplanAdvisoryActivationInternal(input: {
+  cwd: string;
+  sessionId: string;
+  producer: string;
+  threadKind: string;
+  rootThreadId: string;
+  activationTurnId: string;
+  failpoint?: AdvisoryActivationInput['failpoint'];
+}): Promise<AdvisoryActivation> {
+  const cwd = await canonicalCwd(input.cwd);
+  const pending = await readStrictJson(join(advisoryRoot(cwd, input.sessionId), 'rollover-intent.json'));
+  if (!pending) throw new Error('ralplan_advisory_rollover_intent_missing');
+  const authenticated = input.producer === 'native' && input.threadKind === 'root-or-drift'
+    && input.rootThreadId === pending.root_thread_id
+    && input.activationTurnId === pending.activation_turn_id;
+  if (!authenticated) throw new Error('ralplan_advisory_pending_activation_authority_mismatch');
+  const bound = await readStrictJson(join(getBaseStateDir(cwd), 'sessions', input.sessionId, 'ralplan-state.json'));
+  if (!bound || bound.active !== true || bound.workflow_variant !== 'advisory'
+    || bound.advisory_generation_id !== pending.generation_id) {
+    throw new Error('ralplan_advisory_start_binding_conflict');
+  }
+  return commitBoundActivationIntent(
+    cwd, input.sessionId, pending, input.failpoint,
+    () => verifyPreparedActivationMirrors(cwd, input.sessionId, String(pending.generation_id)),
+  );
 }
 
 async function readProjectionForGeneration(cwdInput: string, sessionId: string, generationId: string): Promise<AdvisoryProjection> {
@@ -1165,20 +1198,6 @@ export async function reconcileRalplanAdvisory(
   },
 ): Promise<AdvisoryProjection | null> {
   const cwdCanonical = await canonicalCwd(cwd);
-  const root = advisoryRoot(cwdCanonical, sessionId);
-  const pending = await readStrictJson(join(root, 'rollover-intent.json')).catch(() => null);
-  if (pending) {
-    const authenticated = authority?.producer === 'native' && authority.threadKind === 'root-or-drift'
-      && authority.rootThreadId === pending.root_thread_id
-      && authority.activationTurnId === pending.activation_turn_id;
-    if (!authenticated) return readCurrentRalplanAdvisory(cwdCanonical, sessionId);
-    const bound = await readStrictJson(join(getBaseStateDir(cwdCanonical), 'sessions', sessionId, 'ralplan-state.json')).catch(() => null);
-    if (!bound || bound.active !== true || bound.workflow_variant !== 'advisory'
-      || bound.advisory_generation_id !== pending.generation_id) {
-      return readCurrentRalplanAdvisory(cwdCanonical, sessionId);
-    }
-    await commitBoundActivationIntent(cwdCanonical, sessionId, pending);
-  }
   const projection = await readCurrentRalplanAdvisory(cwdCanonical, sessionId);
   if (!projection?.activation?.generation_id) return projection;
   const initialConflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
@@ -1253,7 +1272,6 @@ export async function observeRalplanAdvisoryPrompt(input: {
   producer: 'native' | string; threadKind: 'root-or-drift' | string;
   isSubagentPromptSubmit: boolean; markedContinuation?: boolean; synthetic?: boolean;
   reservedInput?: string | null;
-  activationFailpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer') => void | Promise<void>;
 }): Promise<{ intent: AdvisoryIntent; projection: AdvisoryProjection | null }> {
   // Prompt observation is deliberately read-only. In particular, an explicit
   // execution request must not reconcile state, append an event, or mint any
@@ -1261,6 +1279,7 @@ export async function observeRalplanAdvisoryPrompt(input: {
   // explicit administrative abandon/replan/new-advisory intents.
   let projection = await readCurrentRalplanAdvisory(input.cwd, input.sessionId);
   if (!projection) return { intent: 'unrelated', projection: null };
+  if (!projection.activation) return { intent: 'unrelated', projection };
   if (projection.activation?.generation_id) {
     const bindingConflict = await liveAdvisoryBindingConflict(
       projection.activation.canonical_cwd,
@@ -1271,13 +1290,12 @@ export async function observeRalplanAdvisoryPrompt(input: {
       return { intent: 'unrelated', projection: { ...projection, corruption: bindingConflict } };
     }
   }
-  if (projection.corruption || !projection.fence) return { intent: 'unrelated', projection };
   if (input.threadId !== projection.activation.root_thread_id) {
     return { intent: 'unrelated', projection };
   }
   if (input.producer !== 'native' || input.isSubagentPromptSubmit
     || input.markedContinuation || input.synthetic || input.reservedInput || !safeId(input.turnId) || !safeId(input.threadId)
-    || input.turnId === projection.fence.closing_turn_id) {
+    || input.turnId === projection.fence?.closing_turn_id) {
     return { intent: 'unrelated', projection };
   }
   const intent = classifyAdvisoryPrompt(input.prompt);
@@ -1293,6 +1311,7 @@ export async function observeRalplanAdvisoryPrompt(input: {
   if (input.producer !== 'native' || input.threadKind !== 'root-or-drift') {
     return { intent: 'unrelated', projection };
   }
+  if (projection.corruption || !projection.fence) return { intent: 'unrelated', projection };
   let binding: Record<string, unknown> | null;
   try {
     binding = await readStrictJson(join(getBaseStateDir(projection.activation.canonical_cwd), 'sessions', input.sessionId, 'ralplan-state.json'));
@@ -1333,14 +1352,7 @@ export async function observeRalplanAdvisoryPrompt(input: {
         rootThreadId: input.threadId, turnId: input.turnId,
       });
     }
-    await activateRalplanAdvisory({
-      cwd: projection.activation.canonical_cwd, sessionId: input.sessionId,
-      rootThreadId: input.threadId, activationTurnId: input.turnId,
-      predecessorGenerationId: projection.activation.generation_id,
-      activationPrompt: input.prompt,
-      failpoint: input.activationFailpoint,
-    });
-    return { intent, projection: await readCurrentRalplanAdvisory(input.cwd, input.sessionId) };
+    return { intent, projection };
   }
   return { intent, projection };
 }

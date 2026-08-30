@@ -122,6 +122,7 @@ import {
   type SkillActiveStateLike,
 } from "../state/skill-active.js";
 import { isTrackedWorkflowMode } from "../state/workflow-transition.js";
+import { validateDetachedAdvisorySessionSkillTransition } from "../ralplan/advisory-detached-transition.js";
 import { maybeCheckAndPromptUpdate, runImmediateUpdate, type UpdateChannel } from "./update.js";
 import { maybePromptGithubStar } from "./star-prompt.js";
 import {
@@ -10334,12 +10335,20 @@ async function cancelModes(
       const cancellationCwd = runSelection ? runSelection.runCwd : cwd;
       let expectedModeIdentity = runSelection?.protectedFiles.get(activeAdvisory.path)?.identity;
       let expectedModeContent = activeAdvisory.originalContent;
+      const detachedSessionSkillBaseline = runSelection
+        ? [...runSelection.protectedFiles.entries()].find(([path]) => basename(path) === "skill-active-state.json"
+          && path.split(sep).includes("sessions") && path.split(sep).includes(currentSessionId))?.[1].content
+        : undefined;
+      const detachedRootSkillBaseline = runSelection
+        ? runSelection.protectedFiles.get(join(dirname(dirname(runSelection.sessionDir)), "skill-active-state.json"))?.content
+        : undefined;
       let sessionModeMutationPending = false;
       const pendingProtectedMutations = new Set<string>();
       const revalidateDetachedAdvisoryAuthority = runSelection
           ? async (checkpoint: string): Promise<void> => {
             if (checkpoint === "mirror_session_mode" || checkpoint === "cancel_mode_update"
-              || checkpoint === "mode_update_complete") {
+              || checkpoint === "mode_update_complete"
+              || checkpoint === "mode_commit_ralplan.session-state") {
               sessionModeMutationPending = true;
             }
             assertRunAuthority();
@@ -10388,10 +10397,61 @@ async function cancelModes(
               if (path === pointerPath || path === activeAdvisory.path) continue;
               const snapshot = await readDetachedPinnedFile(path);
               if (!detachedIdentityMatches(frozen.identity, snapshot.identity) || frozen.content !== snapshot.content) {
+                const isPendingSessionSkill = pendingProtectedMutations.has(path)
+                  && basename(path) === "skill-active-state.json"
+                  && path.split(sep).includes("sessions")
+                  && path.split(sep).includes(currentSessionId);
+                if (isPendingSessionSkill && checkpoint !== "journal_step_session_skill") continue;
                 if (!pendingProtectedMutations.delete(path)) {
-                  throw new Error(`Refusing cancellation because detached protected state changed: ${path}.`);
+                  throw new Error(`Refusing cancellation because detached protected state changed at ${checkpoint}: ${path}.`);
+                }
+                if (basename(path) === "skill-active-state.json"
+                  && path.split(sep).includes("sessions")
+                  && path.split(sep).includes(currentSessionId)) {
+                  const journalPath = runSelection!.advisoryGenerationDir
+                    ? join(runSelection!.advisoryGenerationDir, "closeout-journal.json") : "";
+                  const journalSnapshot = journalPath ? runSelection!.protectedFiles.get(journalPath) : undefined;
+                  const journal = journalSnapshot
+                    ? JSON.parse(journalSnapshot.content) as Record<string, unknown> : null;
+                  const terminalSkillUpdates = journal && typeof journal.terminal_skill_updates === "object"
+                    && journal.terminal_skill_updates !== null
+                    ? journal.terminal_skill_updates as Record<string, unknown> : null;
+                  const expectedTerminalState = terminalSkillUpdates?.session_skill;
+                  const terminalModeState = journal?.terminal_mode_updates;
+                  const terminalTimestamp = journal?.terminal_timestamp;
+                  if (!expectedTerminalState || typeof expectedTerminalState !== "object" || Array.isArray(expectedTerminalState)) {
+                    throw new Error("Refusing cancellation without a canonical detached Advisory session skill payload.");
+                  }
+                  if (!terminalModeState || typeof terminalModeState !== "object" || Array.isArray(terminalModeState)
+                    || typeof terminalTimestamp !== "string" || terminalTimestamp.length === 0) {
+                    throw new Error("Refusing cancellation without canonical detached Advisory terminal metadata.");
+                  }
+                  validateDetachedAdvisorySessionSkillTransition({
+                    baseline: JSON.parse(detachedSessionSkillBaseline ?? frozen.content) as Record<string, unknown>,
+                    rootBaseline: detachedRootSkillBaseline
+                      ? JSON.parse(detachedRootSkillBaseline) as Record<string, unknown>
+                      : null,
+                    current: JSON.parse(snapshot.content) as Record<string, unknown>,
+                    journalProjection: expectedTerminalState as Record<string, unknown>,
+                    terminalModeState: {
+                      ...activeAdvisory.state,
+                      ...terminalModeState as Record<string, unknown>,
+                    },
+                    terminalTimestamp,
+                    sessionId: currentSessionId,
+                  });
                 }
                 runSelection!.protectedFiles.set(path, snapshot);
+              }
+            }
+            if (checkpoint === "mode_commit_ralplan.session-skill-write"
+              || checkpoint === "mirror_session_skill") {
+              for (const path of runSelection!.protectedFiles.keys()) {
+                if (basename(path) === "skill-active-state.json"
+                  && path.split(sep).includes("sessions")
+                  && path.split(sep).includes(currentSessionId)) {
+                  pendingProtectedMutations.add(path);
+                }
               }
             }
             if (runSelection!.advisoryGenerationDir) {

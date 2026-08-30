@@ -223,7 +223,7 @@ export async function startMode(
     baseStateDir,
   });
   let transitionMessage: string | undefined;
-  if (isTrackedWorkflowMode(mode)) {
+  if (isTrackedWorkflowMode(mode) && !startProfile) {
     const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
       action: 'start',
       sessionId: scope.sessionId,
