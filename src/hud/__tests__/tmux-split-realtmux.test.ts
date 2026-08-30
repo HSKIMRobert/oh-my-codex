@@ -3,12 +3,19 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
-import { createHudWatchPane, findHudSplitOperationMarkerPaneId } from '../tmux.js';
+import {
+  createHudWatchPane,
+  findHudSplitOperationMarkerPaneId,
+  findHudWatchPaneIds,
+  listCurrentWindowPanes,
+  registerHudResizeHook,
+} from '../tmux.js';
 import { isRealTmuxAvailable, type TempTmuxSessionFixture, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
 
 const PANE_READY_TIMEOUT_MS = 1_000;
 const PANE_READY_INTERVAL_MS = 50;
 const ENV_FILE_TIMEOUT_MS = 3_000;
+const HUD_RECONCILE_TIMEOUT_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function skipUnlessPrivateRealTmux(t: TestContext): boolean {
@@ -53,6 +60,48 @@ async function waitForFileContent(filePath: string): Promise<string> {
     await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
   }
   throw new Error(`timed out waiting for pane env marker file: ${filePath} (last: ${JSON.stringify(lastContent)})`);
+}
+
+async function waitForReconciledHud(
+  leaderPaneId: string,
+  oldHudPaneId: string,
+  sessionId: string,
+  operation = 'layout mutation',
+): Promise<string> {
+  const deadline = Date.now() + HUD_RECONCILE_TIMEOUT_MS;
+  let lastSnapshot = '';
+  while (Date.now() < deadline) {
+    const panes = listCurrentWindowPanes(undefined, leaderPaneId);
+    const leader = panes.find((pane) => pane.paneId === leaderPaneId);
+    const hudPaneIds = findHudWatchPaneIds(panes, leaderPaneId, { leaderPaneId, sessionId });
+    const hud = hudPaneIds.length === 1
+      ? panes.find((pane) => pane.paneId === hudPaneIds[0])
+      : undefined;
+    lastSnapshot = JSON.stringify({ leader, hudPaneIds, hud });
+    if (
+      leader
+      && hud
+      && hud.paneId !== oldHudPaneId
+      && hud.paneTop === (leader.paneBottom ?? -2) + 2
+      && hud.paneLeft === leader.paneLeft
+      && hud.paneWidth === leader.paneWidth
+    ) return hud.paneId;
+    await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+  }
+  throw new Error(`timed out waiting for automatic HUD topology reconciliation after ${operation}: ${lastSnapshot}`);
+}
+
+async function waitForRegisteredLayoutHooks(fixture: TempTmuxSessionFixture): Promise<void> {
+  const deadline = Date.now() + HUD_RECONCILE_TIMEOUT_MS;
+  let lastHooks = '';
+  while (Date.now() < deadline) {
+    const sessionHooks = fixture.run(['show-hooks', '-t', fixture.sessionName]);
+    const windowHooks = fixture.run(['show-hooks', '-w', '-t', fixture.leaderPaneId]);
+    lastHooks = `${sessionHooks}\n${windowHooks}`;
+    if (/^after-split-window\[/m.test(sessionHooks) && /^window-layout-changed\[/m.test(windowHooks)) return;
+    await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+  }
+  throw new Error(`timed out waiting for split and window layout hooks: ${lastHooks}`);
 }
 
 describe('createHudWatchPane real private-server split transaction', () => {
@@ -123,4 +172,140 @@ describe('createHudWatchPane real private-server split transaction', () => {
       await rm(workDir, { recursive: true, force: true });
     }
   });
+
+  it('recreates and rearms a HUD directly below its owner after another pane is split', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-layout-realtmux-'));
+    try {
+      await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+        const sessionId = `omx-hud-layout-${process.pid}`;
+        const omxEntry = join(process.cwd(), 'dist', 'cli', 'omx.js');
+        const hudCommand = [
+          'env',
+          'OMX_TMUX_HUD_OWNER=1',
+          `OMX_SESSION_ID=${quoteSh(sessionId)}`,
+          `OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)}`,
+          `OMX_ROOT=${quoteSh(workDir)}`,
+          quoteSh(process.execPath),
+          quoteSh(omxEntry),
+          'hud',
+          '--watch',
+        ].join(' ');
+        const oldHudPaneId = fixture.run([
+          'split-window', '-d', '-P', '-F', '#{pane_id}', '-v', '-l', '2',
+          '-t', fixture.leaderPaneId, hudCommand,
+        ]);
+        await waitForPaneReady(fixture, oldHudPaneId);
+
+        assert.equal(registerHudResizeHook(
+          oldHudPaneId,
+          fixture.leaderPaneId,
+          2,
+          {
+            cwd: workDir,
+            env: {
+              ...process.env,
+              ...fixture.env,
+              OMX_ENTRY_PATH: omxEntry,
+              OMX_STARTUP_CWD: process.cwd(),
+              OMX_SESSION_ID: sessionId,
+              OMX_ROOT: workDir,
+            },
+          },
+        ), true);
+        assert.match(fixture.run(['show-hooks', '-t', fixture.sessionName]), /^after-split-window\[/m);
+
+        fixture.run(['split-window', '-d', '-v', '-t', fixture.leaderPaneId, 'sleep 300']);
+        const newHudPaneId = await waitForReconciledHud(fixture.leaderPaneId, oldHudPaneId, sessionId);
+
+        assert.notEqual(newHudPaneId, oldHudPaneId);
+        assert.match(
+          fixture.run(['show-hooks', '-t', fixture.sessionName]),
+          /^after-split-window\[/m,
+          'one-shot split hook must be rearmed after reconciliation',
+        );
+        assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+      });
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  for (const mutation of ['join-pane', 'move-pane', 'swap-pane', 'select-layout'] as const) {
+    it(`reconciles HUD placement after ${mutation}`, async (t) => {
+      if (!skipUnlessPrivateRealTmux(t)) return;
+
+      const workDir = await mkdtemp(join(tmpdir(), `omx-hud-${mutation}-realtmux-`));
+      try {
+        await withTempTmuxSession({ serverLog: true }, async (fixture) => {
+          const sessionId = `omx-hud-${mutation}-${process.pid}`;
+          const omxEntry = join(process.cwd(), 'dist', 'cli', 'omx.js');
+          const peerPaneId = fixture.run([
+            'split-window', '-d', '-P', '-F', '#{pane_id}', '-h',
+            '-t', fixture.leaderPaneId, 'sleep 300',
+          ]);
+          const hudCommand = [
+            'env',
+            'OMX_TMUX_HUD_OWNER=1',
+            `OMX_SESSION_ID=${quoteSh(sessionId)}`,
+            `OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)}`,
+            `OMX_ROOT=${quoteSh(workDir)}`,
+            quoteSh(process.execPath),
+            quoteSh(omxEntry),
+            'hud',
+            '--watch',
+          ].join(' ');
+          const hudPaneId = fixture.run([
+            'split-window', '-d', '-P', '-F', '#{pane_id}', '-v', '-l', '2',
+            '-t', fixture.leaderPaneId, hudCommand,
+          ]);
+          await waitForPaneReady(fixture, peerPaneId);
+          await waitForPaneReady(fixture, hudPaneId);
+
+          assert.equal(registerHudResizeHook(
+            hudPaneId,
+            fixture.leaderPaneId,
+            2,
+            {
+              cwd: workDir,
+              env: {
+                ...process.env,
+                ...fixture.env,
+                OMX_ENTRY_PATH: omxEntry,
+                OMX_STARTUP_CWD: process.cwd(),
+                OMX_SESSION_ID: sessionId,
+                OMX_ROOT: workDir,
+              },
+            },
+          ), true);
+          await waitForRegisteredLayoutHooks(fixture);
+
+          if (mutation === 'join-pane' || mutation === 'move-pane') {
+            const sourcePaneId = fixture.run([
+              'new-window', '-d', '-P', '-F', '#{pane_id}',
+              '-t', fixture.sessionName, 'sleep 300',
+            ]);
+            fixture.run([mutation, '-d', '-v', '-s', sourcePaneId, '-t', fixture.leaderPaneId]);
+          } else if (mutation === 'swap-pane') {
+            fixture.run(['swap-pane', '-d', '-s', hudPaneId, '-t', peerPaneId]);
+          } else {
+            fixture.run(['select-layout', '-t', fixture.leaderPaneId, 'even-horizontal']);
+          }
+
+          const newHudPaneId = await waitForReconciledHud(
+            fixture.leaderPaneId,
+            hudPaneId,
+            sessionId,
+            mutation,
+          );
+          assert.notEqual(newHudPaneId, hudPaneId, `${mutation} must trigger HUD recreation`);
+          await waitForRegisteredLayoutHooks(fixture);
+          assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
+        });
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
+    });
+  }
 });
