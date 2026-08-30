@@ -175,6 +175,34 @@ function ensureHudResizeHook(
   }
 }
 
+function rearmHudResizeHookAfterConcurrentSkip(
+  cwd: string,
+  currentPaneId: string | undefined,
+  owner: HudPaneOwner,
+  listPanes: (currentPaneId?: string) => TmuxPaneSnapshot[],
+  deps: ReconcileHudForPromptSubmitDeps,
+): void {
+  if (!currentPaneId) return;
+  try {
+    const panes = listPanes(currentPaneId);
+    const hudPaneIds = [
+      ...findHudWatchPaneIds(panes, currentPaneId, owner),
+      ...findLegacyFocusedHudWatchPaneIds(panes, currentPaneId),
+    ];
+    const hudPane = panes.find((pane) => pane.paneId === hudPaneIds[0]);
+    if (!hudPane) return;
+    ensureHudResizeHook(
+      hudPane.paneId,
+      currentPaneId,
+      hudPane.paneHeight ?? HUD_TMUX_HEIGHT_LINES,
+      cwd,
+      deps,
+    );
+  } catch {
+    // Best effort: a concurrent reconciliation still owns the mutation lock.
+  }
+}
+
 function hasCompleteGeometry(pane: TmuxPaneSnapshot): boolean {
   return (
     typeof pane.paneLeft === 'number'
@@ -421,6 +449,20 @@ export async function reconcileHudForPromptSubmit(
   const createPane = deps.createHudWatchPane ?? ((hudCwd, hudCmd, options) => createHudWatchPane(hudCwd, hudCmd, options));
   const killPane = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
   const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
+  const currentPaneId = env.TMUX_PANE?.trim();
+  const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
+  const equivalentSessionIds = [
+    resolvedSessionId,
+    env.OMX_SESSION_ID?.trim(),
+    ...(deps.sessionIds ?? []),
+  ]
+    .map((sessionId) => sessionId?.trim() ?? '')
+    .filter((sessionId, index, sessionIds) => sessionId !== '' && sessionIds.indexOf(sessionId) === index);
+  const owner = {
+    sessionId: resolvedSessionId,
+    sessionIds: equivalentSessionIds,
+    leaderPaneId: currentPaneId,
+  };
 
   // Layout-change hooks for every OMX pane in a window may fire together. Keep
   // tmux layout mutations serialized, but wait briefly for a fresh holder so a
@@ -436,6 +478,7 @@ export async function reconcileHudForPromptSubmit(
     )
     : null;
   if (lockDirReady && !lock) {
+    rearmHudResizeHookAfterConcurrentSkip(cwd, currentPaneId, owner, listPanes, deps);
     return {
       status: 'skipped_concurrent',
       paneId: null,
@@ -445,16 +488,6 @@ export async function reconcileHudForPromptSubmit(
   }
 
   try {
-
-  const currentPaneId = env.TMUX_PANE?.trim();
-  const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
-  const equivalentSessionIds = [
-    resolvedSessionId,
-    env.OMX_SESSION_ID?.trim(),
-    ...(deps.sessionIds ?? []),
-  ]
-    .map((sessionId) => sessionId?.trim() ?? '')
-    .filter((sessionId, index, sessionIds) => sessionId !== '' && sessionIds.indexOf(sessionId) === index);
   let panes = listPanes(currentPaneId);
 
   // Reclaim orphaned HUD panes left behind by a destroyed leader before deciding
@@ -487,11 +520,6 @@ export async function reconcileHudForPromptSubmit(
     panes = panes.filter((pane) => !reapedPaneIdSet.has(pane.paneId));
   }
 
-  const owner = {
-    sessionId: resolvedSessionId,
-    sessionIds: equivalentSessionIds,
-    leaderPaneId: currentPaneId,
-  };
   const hudPaneIds = [
     ...findHudWatchPaneIds(panes, currentPaneId, owner),
     ...findLegacyFocusedHudWatchPaneIds(panes, currentPaneId),

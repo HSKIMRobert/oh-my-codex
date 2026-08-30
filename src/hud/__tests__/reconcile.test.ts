@@ -89,7 +89,7 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.equal(resized.length, 0);
   });
 
-  it('skips concurrent reconciliation for a stale lock whose holder pid is still live without mutating panes or lock metadata', async () => {
+  it('re-arms the existing HUD hook when a live holder blocks reconciliation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-reconcile-live-lock-'));
     try {
       const lockPath = await writeHudReconcileLock(cwd, {
@@ -102,6 +102,7 @@ describe('reconcileHudForPromptSubmit', () => {
       let killed = false;
       let created = false;
       let resized = false;
+      const registered: Array<{ hudPaneId: string; leaderPaneId: string | undefined; heightLines: number }> = [];
 
       const result = await reconcileHudForPromptSubmit(cwd, {
         env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-a', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
@@ -112,7 +113,15 @@ describe('reconcileHudForPromptSubmit', () => {
         },
         listCurrentWindowPanes: () => {
           listed = true;
-          return [{ paneId: '%1', currentCommand: 'codex', startCommand: 'codex' }];
+          return [
+            { paneId: '%1', currentCommand: 'codex', startCommand: 'codex' },
+            {
+              paneId: '%9',
+              currentCommand: 'node',
+              startCommand: "exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch",
+              paneHeight: 4,
+            },
+          ];
         },
         killTmuxPane: () => {
           killed = true;
@@ -126,15 +135,20 @@ describe('reconcileHudForPromptSubmit', () => {
           resized = true;
           return true;
         },
+        registerHudResizeHook: (hudPaneId, leaderPaneId, heightLines) => {
+          registered.push({ hudPaneId, leaderPaneId, heightLines });
+          return true;
+        },
         resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
       });
 
       assert.equal(result.status, 'skipped_concurrent');
       assert.equal(result.paneId, null);
-      assert.equal(listed, false);
+      assert.equal(listed, true);
       assert.equal(killed, false);
       assert.equal(created, false);
       assert.equal(resized, false);
+      assert.deepEqual(registered, [{ hudPaneId: '%9', leaderPaneId: '%1', heightLines: 4 }]);
       assert.deepEqual(await readLockOwner(lockPath), originalOwner);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -151,17 +165,20 @@ describe('reconcileHudForPromptSubmit', () => {
       });
       const originalOwner = await readLockOwner(lockPath);
 
+      let listed = false;
       const result = await reconcileHudForPromptSubmit(cwd, {
         env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-a', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
         nowMs: () => 20_000,
         isProcessLive: () => null,
         listCurrentWindowPanes: () => {
-          assert.fail('unknown liveness must not enter reconciliation');
+          listed = true;
+          return [{ paneId: '%1', currentCommand: 'codex', startCommand: 'codex' }];
         },
         resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
       });
 
       assert.equal(result.status, 'skipped_concurrent');
+      assert.equal(listed, true);
       assert.deepEqual(await readLockOwner(lockPath), originalOwner);
     } finally {
       await rm(cwd, { recursive: true, force: true });
