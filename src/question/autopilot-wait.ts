@@ -5,7 +5,7 @@ import {
   isAutopilotSupervisingChild,
   normalizeAutopilotPhase,
 } from '../autopilot/fsm.js';
-import { getStateFilePath } from '../mcp/state-paths.js';
+import { getBaseStateDir, getStateFilePath } from '../mcp/state-paths.js';
 import { writeStateFile } from '../state/operations.js';
 import { sleep } from '../utils/sleep.js';
 import type { DeepInterviewQuestionEnforcementState } from './deep-interview.js';
@@ -69,7 +69,7 @@ async function readAutopilotState(cwd: string, sessionId?: string): Promise<Reco
 
 async function writeAutopilotState(cwd: string, sessionId: string | undefined, state: Record<string, unknown>): Promise<void> {
   const statePath = getStateFilePath(AUTOPILOT_STATE_FILE, cwd, sessionId);
-  await writeStateFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  await writeStateFile(statePath, `${JSON.stringify(state, null, 2)}\n`, getBaseStateDir(cwd));
 }
 
 function lockOwnerToken(): string {

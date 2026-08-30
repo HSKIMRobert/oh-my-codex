@@ -10,6 +10,10 @@ import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { cancelRalplanConsensus, isCompletedAdvisoryCatchRecovery, runRalplanConsensus } from '../runtime.js';
 import { readCurrentRalplanAdvisory } from '../advisory.js';
+import {
+  __setRalplanAdvisoryRecoveryHooksForTests,
+  verifyAdvisoryCatchRecovery,
+} from '../runtime-advisory-lifecycle.js';
 
 function sessionStatePath(cwd: string, sessionId: string): string {
   return getStatePath('ralplan', cwd, sessionId);
@@ -136,11 +140,46 @@ describe('ralplan runtime', () => {
   });
 
   afterEach(() => {
+    __setRalplanAdvisoryRecoveryHooksForTests({});
     for (const key of ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const) {
       const value = savedOmxEnv[key];
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  });
+
+  it('preserves the primary failure when Advisory reconciliation verification throws', async () => {
+    const primary = new Error('primary');
+    const recovery = new Error('reconcile failed');
+    __setRalplanAdvisoryRecoveryHooksForTests({ reconcile: async () => { throw recovery; } });
+    await assert.rejects(
+      verifyAdvisoryCatchRecovery({ cwd: '/tmp', sessionId: 'session-a', generationId: 'generation-a', primaryError: primary }),
+      (error: unknown) => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === recovery,
+    );
+  });
+
+  it('preserves the primary failure when Advisory binding verification throws', async () => {
+    const primary = new Error('primary');
+    const bindingError = new Error('binding read failed');
+    __setRalplanAdvisoryRecoveryHooksForTests({
+      reconcile: async () => ({ corruption: null, fence: { state: 'closed' }, journal: { outcome: 'approved' } } as never),
+      readBinding: async () => { throw bindingError; },
+    });
+    await assert.rejects(
+      verifyAdvisoryCatchRecovery({ cwd: '/tmp', sessionId: 'session-a', generationId: 'generation-a', primaryError: primary }),
+      (error: unknown) => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === bindingError,
+    );
+  });
+
+  it('distinguishes valid approved catch recovery from explicit absence', async () => {
+    const input = { cwd: '/tmp', sessionId: 'session-a', generationId: 'generation-a', primaryError: new Error('primary') };
+    __setRalplanAdvisoryRecoveryHooksForTests({
+      reconcile: async () => ({ corruption: null, fence: { state: 'closed' }, journal: { outcome: 'approved' } } as never),
+      readBinding: async () => ({ mode: 'ralplan', session_id: 'session-a', workflow_variant: 'advisory', advisory_generation_id: 'generation-a', active: false }),
+    });
+    assert.equal(await verifyAdvisoryCatchRecovery(input), true);
+    __setRalplanAdvisoryRecoveryHooksForTests({ reconcile: async () => null, readBinding: async () => null });
+    assert.equal(await verifyAdvisoryCatchRecovery(input), false);
   });
 
 

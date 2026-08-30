@@ -1,415 +1,51 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants as fsConstants } from 'node:fs';
-import { appendFile, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
 import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
-
-export const RALPLAN_ADVISORY_SCHEMA_VERSION = 1;
-export type AdvisoryFenceState = 'pending_closeout' | 'recovery_required' | 'closed' | 'abandoned' | 'released';
-export type AdvisoryOutcome = 'approved' | 'exhausted' | 'rejected' | 'failed' | 'cancelled' | 'abandoned';
-export type AdvisoryIntent = 'execute' | 'replan' | 'new_advisory' | 'abandon' | 'unrelated';
-export type AdvisoryIntegrityStatus = 'proven' | 'unproven';
-
-const JOURNAL_STEPS = [
-  'session_mode', 'root_mode', 'session_skill', 'root_skill',
-  'post_digest', 'journal_commit', 'fence_terminal',
-] as const;
-type JournalStep = (typeof JOURNAL_STEPS)[number];
-
-type AdvisoryEventType =
-  | 'ralplan_advisory_fence_created'
-  | 'ralplan_advisory_closeout_step'
-  | 'ralplan_advisory_closeout_reconciled'
-  | 'ralplan_advisory_closeout_committed'
-  | 'ralplan_advisory_fence_closed'
-  | 'ralplan_advisory_digest_mismatch';
-
-export function ralplanAdvisoryEventsPath(cwd: string, now = new Date()): string {
-  return join(dirname(getBaseStateDir(cwd)), 'logs', `ralplan-advisory-${now.toISOString().slice(0, 10)}.jsonl`);
-}
-
-async function emitAdvisoryEvent(cwd: string, event: {
-  type: AdvisoryEventType;
-  generationId: string;
-  iteration?: number;
-  transition: string;
-  checkpoint: string;
-  reason: string;
-  path: string;
-  digest?: string;
-}): Promise<void> {
-  const path = ralplanAdvisoryEventsPath(cwd);
-  await mkdir(dirname(path), { recursive: true }).catch(() => {});
-  await appendFile(path, `${JSON.stringify({
-    timestamp: new Date().toISOString(),
-    type: event.type,
-    generation_id: event.generationId,
-    ...(event.iteration !== undefined ? { iteration: event.iteration } : {}),
-    state_transition: event.transition,
-    checkpoint: event.checkpoint,
-    reason: event.reason,
-    relative_path: relative(cwd, event.path),
-    ...(event.digest ? { digest_prefix: event.digest.slice(0, 12) } : {}),
-  })}\n`).catch(() => {});
-}
-
-export interface AdvisoryActivation {
-  schema_version: 1;
-  generation_id: string;
-  predecessor_generation_id?: string;
-  canonical_cwd: string;
-  session_id: string;
-  root_thread_id: string;
-  activation_turn_id: string;
-  activation_prompt_sha256?: string;
-  created_at: string;
-}
-
-export interface AdvisoryFence extends AdvisoryActivation {
-  state: AdvisoryFenceState;
-  closing_turn_id: string;
-  iteration: number;
-  iteration_id?: string;
-  plan_manifest_sha256?: string;
-  architect_review_sha256?: string;
-  critic_review_sha256?: string;
-  evidence_bundle_sha256?: string;
-  outcome?: AdvisoryOutcome;
-  integrity_status?: AdvisoryIntegrityStatus;
-  release_turn_id?: string;
-  release_thread_id?: string;
-  release_prompt_sha256?: string;
-  requested_lane?: string;
-  authority_kind?: 'new_root_user_execution_request';
-  updated_at: string;
-  sequence: number;
-  previous_event_sha256?: string;
-}
-
-interface AdvisoryCurrentPointer {
-  schema_version: 1;
-  generation_id: string;
-  predecessor_generation_id?: string;
-  session_id: string;
-  canonical_cwd: string;
-  updated_at: string;
-}
-
-interface AdvisoryRolloverIntent {
-  schema_version: 1;
-  predecessor_generation_id?: string;
-  generation_id: string;
-  session_id: string;
-  root_thread_id: string;
-  activation_turn_id: string;
-  activation_prompt_sha256?: string;
-  canonical_cwd: string;
-  created_at: string;
-}
-
-function valuesMatch(actual: Record<string, unknown>, expected: Record<string, unknown>): boolean {
-  return Object.entries(expected).every(([key, value]) => JSON.stringify(actual[key]) === JSON.stringify(value));
-}
-
-function hasActiveRalplanSkill(value: Record<string, unknown>, sessionId?: string): boolean {
-  const entries = Array.isArray(value.active_skills) ? value.active_skills : [];
-  if (entries.some((entry) => {
-    const record = object(entry);
-    return record?.skill === 'ralplan' && record.active !== false
-      && (!sessionId || record.session_id === sessionId || record.session_id === undefined);
-  })) return true;
-  return value.active === true && value.skill === 'ralplan'
-    && (!sessionId || value.session_id === sessionId || value.session_id === undefined);
-}
-
-async function closeoutStepPostcondition(
-  cwd: string,
-  sessionId: string,
-  step: Extract<JournalStep, 'session_mode' | 'root_mode' | 'session_skill' | 'root_skill'>,
-  patch: Record<string, unknown> | undefined,
-  expectedSkill?: Record<string, unknown> | null,
-): Promise<boolean> {
-  if (!patch) return true;
-  const base = getBaseStateDir(cwd);
-  if (step === 'session_mode' || step === 'root_mode') {
-    const path = step === 'session_mode'
-      ? join(base, 'sessions', sessionId, 'ralplan-state.json')
-      : join(base, 'ralplan-state.json');
-    const value = await readStrictJson(path);
-    if (step === 'root_mode' && value === null) return true;
-    if (step === 'root_mode' && value && typeof value.session_id === 'string' && value.session_id !== sessionId) return true;
-    if (step === 'root_mode') {
-      return Boolean(value && valuesMatch(value, patch));
-    }
-    return Boolean(value && valuesMatch(value, patch));
-  }
-  const path = step === 'session_skill'
-    ? join(base, 'sessions', sessionId, 'skill-active-state.json')
-    : join(base, 'skill-active-state.json');
-  const value = await readStrictJson(path);
-  if (expectedSkill !== undefined) return JSON.stringify(value) === JSON.stringify(expectedSkill);
-  return value === null || !hasActiveRalplanSkill(value, sessionId);
-}
-
-export interface AdvisoryJournal {
-  schema_version: 1;
-  generation_id: string;
-  outcome: AdvisoryOutcome;
-  integrity_status: AdvisoryIntegrityStatus;
-  evidence_bundle_sha256?: string;
-  terminal_mode_updates?: Record<string, unknown>;
-  terminal_skill_updates?: { session_skill?: Record<string, unknown> | null; root_skill?: Record<string, unknown> | null };
-  terminal_timestamp: string;
-  phase: 'prepared' | 'committed';
-  steps: Record<JournalStep, 'pending' | 'applied'>;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AdvisoryAdminEvent {
-  schema_version: 1;
-  action: 'abandon';
-  generation_id: string;
-  session_id: string;
-  root_thread_id: string;
-  turn_id: string;
-  prior_fence_sha256: string;
-  prior_journal_sha256?: string;
-  created_at: string;
-}
-
-export interface AdvisoryProjection {
-  activation: AdvisoryActivation;
-  fence: AdvisoryFence | null;
-  journal: AdvisoryJournal | null;
-  admin_event?: AdvisoryAdminEvent | null;
-  /** @deprecated Compatibility diagnostic only. Always false; never used for enforcement. */
-  denyProductWrites: boolean;
-  corruption: string | null;
-}
+import {
+  JOURNAL_STEPS,
+  classifyAdvisoryPrompt,
+  validateAdvisoryInactiveState,
+  type AdvisoryActivation,
+  type AdvisoryAdminEvent,
+  type AdvisoryCurrentPointer,
+  type AdvisoryFence,
+  type AdvisoryFenceState,
+  type AdvisoryIntent,
+  type AdvisoryIntegrityStatus,
+  type AdvisoryJournal,
+  type AdvisoryOutcome,
+  type AdvisoryProjection,
+  type AdvisoryRolloverIntent,
+  type JournalStep,
+} from './advisory-contract.js';
+export * from './advisory-contract.js';
+import {
+  activationValid, committedJournalMatchesFence, completeLifecycleBinding, fenceStateSemanticsValid,
+  fenceTransitionSemanticsValid, fenceValid, journalValid, releasedEventValid,
+} from './advisory-lifecycle-validation.js';
+import {
+  advisoryEventsPath as ralplanAdvisoryEventsPath,
+  advisoryGenerationDir as generationDir,
+  advisoryObject as object,
+  advisoryRoot,
+  canonicalAdvisoryCwd as canonicalCwd,
+  emitAdvisoryEvent,
+  readAdvisoryJson as readStrictJson,
+  safeAdvisoryId as safeId,
+  syncAdvisoryDirectory as syncDirectory,
+  withAdvisoryCurrentLock as withRalplanAdvisoryCurrentLock,
+  withAdvisoryGenerationLock as withGenerationLock,
+  writeAdvisoryAtomic as writeAtomic,
+  writeAdvisoryExclusive as writeExclusive,
+} from './advisory-storage.js';
+export { ralplanAdvisoryEventsPath, withRalplanAdvisoryCurrentLock };
+import { closeoutStepPostcondition } from './advisory-postconditions.js';
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
-}
-
-function safeId(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && value !== '.' && value !== '..';
-}
-
-function object(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
-
-async function syncDirectory(path: string): Promise<void> {
-  if (process.platform === 'win32') return;
-  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
-  try { await handle.sync(); } finally { await handle.close(); }
-}
-
-async function writeAtomic(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const payload = `${JSON.stringify(value, null, 2)}\n`;
-  const temp = `${path}.tmp.${process.pid}.${randomUUID()}`;
-  const handle = await open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-  try { await handle.writeFile(payload); await handle.sync(); } finally { await handle.close(); }
-  await rename(temp, path);
-  await syncDirectory(dirname(path));
-}
-
-async function writeExclusive(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-  try { await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`); await handle.sync(); } finally { await handle.close(); }
-  await syncDirectory(dirname(path));
-}
-
-async function readStrictJson(path: string): Promise<Record<string, unknown> | null> {
-  let handle: Awaited<ReturnType<typeof open>>;
-  try { handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
-  try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1 || before.size > 1024 * 1024) throw new Error('invalid_file');
-    const bytes = await handle.readFile();
-    const after = await handle.stat();
-    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || bytes.length !== before.size) {
-      throw new Error('file_changed_during_read');
-    }
-    const parsed = JSON.parse(bytes.toString('utf8'));
-    const record = object(parsed);
-    if (!record) throw new Error('invalid_json_object');
-    return record;
-  } finally { await handle.close(); }
-}
-
-function advisoryRoot(cwd: string, sessionId: string): string {
-  if (!safeId(sessionId)) throw new Error('ralplan_advisory_session_id_invalid');
-  return join(getBaseStateDir(cwd), 'sessions', sessionId, 'ralplan-advisory');
-}
-
-function generationDir(cwd: string, sessionId: string, generationId: string): string {
-  if (!safeId(generationId)) throw new Error('ralplan_advisory_generation_id_invalid');
-  return join(advisoryRoot(cwd, sessionId), generationId);
-}
-
-function activationValid(value: Record<string, unknown>, cwd: string, sessionId: string, generationId: string): boolean {
-  return value.schema_version === 1 && value.generation_id === generationId && value.session_id === sessionId
-    && value.canonical_cwd === cwd && typeof value.root_thread_id === 'string' && safeId(value.root_thread_id)
-    && typeof value.activation_turn_id === 'string' && safeId(value.activation_turn_id)
-    && typeof value.created_at === 'string'
-    && (value.activation_prompt_sha256 === undefined
-      || (typeof value.activation_prompt_sha256 === 'string' && /^[a-f0-9]{64}$/i.test(value.activation_prompt_sha256)))
-    && (value.predecessor_generation_id === undefined || (typeof value.predecessor_generation_id === 'string' && safeId(value.predecessor_generation_id)));
-}
-
-function fenceValid(value: Record<string, unknown>, activation: AdvisoryActivation): boolean {
-  const states: AdvisoryFenceState[] = ['pending_closeout', 'recovery_required', 'closed', 'abandoned', 'released'];
-  return activationValid(value, activation.canonical_cwd, activation.session_id, activation.generation_id)
-    && states.includes(value.state as AdvisoryFenceState)
-    && typeof value.closing_turn_id === 'string' && safeId(value.closing_turn_id)
-    && Number.isSafeInteger(value.iteration) && Number(value.iteration) > 0
-    && Number.isSafeInteger(value.sequence) && Number(value.sequence) >= 0
-    && typeof value.updated_at === 'string';
-}
-
-const FENCE_INHERITED_FIELDS = [
-  'schema_version', 'generation_id', 'predecessor_generation_id', 'canonical_cwd', 'session_id',
-  'root_thread_id', 'activation_turn_id', 'created_at', 'closing_turn_id', 'iteration',
-  'activation_prompt_sha256',
-  'iteration_id', 'plan_manifest_sha256', 'architect_review_sha256', 'critic_review_sha256',
-  'evidence_bundle_sha256',
-] as const;
-
-function fenceStateSemanticsValid(fence: AdvisoryFence): boolean {
-  if (fence.state === 'pending_closeout') return fence.outcome === undefined && fence.integrity_status === undefined;
-  if (fence.state === 'recovery_required') return fence.integrity_status === 'unproven' && fence.outcome !== undefined;
-  if (fence.state === 'closed') {
-    return fence.outcome === 'approved' && fence.integrity_status === 'proven'
-      && [fence.iteration_id, fence.plan_manifest_sha256, fence.architect_review_sha256,
-        fence.critic_review_sha256, fence.evidence_bundle_sha256]
-        .every((value) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value));
-  }
-  if (fence.state === 'abandoned') return fence.outcome !== undefined && fence.outcome !== 'approved'
-    && (fence.integrity_status === 'proven' || fence.integrity_status === 'unproven');
-  return false;
-}
-
-function fenceTransitionSemanticsValid(prior: AdvisoryFence, event: AdvisoryFence): boolean {
-  if (!FENCE_INHERITED_FIELDS.every((field) => JSON.stringify(event[field]) === JSON.stringify(prior[field]))) return false;
-  return fenceStateSemanticsValid(event);
-}
-
-function releasedEventValid(
-  prior: AdvisoryFence,
-  event: AdvisoryFence,
-  journal: Record<string, unknown> | null,
-): boolean {
-  if (!['closed', 'abandoned'].includes(prior.state)) return false;
-  if (!FENCE_INHERITED_FIELDS.every((field) => JSON.stringify(event[field]) === JSON.stringify(prior[field]))) return false;
-  if (prior.state === 'closed' && !committedJournalMatchesFence(
-    journal as AdvisoryJournal | null, prior, true,
-  )) return false;
-  if (prior.state === 'closed' && !fenceStateSemanticsValid(prior)) return false;
-  return event.authority_kind === 'new_root_user_execution_request'
-    && typeof event.release_turn_id === 'string' && safeId(event.release_turn_id)
-    && typeof event.release_thread_id === 'string' && safeId(event.release_thread_id)
-    && typeof event.release_prompt_sha256 === 'string' && /^[a-f0-9]{64}$/i.test(event.release_prompt_sha256)
-    && typeof event.requested_lane === 'string' && event.requested_lane.trim().length > 0;
-}
-
-function committedJournalMatchesFence(
-  journal: AdvisoryJournal | null,
-  fence: AdvisoryFence,
-  requireCompleteSteps = false,
-): boolean {
-  return Boolean(journal && journal.phase === 'committed'
-    && journal.outcome === fence.outcome
-    && journal.integrity_status === fence.integrity_status
-    && journal.evidence_bundle_sha256 === fence.evidence_bundle_sha256
-    && (!requireCompleteSteps || JOURNAL_STEPS.every((step) => journal.steps[step] === 'applied')));
-}
-
-function journalValid(value: Record<string, unknown>, generationId: string): boolean {
-  const outcome = ['approved', 'exhausted', 'rejected', 'failed', 'cancelled', 'abandoned'].includes(String(value.outcome));
-  const steps = object(value.steps);
-  const skillUpdates = value.terminal_skill_updates === undefined ? null : object(value.terminal_skill_updates);
-  return value.schema_version === 1 && value.generation_id === generationId && outcome
-    && (value.integrity_status === 'proven' || value.integrity_status === 'unproven')
-    && (value.phase === 'prepared' || value.phase === 'committed')
-    && typeof value.terminal_timestamp === 'string' && Number.isFinite(Date.parse(value.terminal_timestamp))
-    && (value.terminal_mode_updates === undefined || object(value.terminal_mode_updates) !== null)
-    && (value.terminal_mode_updates === undefined ? value.terminal_skill_updates === undefined : (skillUpdates !== null
-      && ['session_skill', 'root_skill'].every((key) => Object.prototype.hasOwnProperty.call(skillUpdates, key)
-        && (skillUpdates[key] === null || object(skillUpdates[key]) !== null))))
-    && Boolean(steps) && JOURNAL_STEPS.every((step) => steps?.[step] === 'pending' || steps?.[step] === 'applied');
-}
-
-function completeLifecycleBinding(lifecycle: AdvisoryReviewLifecycle | undefined): lifecycle is AdvisoryReviewLifecycle {
-  return Boolean(lifecycle?.complete === true && lifecycle.sequence_valid === true
-    && Number.isSafeInteger(lifecycle.iteration) && lifecycle.iteration > 0
-    && [lifecycle.iteration_id, lifecycle.plan_manifest_sha256, lifecycle.architect_review_sha256,
-      lifecycle.critic_review_sha256, lifecycle.evidence_bundle_sha256]
-      .every((value) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value)));
-}
-
-async function canonicalCwd(cwd: string): Promise<string> {
-  return realpath(cwd);
-}
-
-async function acquireAdvisoryLock(lockPath: string, directory: string, heldError: string): Promise<Awaited<ReturnType<typeof open>>> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const handle = await open(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-      await handle.writeFile(`${JSON.stringify({ schema_version: 1, pid: process.pid, created_at: new Date().toISOString() })}\n`);
-      await handle.sync();
-      await syncDirectory(directory);
-      return handle;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const owner = await readStrictJson(lockPath).catch(() => null);
-      const pid = owner?.schema_version === 1 && Number.isSafeInteger(owner.pid) && Number(owner.pid) > 0
-        ? Number(owner.pid)
-        : null;
-      if (attempt > 0 || pid === null) throw new Error(heldError);
-      try {
-        process.kill(pid, 0);
-        throw new Error(heldError);
-      } catch (probeError) {
-        if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
-      }
-      await rm(lockPath, { force: false });
-      await syncDirectory(directory);
-    }
-  }
-  throw new Error(heldError);
-}
-
-async function withCurrentLock<T>(root: string, work: () => Promise<T>): Promise<T> {
-  await mkdir(root, { recursive: true });
-  const lockPath = join(root, 'current.lock');
-  const lock = await acquireAdvisoryLock(lockPath, root, 'ralplan_advisory_current_lock_held');
-  try { return await work(); }
-  finally { await lock.close().catch(() => {}); await rm(lockPath, { force: true }); await syncDirectory(root).catch(() => {}); }
-}
-
-export async function withRalplanAdvisoryCurrentLock<T>(
-  cwd: string,
-  sessionId: string,
-  work: () => Promise<T>,
-): Promise<T> {
-  const canonical = await canonicalCwd(cwd);
-  return withCurrentLock(advisoryRoot(canonical, sessionId), work);
-}
-
-async function withGenerationLock<T>(cwd: string, sessionId: string, generationId: string, work: () => Promise<T>): Promise<T> {
-  const dir = generationDir(await canonicalCwd(cwd), sessionId, generationId);
-  const lockPath = join(dir, 'generation.lock');
-  const lock = await acquireAdvisoryLock(lockPath, dir, 'ralplan_advisory_generation_lock_held');
-  try { return await work(); }
-  finally { await lock.close().catch(() => {}); await rm(lockPath, { force: true }); await syncDirectory(dir).catch(() => {}); }
 }
 
 interface AdvisoryActivationInput {
@@ -457,7 +93,7 @@ export async function prepareRalplanAdvisoryActivationInternal(input: Omit<Advis
   const cwd = await canonicalCwd(input.cwd);
   if (![input.sessionId, input.rootThreadId, input.activationTurnId].every(safeId)) throw new Error('ralplan_advisory_identity_missing');
   const root = advisoryRoot(cwd, input.sessionId);
-  return withCurrentLock(root, () => prepareActivationIntentUnlocked(cwd, root, input));
+  return withRalplanAdvisoryCurrentLock(cwd, input.sessionId, () => prepareActivationIntentUnlocked(cwd, root, input));
 }
 
 export async function readAuthorizedPendingRalplanActivation(input: {
@@ -493,7 +129,7 @@ async function commitBoundActivationIntent(
   beforeCommit?: () => void | Promise<void>,
 ): Promise<AdvisoryActivation> {
   const root = advisoryRoot(cwd, sessionId);
-  return withCurrentLock(root, async () => {
+  return withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => {
     const intentPath = join(root, 'rollover-intent.json');
     const currentIntent = await readStrictJson(intentPath);
     if (!currentIntent || JSON.stringify(currentIntent) !== JSON.stringify(pending)) {
@@ -1218,55 +854,6 @@ export async function reconcileRalplanAdvisory(
   });
 }
 
-const EXECUTION_VERBS = /\b(?:implement(?:á|a|e|ar)?|fix(?:e|ear|á)?|correg(?:í|ir|i)|ejecut(?:á|a|e|ar)|corr(?:é|e|er)|build|ship|deploy|aplic(?:á|a|ar)|cre(?:á|a|ar))\b/iu;
-const EXECUTION_ANCHOR = /(?:\b(?:issue|bug|test|tests|command|comando|task|tarea|plan|prd|spec|archivo|file|path|ruta)\b\s*(?:#?\w+|[.:/-])|(?:^|\s)(?:\.\.?\/|\/)[^\s]+|`[^`]+`|#[0-9]+)/iu;
-const QUESTION = /\?|\b(?:qué|como|cómo|cuál|cual|por qué|porqué|status|estado|explic(?:á|a)|revis(?:á|a)|opin(?:á|a))\b/iu;
-const FUTURE_OR_CONDITIONAL = /\b(?:si|cuando|después|luego|podr(?:ía|ias|íamos)|deber(?:ía|ias|íamos)|quiero que eventualmente|más adelante)\b/iu;
-const NEGATION = /\b(?:no|nunca|sin)\s+(?:implement|ejecut|corr|build|ship|deploy|aplic|cre)/iu;
-const ENGLISH_NEGATION = /\b(?:do\s+not|don't|never|without)\s+(?:implement|execute|run|build|ship|deploy|apply|create)/iu;
-const DEFERRED_EXECUTION = /\b(?:after\s+approval|when\s+ready|later|eventually|despu[eé]s\s+de\s+aprobar|cuando\s+est[eé]\s+listo|m[aá]s\s+adelante)\b/iu;
-const CLAUSE_NEGATION = /\b(?:pero|but)\b[^.!?;]*(?:no\s+(?:lo\s+)?(?:ejecut|implement)|do\s+not\s+(?:execute|implement|run))/iu;
-const MODAL_SPANISH = /\b(?:pod(?:és|es|rías?|ria|ría)|deber(?:ías?|ias?|ía)|quer(?:és|es|rías?|ria|ría)|sería\s+posible)\b/iu;
-const CLAUSE_CONSERVATIVE_NEGATION = /\b(?:no|nunca|sin|not|never|without|cannot|can't|won't|don't)\b/iu;
-const ENGLISH_MODAL_QUESTION = /(?:\b(?:can|could|would|will)\s+you\b|\b(?:should|can|could|would)\s+(?:i|we)\b|\bwhether\b|\basking\s+(?:if|whether)\b)/iu;
-const META_OR_DOCUMENTAL_DIRECTIVE = /^\s*(?:(?:por\s+favor|please)\s+)?(?:consider(?:á|a|ar)?|copi(?:á|a|ar)|copy|confirm(?:á|a|ar)?|quote|cit(?:á|a|ar)|document(?:á|a|ar)?|traduc(?:í|ir)|translate)\b/iu;
-const QUOTED_OR_CODE_DIRECTIVE = /^\s*(?:>|```|~~~|[`"“'‘])|(?:```|~~~)[\s\S]*(?:implement|execute|fix|ejecut|correg)/iu;
-const PRIMARY_EXECUTION_DIRECTIVE = /^\s*(?:(?:por\s+favor|please)\s+)?(?:implement(?:á|a|e|ar)?|fix(?:e|ear|á)?|correg(?:í|ir|i)|ejecut(?:á|a|e|ar)|corr(?:é|e|er)|build|ship|deploy|aplic(?:á|a|ar)|cre(?:á|a|ar))\b/iu;
-
-export type RalplanAdvisoryInvocationKind = 'none' | 'valid' | 'invalid';
-
-/** Canonical parser for direct `$ralplan --advisory` invocations. */
-export function parseRalplanAdvisoryInvocation(text: string): RalplanAdvisoryInvocationKind {
-  const tokens = text.trim().split(/\s+/u);
-  if (!/^\$(?:oh-my-codex:)?ralplan$/iu.test(tokens[0] ?? '')) return 'none';
-  const arguments_ = tokens.slice(1);
-  const hasAdvisoryLikeToken = arguments_.some((token) => token.toLowerCase().startsWith('--advisory'));
-  if (!hasAdvisoryLikeToken) return 'none';
-  return arguments_.every((token) => {
-    if (/^--(?:advisory|interactive|deliberate)$/iu.test(token)) return true;
-    return !token.startsWith('-') && !token.startsWith('$');
-  }) ? 'valid' : 'invalid';
-}
-
-export function isDirectRalplanAdvisoryInvocation(text: string): boolean {
-  return parseRalplanAdvisoryInvocation(text) === 'valid';
-}
-
-export function classifyAdvisoryPrompt(prompt: string): AdvisoryIntent {
-  const text = prompt.trim();
-  if (!text) return 'unrelated';
-  if (META_OR_DOCUMENTAL_DIRECTIVE.test(text) || QUOTED_OR_CODE_DIRECTIVE.test(text)
-    || QUESTION.test(text) || FUTURE_OR_CONDITIONAL.test(text) || MODAL_SPANISH.test(text) || ENGLISH_MODAL_QUESTION.test(text)
-    || CLAUSE_CONSERVATIVE_NEGATION.test(text) || NEGATION.test(text)
-    || ENGLISH_NEGATION.test(text) || DEFERRED_EXECUTION.test(text) || CLAUSE_NEGATION.test(text)) return 'unrelated';
-  if (/^\s*(?:abandon(?:á|a|ar)?|cancel(?:á|a|ar)?)\s+(?:el\s+)?(?:ralplan|advisory|plan)/iu.test(text)) return 'abandon';
-  if (isDirectRalplanAdvisoryInvocation(text)
-    || /^\s*(?:inici(?:á|a|ar)|cre(?:á|a|ar)|hac(?:é|e|er))\s+(?:un\s+)?(?:new advisory|nuevo advisory|nueva planificación advisory)\b/iu.test(text)) return 'new_advisory';
-  if (/^\s*(?:replan\b|replanific(?:á|a|ar)(?:\s|$)|volv(?:é|e)(?:\s|$)\s+a\s+planificar\b)/iu.test(text)) return 'replan';
-  if (/^(?:continue|continuá|dale|ok|sí|si|go|proceed)[.!]?$/iu.test(text)) return 'unrelated';
-  return PRIMARY_EXECUTION_DIRECTIVE.test(text) && EXECUTION_VERBS.test(text) && EXECUTION_ANCHOR.test(text) ? 'execute' : 'unrelated';
-}
-
 export async function observeRalplanAdvisoryPrompt(input: {
   cwd: string; sessionId: string; turnId: string; threadId: string; prompt: string;
   producer: 'native' | string; threadKind: 'root-or-drift' | string;
@@ -1406,48 +993,4 @@ export async function administrativelyAbandonRalplanAdvisory(input: {
     await input.failpoint?.('after_admin_event');
     return readProjectionForGeneration(projection.activation.canonical_cwd, input.sessionId, input.generationId);
   });
-}
-
-export function validateAdvisoryInactiveState(state: Record<string, unknown>, projection: AdvisoryProjection | null): string | null {
-  if (state.mode !== 'ralplan' || state.workflow_variant !== 'advisory' || state.active !== false) return null;
-  if (!projection || projection.corruption || !projection.fence || (!projection.journal && !projection.admin_event)) return 'ralplan_advisory_inactive_requires_canonical_fence_and_journal';
-  if (!['closed', 'abandoned', 'recovery_required'].includes(projection.fence.state)) return 'ralplan_advisory_inactive_fence_not_terminal';
-  if (!projection.admin_event && projection.journal?.phase !== 'committed') return 'ralplan_advisory_inactive_journal_not_committed';
-  if (projection.fence.generation_id !== state.advisory_generation_id) return 'ralplan_advisory_inactive_generation_mismatch';
-  if (state.execution_handoff_authorized !== false || state.host_verified !== false
-    || object(state.ralplan_consensus_gate)?.complete !== false) return 'ralplan_advisory_inactive_explicit_false_fields_required';
-  if (projection.journal && projection.journal.outcome !== 'approved' && object(state.ralplan_review_lifecycle)?.complete === true) {
-    return 'ralplan_advisory_negative_outcome_lifecycle_complete_forbidden';
-  }
-  return null;
-}
-
-export function isCanonicalInactiveAdvisoryBinding(
-  state: Record<string, unknown> | null,
-  sessionId: string,
-  generationId: string,
-): boolean {
-  return Boolean(state
-    && state.mode === 'ralplan'
-    && state.session_id === sessionId
-    && state.workflow_variant === 'advisory'
-    && state.advisory_generation_id === generationId
-    && state.active === false);
-}
-
-/** Internal fence-first write boundary used by the canonical mode writer while
- * a prepared closeout journal is still in progress. Public state_write remains
- * stricter and requires the terminal committed projection above. */
-export function validateAdvisoryPreparedInactiveWrite(state: Record<string, unknown>, projection: AdvisoryProjection | null): string | null {
-  if (state.mode !== 'ralplan' || state.workflow_variant !== 'advisory' || state.active !== false) return null;
-  if (!projection || projection.corruption || !projection.fence || !projection.journal) return 'ralplan_advisory_inactive_requires_prepared_fence_and_journal';
-  if (projection.fence.state !== 'pending_closeout') return 'ralplan_advisory_prepared_write_requires_pending_fence';
-  if (projection.journal.phase !== 'prepared') return 'ralplan_advisory_prepared_write_requires_prepared_journal';
-  if (projection.fence.generation_id !== state.advisory_generation_id || projection.journal.generation_id !== state.advisory_generation_id) {
-    return 'ralplan_advisory_prepared_write_generation_mismatch';
-  }
-  if (state.execution_handoff_authorized !== false || state.host_verified !== false) {
-    return 'ralplan_advisory_prepared_explicit_false_fields_required';
-  }
-  return null;
 }

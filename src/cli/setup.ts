@@ -271,6 +271,8 @@ export interface SkillFrontmatterMetadata {
 
 const PROJECT_GITIGNORE_ENTRIES = [
 	".omx/",
+	".omx-state-locks/",
+	".omx-state-locks.identity.json",
 	".codex/*",
 	"!.codex/agents/",
 	"!.codex/agents/**",

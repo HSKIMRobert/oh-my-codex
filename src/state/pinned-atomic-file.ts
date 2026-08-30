@@ -500,7 +500,7 @@ async function pinDarwin(path: string): Promise<PinnedAtomicFile> {
       await assertVisibleParent(parentPath, identity);
       return supervisor;
     } catch (error) {
-      await supervisor.close();
+      await supervisor.close().catch(() => undefined);
       throw error;
     }
   };
@@ -530,7 +530,7 @@ async function pinDarwin(path: string): Promise<PinnedAtomicFile> {
     );
     return owner;
   } catch (error) {
-    await Promise.all([worker.close(), supervisor.close()]);
+    await Promise.all([worker.close().catch(() => undefined), supervisor.close().catch(() => undefined)]);
     throw error;
   }
 }

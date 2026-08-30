@@ -1,167 +1,34 @@
 import {
   readModeState,
   readModeStateForExplicitSession,
-  startMode,
   updateAutopilotPipelineState,
   updateModeState,
 } from '../modes/base.js';
 import { resolveWritableStateScope } from '../mcp/state-paths.js';
 import { requirePersistedHandoffCarrier } from '../state/handoff-carrier.js';
 import { readSubagentTrackingState, recordSubagentTurnForSession } from '../subagents/tracker.js';
-import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import {
   administrativelyAbandonRalplanAdvisory,
-  isCanonicalInactiveAdvisoryBinding,
   readCurrentRalplanAdvisory,
-  reconcileRalplanAdvisory,
-  terminalizeRalplanAdvisory,
-  type AdvisoryProjection,
-  type AdvisoryOutcome,
 } from './advisory.js';
-import { activateOrResumeRalplanAdvisory } from './advisory-activation.js';
-
-export const RALPLAN_ACTIVE_PHASES = [
-  'draft',
-  'architect-review',
-  'critic-review',
-  'complete',
-] as const;
-
-export type RalplanActivePhase = (typeof RALPLAN_ACTIVE_PHASES)[number];
-export type RalplanTerminalPhase = 'complete' | 'cancelled' | 'failed';
-export type RalplanReviewVerdict = 'approve' | 'iterate' | 'reject';
-export type RalplanExecutionLane = 'ultragoal' | 'team' | 'ralph' | 'conductor' | 'execution' | 'none';
-
-export interface RalplanReusableRoleLane {
-  agent_role: 'architect' | 'critic';
-  thread_id?: string;
-  lane_id?: string;
-  session_id?: string;
-  native_session_id?: string;
-  tracker_path?: string;
-}
-
-
-export interface RalplanDraftResult {
-  summary?: string;
-  planPath?: string;
-  artifacts?: Record<string, unknown>;
-  session_id?: string;
-  thread_id?: string;
-  native_session_id?: string;
-  agent_role?: 'planner' | 'architect' | 'critic' | 'executor';
-  lane_id?: string;
-  tracker_path?: string;
-}
-
-export interface RalplanReviewResult {
-  verdict: RalplanReviewVerdict;
-  summary?: string;
-  artifacts?: Record<string, unknown>;
-  provenance_kind?: 'native_subagent';
-
-  session_id?: string;
-  thread_id?: string;
-  native_session_id?: string;
-  artifact_path?: string;
-  agent_role?: 'architect' | 'critic';
-  lane_id?: string;
-  tracker_path?: string;
-  new_lane_reason?: string;
-  sequence_index?: number;
-}
-
-export interface RalplanConsensusGate {
-  required: true;
-  complete: boolean;
-  sequence: ['architect-review', 'critic-review'];
-  planning_artifacts_are_not_consensus: true;
-  required_review_roles: ['architect', 'critic'];
-  ralplan_architect_review: (RalplanReviewResult & { agent_role: 'architect'; iteration: number }) | null;
-  ralplan_critic_review: (RalplanReviewResult & { agent_role: 'critic'; iteration: number }) | null;
-  architect_review: (RalplanReviewResult & { agent_role: 'architect'; iteration: number }) | null;
-  critic_review: (RalplanReviewResult & { agent_role: 'critic'; iteration: number }) | null;
-  blocked_reason: string | null;
-}
-
-export interface RalplanConsensusIterationContext {
-  task: string;
-  cwd: string;
-  iteration: number;
-  priorDrafts: RalplanDraftResult[];
-  architectReviews: RalplanReviewResult[];
-  criticReviews: RalplanReviewResult[];
-  reusableRoleLanes: {
-    architect?: RalplanReusableRoleLane;
-    critic?: RalplanReusableRoleLane;
-  };
-}
-
-export interface RalplanConsensusExecutor {
-  draft(ctx: RalplanConsensusIterationContext): Promise<RalplanDraftResult>;
-  architectReview(
-    ctx: RalplanConsensusIterationContext & { draft: RalplanDraftResult },
-  ): Promise<RalplanReviewResult>;
-  criticReview(
-    ctx: RalplanConsensusIterationContext & {
-      draft: RalplanDraftResult;
-      architectReview: RalplanReviewResult;
-    },
-  ): Promise<RalplanReviewResult>;
-}
-
-export interface RunRalplanConsensusOptions {
-  task: string;
-  cwd?: string;
-  maxIterations?: number;
-  sessionId?: string;
-  requireNativeSubagents?: boolean;
-  selectedExecutionLane?: RalplanExecutionLane;
-  workflowVariant?: 'standard' | 'advisory';
-  rootThreadId?: string;
-  activationTurnId?: string;
-  closingTurnId?: string;
-  advisoryProducer?: 'native' | string;
-  advisoryThreadKind?: 'root-or-drift' | string;
-}
-
-export interface RalplanRuntimeResult {
-  status: 'completed' | 'failed' | 'cancelled';
-  iteration: number;
-  phase: RalplanTerminalPhase;
-  planningComplete: boolean;
-  drafts: RalplanDraftResult[];
-  architectReviews: RalplanReviewResult[];
-  criticReviews: RalplanReviewResult[];
-  ralplanConsensusGate: RalplanConsensusGate;
-  latestPlanPath?: string;
-  artifacts: Record<string, unknown>;
-  error?: string;
-  selectedExecutionLane?: RalplanExecutionLane;
-  executionHandoffStarted?: boolean;
-  workflowVariant?: 'advisory';
-  ralplanReviewLifecycle?: AdvisoryReviewLifecycle;
-  executionHandoffAuthorized?: false;
-  hostVerified?: false;
-  returnToCaller?: boolean;
-}
-
-type AdvisoryCatchRecoveryProjection = Pick<AdvisoryProjection, 'corruption'> & {
-  fence: { state: string } | null;
-  journal: { outcome: string } | null;
-};
-
-export function isCompletedAdvisoryCatchRecovery(
-  recovered: AdvisoryCatchRecoveryProjection | null,
-  binding: Record<string, unknown> | null,
-  sessionId: string,
-  generationId: string,
-): boolean {
-  return recovered?.corruption === null
-    && recovered.fence?.state === 'closed'
-    && recovered.journal?.outcome === 'approved'
-    && isCanonicalInactiveAdvisoryBinding(binding, sessionId, generationId);
-}
+import {
+  type RalplanConsensusExecutor,
+  type RalplanConsensusGate,
+  type RalplanConsensusIterationContext,
+  type RalplanDraftResult,
+  type RalplanReviewResult,
+  type RalplanReviewVerdict,
+  type RalplanReusableRoleLane,
+  type RalplanRuntimeResult,
+  type RunRalplanConsensusOptions,
+} from './runtime-contract.js';
+export * from './runtime-contract.js';
+export { isCompletedAdvisoryCatchRecovery } from './runtime-advisory-lifecycle.js';
+import {
+  createRalplanRuntimeLifecycle,
+  terminalizeCancelledAdvisory,
+  type RalplanRuntimeSnapshot,
+} from './runtime-advisory-lifecycle.js';
 
 interface RalplanModeUpdates {
   active?: boolean;
@@ -408,82 +275,6 @@ function requiredAdvisoryIdentity(value: string | undefined, name: string): stri
   return normalized;
 }
 
-function advisoryStartupFailpoint(name: 'after_intent' | 'after_mode'): void {
-  if (process.env.NODE_ENV === 'test' && process.env.OMX_RALPLAN_ADVISORY_STARTUP_FAILPOINT === name) {
-    throw new Error(`ralplan_advisory_startup_test_failpoint:${name}`);
-  }
-}
-
-async function terminalizeRuntimeAdvisory(input: {
-  cwd: string;
-  sessionId: string;
-  generationId: string;
-  closingTurnId: string;
-  iteration: number;
-  outcome: AdvisoryOutcome;
-  lifecycle?: AdvisoryReviewLifecycle;
-  updates: RalplanModeUpdates;
-  revalidateEvidence?: () => Promise<string | undefined>;
-  revalidateAuthority?: (checkpoint: string) => void | Promise<void>;
-}): Promise<void> {
-  let modeWritten = false;
-  const terminalModeUpdates: RalplanModeUpdates = {
-    ...input.updates,
-    active: false,
-    workflow_variant: 'advisory',
-    advisory_generation_id: input.generationId,
-    advisory_closing_turn_id: input.closingTurnId,
-    execution_handoff_authorized: false,
-    host_verified: false,
-    ralplan_consensus_gate: {
-      ...(input.updates.ralplan_consensus_gate ?? buildRalplanConsensusGate([], [])),
-      complete: false,
-    },
-    ...(input.lifecycle ? { ralplan_review_lifecycle: input.lifecycle } : {}),
-  };
-  const projection = await terminalizeRalplanAdvisory({
-    cwd: input.cwd,
-    sessionId: input.sessionId,
-    generationId: input.generationId,
-    closingTurnId: input.closingTurnId,
-    iteration: input.iteration,
-    outcome: input.outcome,
-    integrityStatus: input.lifecycle || input.outcome !== 'approved' ? 'proven' : 'unproven',
-    lifecycle: input.lifecycle,
-    terminalModeUpdates: terminalModeUpdates as Record<string, unknown>,
-    revalidateEvidence: input.revalidateEvidence,
-    beforeMutation: input.revalidateAuthority,
-    failpoint: async (name) => {
-      if (process.env.NODE_ENV === 'test' && process.env.OMX_RALPLAN_ADVISORY_FAILPOINT === name) {
-        throw new Error(`ralplan_advisory_test_failpoint:${name}`);
-      }
-    },
-    applyStep: async (step, storedPatch) => {
-      // updateModeState is the existing canonical writer: it writes the
-      // session/root mode and skill mirrors under its scope revalidator. The
-      // remaining journal steps verify/reconcile that idempotent result.
-      if (!modeWritten && step === 'session_mode') {
-        await updateRalplanState(
-          input.cwd,
-          storedPatch as RalplanModeUpdates,
-          input.sessionId,
-          input.revalidateAuthority
-            ? (site) => input.revalidateAuthority?.(`mode_commit_${site}`)
-            : undefined,
-        );
-        await input.revalidateAuthority?.('mode_update_complete');
-        modeWritten = true;
-      }
-    },
-  });
-  const terminalStateValid = input.outcome === 'approved'
-    ? projection.fence?.state === 'closed'
-    : Boolean(projection.fence && ['closed', 'abandoned', 'recovery_required'].includes(projection.fence.state));
-  if (projection.corruption || !terminalStateValid) {
-    throw new Error(`ralplan_advisory_terminalization_unproven:${projection.corruption ?? projection.fence?.state ?? 'missing'}`);
-  }
-}
-
 export async function runRalplanConsensus(
   executor: RalplanConsensusExecutor,
   options: RunRalplanConsensusOptions,
@@ -508,76 +299,26 @@ export async function runRalplanConsensus(
   const aggregatedArtifacts: Record<string, unknown> = {};
   let latestPlanPath: string | undefined;
   let iteration = 1;
-  const advisory = options.workflowVariant === 'advisory';
-  let advisorySessionId: string | undefined;
-  let advisoryGenerationId: string | undefined;
-  let advisoryActivationTurnId: string | undefined;
-  let advisoryClosingTurnId: string | undefined;
-  let advisoryRootThreadId: string | undefined;
-  let advisoryLifecycle: AdvisoryReviewLifecycle | undefined;
-  let advisoryPlanDigestBeforeReviews: string | undefined;
-  const writeRalplanState = (
-    updates: RalplanModeUpdates,
-    sessionId = advisorySessionId ?? runtimeSessionId,
-  ): Promise<void> => updateRalplanState(cwd, updates, sessionId);
 
   const existing = runtimeSessionId
     ? await readModeStateForExplicitSession('ralplan', runtimeSessionId, cwd)
     : await readModeState('ralplan', cwd);
-  if (existing?.active && !advisory) {
-    throw new Error('ralplan_active_mode_exists');
-  }
-  if (advisory) {
-    advisorySessionId = requiredAdvisoryIdentity(runtimeSessionId ?? String(existing?.session_id ?? ''), 'session_id');
-    advisoryActivationTurnId = requiredAdvisoryIdentity(options.activationTurnId ?? String(existing?.turn_id ?? ''), 'activation_turn_id');
-    advisoryClosingTurnId = requiredAdvisoryIdentity(options.closingTurnId ?? advisoryActivationTurnId, 'closing_turn_id');
-    advisoryRootThreadId = requiredAdvisoryIdentity(options.rootThreadId ?? String(existing?.thread_id ?? ''), 'root_thread_id');
-    const resumed = await activateOrResumeRalplanAdvisory({
-      cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId,
-      activationTurnId: advisoryActivationTurnId, prompt: options.task, maxIterations, resumeOnly: true,
-      producer: options.advisoryProducer ?? 'unknown', threadKind: options.advisoryThreadKind ?? 'unknown',
-      failpoint: (checkpoint) => {
-        if (checkpoint === 'after_intent' || checkpoint === 'after_mode') advisoryStartupFailpoint(checkpoint);
-      },
-    });
-    if (resumed) {
-      advisoryGenerationId = resumed.activation.generation_id;
-    } else if (existing?.active && existing.workflow_variant === 'advisory') {
-      advisoryGenerationId = requiredAdvisoryIdentity(String(existing.advisory_generation_id ?? ''), 'generation_id');
-      const current = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
-      if (!current?.activation || current.activation.generation_id !== advisoryGenerationId) {
-        throw new Error('ralplan_advisory_active_binding_without_matching_activation');
-      }
-    } else {
-      let prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
-      if (prior?.corruption || prior?.fence?.state === 'pending_closeout') {
-        prior = await reconcileRalplanAdvisory(cwd, advisorySessionId);
-        if (prior?.fence?.state === 'pending_closeout' && !prior.journal) {
-          await administrativelyAbandonRalplanAdvisory({
-            cwd, sessionId: advisorySessionId, generationId: prior.activation.generation_id,
-            rootThreadId: prior.activation.root_thread_id, turnId: prior.fence.closing_turn_id,
-          });
-          prior = await readCurrentRalplanAdvisory(cwd, advisorySessionId);
-        }
-      }
-      if (prior?.corruption) throw new Error(`ralplan_advisory_${prior.corruption}`);
-      if (prior && (!prior.fence || !['closed', 'abandoned', 'recovery_required'].includes(prior.fence.state))) {
-        throw new Error('ralplan_advisory_existing_generation_not_terminal');
-      }
-      const activated = await activateOrResumeRalplanAdvisory({
-        cwd, sessionId: advisorySessionId, rootThreadId: advisoryRootThreadId,
-        activationTurnId: advisoryActivationTurnId, prompt: options.task, maxIterations,
-        producer: options.advisoryProducer ?? 'unknown', threadKind: options.advisoryThreadKind ?? 'unknown',
-        ...(prior ? { predecessorGenerationId: prior.activation.generation_id } : {}),
-        failpoint: (checkpoint) => {
-          if (checkpoint === 'after_intent' || checkpoint === 'after_mode') advisoryStartupFailpoint(checkpoint);
-        },
-      });
-      advisoryGenerationId = activated.activation.generation_id;
-    }
-  } else {
-    await startMode('ralplan', options.task, maxIterations, cwd, runtimeSessionId);
-  }
+  const lifecycle = await createRalplanRuntimeLifecycle({ cwd, runtimeSessionId, maxIterations, options, existing });
+  const writeRalplanState = (updates: RalplanModeUpdates): Promise<void> =>
+    updateRalplanState(cwd, updates, lifecycle.sessionId);
+  const snapshot = (
+    consensusGate = buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
+    reviewHistory = buildReviewHistory(drafts, architectReviews, criticReviews),
+  ): RalplanRuntimeSnapshot => ({
+    iteration,
+    drafts,
+    architectReviews,
+    criticReviews,
+    consensusGate,
+    reviewHistory,
+    latestPlanPath,
+    artifacts: aggregatedArtifacts,
+  });
 
   try {
     while (iteration <= maxIterations) {
@@ -601,15 +342,12 @@ export async function runRalplanConsensus(
         planning_complete: false,
         ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
         review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
-      }, runtimeSessionId);
+      });
       const draft = await executor.draft(iterationContext);
       drafts.push(draft);
       if (draft.artifacts) Object.assign(aggregatedArtifacts, draft.artifacts);
       if (draft.planPath) latestPlanPath = draft.planPath;
-      if (advisory) {
-        if (!latestPlanPath) throw new Error('ralplan_advisory_plan_artifact_required');
-        advisoryPlanDigestBeforeReviews = (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256;
-      }
+      await lifecycle.postDraft(latestPlanPath);
       await recordRalplanSubagentTurn(cwd, runtimeSessionId, {
         threadId: draft.thread_id,
         role: draft.agent_role ?? undefined,
@@ -627,15 +365,12 @@ export async function runRalplanConsensus(
         latest_draft_summary: draft.summary,
         ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
         review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
-      }, runtimeSessionId);
+      });
       const architectReview = normalizeReviewForLane(await executor.architectReview({
         ...iterationContext,
         draft,
       }), 'architect', options.requireNativeSubagents === true);
-      if (advisory && latestPlanPath
-        && (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256 !== advisoryPlanDigestBeforeReviews) {
-        throw new Error('ralplan_advisory_plan_changed_during_architect_review');
-      }
+      await lifecycle.postReview(latestPlanPath, 'architect');
       assertRoleLaneReuse(reusableRoleLanes.architect, architectReview, 'architect');
       architectReviews.push(architectReview);
       if (architectReview.artifacts) Object.assign(aggregatedArtifacts, architectReview.artifacts);
@@ -643,7 +378,7 @@ export async function runRalplanConsensus(
         threadId: architectReview.thread_id,
         role: 'architect',
         laneId: architectReview.lane_id,
-        scope: advisory ? `ralplan-advisory:${advisoryGenerationId}` : options.task,
+        scope: lifecycle.reviewScope(options.task),
         summary: architectReview.summary,
         preserveCompletionEvidence: true,
       });
@@ -658,27 +393,21 @@ export async function runRalplanConsensus(
           latest_architect_summary: architectReview.summary,
           ralplan_consensus_gate: consensusGate,
           review_history: reviewHistory,
-        }, runtimeSessionId);
+        });
 
         if (iteration >= maxIterations) {
           const error = `ralplan_consensus_not_reached_after_${maxIterations}_iterations`;
-          if (advisory) {
-            await terminalizeRuntimeAdvisory({
-              cwd, sessionId: advisorySessionId!, generationId: advisoryGenerationId!,
-              closingTurnId: advisoryClosingTurnId!, iteration, outcome: 'exhausted',
-              updates: {
-                iteration, current_phase: 'failed', completed_at: new Date().toISOString(), planning_complete: false,
-                latest_plan_path: latestPlanPath, latest_architect_verdict: architectReview.verdict,
-                latest_architect_summary: architectReview.summary, ralplan_consensus_gate: consensusGate,
-                review_history: reviewHistory, status_message: 'Status: advisory exhausted — control returned to the caller without an execution handoff.', error,
-              },
-            });
-            return {
-              status: 'failed', iteration, phase: 'failed', planningComplete: false, drafts, architectReviews, criticReviews,
-              ralplanConsensusGate: consensusGate, latestPlanPath, artifacts: aggregatedArtifacts, error,
-              workflowVariant: 'advisory', executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
-            };
-          }
+          const advisoryResult = await lifecycle.terminalFailure({
+            ...snapshot(consensusGate, reviewHistory),
+            outcome: 'exhausted',
+            error,
+            statusMessage: 'Status: advisory exhausted — control returned to the caller without an execution handoff.',
+            updates: {
+              latest_architect_verdict: architectReview.verdict,
+              latest_architect_summary: architectReview.summary,
+            },
+          });
+          if (advisoryResult) return advisoryResult;
           await writeRalplanState({
             active: false,
             iteration,
@@ -692,7 +421,7 @@ export async function runRalplanConsensus(
             review_history: reviewHistory,
             status_message: `Status: paused_for_review — ralplan reached the ${maxIterations}-iteration review limit without Architect approval; continue from the best current artifact or ask the user how to proceed.`,
             error,
-          }, runtimeSessionId);
+          });
           return {
             status: 'failed',
             iteration,
@@ -719,16 +448,13 @@ export async function runRalplanConsensus(
         latest_architect_summary: architectReview.summary,
         ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
         review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
-      }, runtimeSessionId);
+      });
       const criticReview = normalizeReviewForLane(await executor.criticReview({
         ...iterationContext,
         draft,
         architectReview,
       }), 'critic', options.requireNativeSubagents === true);
-      if (advisory && latestPlanPath
-        && (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256 !== advisoryPlanDigestBeforeReviews) {
-        throw new Error('ralplan_advisory_plan_changed_during_critic_review');
-      }
+      await lifecycle.postReview(latestPlanPath, 'critic');
       assertRoleLaneReuse(reusableRoleLanes.critic, criticReview, 'critic');
       criticReviews.push(criticReview);
       if (criticReview.artifacts) Object.assign(aggregatedArtifacts, criticReview.artifacts);
@@ -736,7 +462,7 @@ export async function runRalplanConsensus(
         threadId: criticReview.thread_id,
         role: 'critic',
         laneId: criticReview.lane_id,
-        scope: advisory ? `ralplan-advisory:${advisoryGenerationId}` : options.task,
+        scope: lifecycle.reviewScope(options.task),
         summary: criticReview.summary,
         preserveCompletionEvidence: true,
       });
@@ -747,30 +473,6 @@ export async function runRalplanConsensus(
         nativeEvidenceComplete: options.requireNativeSubagents !== true
           || await hasCompletedNativeReviewEvidence(cwd, runtimeSessionId, architectReview, criticReview),
       });
-      if (advisory && architectReview.verdict === 'approve' && criticReview.verdict === 'approve') {
-        advisoryLifecycle = await projectAdvisoryReviewLifecycle({
-          cwd,
-          sessionId: advisorySessionId!,
-          generationId: advisoryGenerationId!,
-          activationTurnId: advisoryActivationTurnId!,
-          activationCreatedAt: (await readCurrentRalplanAdvisory(cwd, advisorySessionId!))!.activation.created_at,
-          rootThreadId: advisoryRootThreadId!,
-          iteration,
-          planPaths: [latestPlanPath!],
-          architect: {
-            threadId: requiredAdvisoryIdentity(architectReview.thread_id, 'architect_thread_id'),
-            artifactPath: requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path'),
-            verdict: architectReview.verdict,
-            sessionId: architectReview.session_id,
-          },
-          critic: {
-            threadId: requiredAdvisoryIdentity(criticReview.thread_id, 'critic_thread_id'),
-            artifactPath: requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path'),
-            verdict: criticReview.verdict,
-            sessionId: criticReview.session_id,
-          },
-        });
-      }
       await writeRalplanState({
         iteration,
         current_phase: 'critic-review',
@@ -778,52 +480,14 @@ export async function runRalplanConsensus(
         latest_critic_summary: criticReview.summary,
         ralplan_consensus_gate: consensusGate,
         review_history: reviewHistory,
-      }, runtimeSessionId);
+      });
 
-      if (advisory && advisoryLifecycle) {
-        const revalidate = async () => (await projectAdvisoryReviewLifecycle({
-          cwd,
-          sessionId: advisorySessionId!,
-          generationId: advisoryGenerationId!,
-          activationTurnId: advisoryActivationTurnId!,
-          activationCreatedAt: (await readCurrentRalplanAdvisory(cwd, advisorySessionId!))!.activation.created_at,
-          rootThreadId: advisoryRootThreadId!,
-          iteration,
-          planPaths: [latestPlanPath!],
-          architect: {
-            threadId: requiredAdvisoryIdentity(architectReview.thread_id, 'architect_thread_id'),
-            artifactPath: requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path'),
-            verdict: architectReview.verdict,
-            sessionId: architectReview.session_id,
-          },
-          critic: {
-            threadId: requiredAdvisoryIdentity(criticReview.thread_id, 'critic_thread_id'),
-            artifactPath: requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path'),
-            verdict: criticReview.verdict,
-            sessionId: criticReview.session_id,
-          },
-        })).evidence_bundle_sha256;
-        await terminalizeRuntimeAdvisory({
-          cwd, sessionId: advisorySessionId!, generationId: advisoryGenerationId!,
-          closingTurnId: advisoryClosingTurnId!, iteration, outcome: 'approved', lifecycle: advisoryLifecycle,
-          revalidateEvidence: revalidate,
-          updates: {
-            iteration, current_phase: 'complete', completed_at: new Date().toISOString(), planning_complete: true,
-            latest_plan_path: latestPlanPath, latest_architect_verdict: architectReview.verdict,
-            latest_architect_summary: architectReview.summary, latest_critic_verdict: criticReview.verdict,
-            latest_critic_summary: criticReview.summary, ralplan_consensus_gate: consensusGate,
-            ralplan_review_lifecycle: advisoryLifecycle, review_history: reviewHistory,
-            status_message: 'Status: advisory complete — local review lifecycle approved; control returned to the caller without an automatic execution handoff. Later user instructions follow normal host rules.',
-          },
-        });
-        return {
-          status: 'completed', iteration, phase: 'complete', planningComplete: true,
-          drafts, architectReviews, criticReviews, ralplanConsensusGate: { ...consensusGate, complete: false },
-          latestPlanPath, artifacts: aggregatedArtifacts, workflowVariant: 'advisory',
-          ralplanReviewLifecycle: advisoryLifecycle, executionHandoffAuthorized: false,
-          hostVerified: false, returnToCaller: true,
-        };
-      }
+      const advisoryCompleted = await lifecycle.completeApproved({
+        ...snapshot(consensusGate, reviewHistory),
+        architectReview,
+        criticReview,
+      });
+      if (advisoryCompleted) return advisoryCompleted;
 
       if (consensusGate.complete) {
         // Architect→Critic lifecycle consensus is complete; planning is done and
@@ -902,24 +566,18 @@ export async function runRalplanConsensus(
 
       if (iteration >= maxIterations) {
         const error = `ralplan_consensus_not_reached_after_${maxIterations}_iterations`;
-        if (advisory) {
-          const outcome: AdvisoryOutcome = criticReview.verdict === 'reject' ? 'rejected' : 'exhausted';
-          await terminalizeRuntimeAdvisory({
-            cwd, sessionId: advisorySessionId!, generationId: advisoryGenerationId!, closingTurnId: advisoryClosingTurnId!,
-            iteration, outcome,
-            updates: {
-              iteration, current_phase: 'failed', completed_at: new Date().toISOString(), planning_complete: false,
-              latest_plan_path: latestPlanPath, latest_critic_verdict: criticReview.verdict,
-              latest_critic_summary: criticReview.summary, ralplan_consensus_gate: consensusGate,
-              review_history: reviewHistory, status_message: `Status: advisory ${outcome} — control returned to the caller without an execution handoff.`, error,
-            },
-          });
-          return {
-            status: 'failed', iteration, phase: 'failed', planningComplete: false, drafts, architectReviews, criticReviews,
-            ralplanConsensusGate: consensusGate, latestPlanPath, artifacts: aggregatedArtifacts, error,
-            workflowVariant: 'advisory', executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
-          };
-        }
+        const outcome = criticReview.verdict === 'reject' ? 'rejected' : 'exhausted';
+        const advisoryResult = await lifecycle.terminalFailure({
+          ...snapshot(consensusGate, reviewHistory),
+          outcome,
+          error,
+          statusMessage: `Status: advisory ${outcome} — control returned to the caller without an execution handoff.`,
+          updates: {
+            latest_critic_verdict: criticReview.verdict,
+            latest_critic_summary: criticReview.summary,
+          },
+        });
+        if (advisoryResult) return advisoryResult;
         await updateRalplanState(cwd, {
           active: false,
           iteration,
@@ -933,7 +591,7 @@ export async function runRalplanConsensus(
           review_history: reviewHistory,
           status_message: `Status: paused_for_review — ralplan reached the ${maxIterations}-iteration review limit without approval; continue from the best current artifact or ask the user how to proceed.`,
           error,
-        }, runtimeSessionId);
+        });
         return {
           status: 'failed',
           iteration,
@@ -953,36 +611,8 @@ export async function runRalplanConsensus(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (advisory && advisorySessionId && advisoryGenerationId && advisoryClosingTurnId) {
-      const recovered = await reconcileRalplanAdvisory(cwd, advisorySessionId).catch(() => null);
-      const recoveredBinding = await readModeStateForExplicitSession('ralplan', advisorySessionId, cwd).catch(() => null);
-      if (isCompletedAdvisoryCatchRecovery(recovered, recoveredBinding, advisorySessionId, advisoryGenerationId)) {
-        return {
-          status: 'completed', iteration, phase: 'complete', planningComplete: true,
-          drafts, architectReviews, criticReviews,
-          ralplanConsensusGate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
-          latestPlanPath, artifacts: aggregatedArtifacts, workflowVariant: 'advisory',
-          ...(advisoryLifecycle ? { ralplanReviewLifecycle: advisoryLifecycle } : {}),
-          executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
-        };
-      }
-      await terminalizeRuntimeAdvisory({
-        cwd, sessionId: advisorySessionId, generationId: advisoryGenerationId,
-        closingTurnId: advisoryClosingTurnId, iteration, outcome: 'failed',
-        updates: {
-          iteration, current_phase: 'failed', completed_at: new Date().toISOString(), planning_complete: false,
-          latest_plan_path: latestPlanPath, ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
-          review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
-          status_message: 'Status: advisory failed — control returned to the caller without an execution handoff.', error: message,
-        },
-      });
-      return {
-        status: 'failed', iteration, phase: 'failed', planningComplete: false, drafts, architectReviews, criticReviews,
-        ralplanConsensusGate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
-        latestPlanPath, artifacts: aggregatedArtifacts, error: message,
-        workflowVariant: 'advisory', executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
-      };
-    }
+    const lifecycleResult = await lifecycle.recoverFailure(error, snapshot());
+    if (lifecycleResult) return lifecycleResult;
     await writeRalplanState({
       active: false,
       iteration,
@@ -994,7 +624,7 @@ export async function runRalplanConsensus(
       review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
       status_message: 'Status: failed — ralplan encountered an error and cannot continue without inspecting the failure.',
       error: message,
-    }, runtimeSessionId);
+    });
     return {
       status: 'failed',
       iteration,
@@ -1011,23 +641,13 @@ export async function runRalplanConsensus(
   }
 
   const unreachableError = 'ralplan_runtime_unreachable_state';
-  if (advisory && advisorySessionId && advisoryGenerationId && advisoryClosingTurnId) {
-    await terminalizeRuntimeAdvisory({
-      cwd, sessionId: advisorySessionId, generationId: advisoryGenerationId,
-      closingTurnId: advisoryClosingTurnId, iteration, outcome: 'failed',
-      updates: {
-        iteration, current_phase: 'failed', completed_at: new Date().toISOString(), planning_complete: false,
-        ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
-        status_message: 'Status: advisory failed — unexpected runtime state; control returned to the caller without an execution handoff.', error: unreachableError,
-      },
-    });
-    return {
-      status: 'failed', iteration, phase: 'failed', planningComplete: false, drafts, architectReviews, criticReviews,
-      ralplanConsensusGate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions), latestPlanPath,
-      artifacts: aggregatedArtifacts, error: unreachableError, workflowVariant: 'advisory',
-      executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
-    };
-  }
+  const advisoryUnreachable = await lifecycle.terminalFailure({
+    ...snapshot(),
+    outcome: 'failed',
+    error: unreachableError,
+    statusMessage: 'Status: advisory failed — unexpected runtime state; control returned to the caller without an execution handoff.',
+  });
+  if (advisoryUnreachable) return advisoryUnreachable;
   await writeRalplanState({
     active: false,
     iteration,
@@ -1037,7 +657,7 @@ export async function runRalplanConsensus(
     ralplan_consensus_gate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
     status_message: 'Status: failed — ralplan reached an unexpected runtime state.',
     error: unreachableError,
-  }, runtimeSessionId);
+  });
   return {
     status: 'failed',
     iteration,
@@ -1099,14 +719,10 @@ export async function cancelRalplanConsensus(
       await options.revalidateAuthority?.('cancel_mode_updated');
       return true;
     }
-    await terminalizeRuntimeAdvisory({
+    await terminalizeCancelledAdvisory({
       cwd: root, sessionId: advisorySessionId, generationId, closingTurnId,
       iteration: typeof state.iteration === 'number' && state.iteration > 0 ? state.iteration : 1,
-      outcome: 'cancelled',
-      updates: {
-        current_phase: 'cancelled', completed_at: new Date().toISOString(), planning_complete: false,
-        status_message: 'Status: advisory cancelled — control returned to the caller; later user instructions follow normal host rules.',
-      },
+      consensusGate: buildRalplanConsensusGate([], []),
       revalidateAuthority: options.revalidateAuthority,
     });
     return true;

@@ -22,6 +22,8 @@ const TEST_CODEX_PROBES = {
 
 const EXPECTED_PROJECT_GITIGNORE = [
   ".omx/",
+  ".omx-state-locks/",
+  ".omx-state-locks.identity.json",
   ".codex/*",
   "!.codex/agents/",
   "!.codex/agents/**",
@@ -33,6 +35,8 @@ const EXPECTED_PROJECT_GITIGNORE = [
 ].join("\n") + "\n";
 
 const EXPECTED_PROJECT_GITIGNORE_WITHOUT_OMX = [
+  ".omx-state-locks/",
+  ".omx-state-locks.identity.json",
   ".codex/*",
   "!.codex/agents/",
   "!.codex/agents/**",
@@ -249,6 +253,8 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
       assert.equal(gitignore, `node_modules/\n${EXPECTED_PROJECT_GITIGNORE}`);
       assert.equal(gitignore.match(/^\.omx\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx-state-locks\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx-state-locks\.identity\.json$/gm)?.length ?? 0, 1);
       assert.equal(gitignore.match(/^\.codex\/\*$/gm)?.length ?? 0, 1);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -360,10 +366,13 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await writeFile(join(wd, ".gitignore"), ".omx/\n.codex/\n");
 
       await runSetupInTempDir(wd, { scope: "project" });
+      await runSetupInTempDir(wd, { scope: "project" });
 
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
       assert.equal(gitignore, EXPECTED_PROJECT_GITIGNORE);
       assert.equal(gitignore.match(/^\.codex\/$/gm)?.length ?? 0, 0);
+      assert.equal(gitignore.match(/^\.omx-state-locks\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx-state-locks\.identity\.json$/gm)?.length ?? 0, 1);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

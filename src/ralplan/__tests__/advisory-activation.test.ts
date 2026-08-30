@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -10,6 +10,8 @@ import {
   type AdvisoryActivationCheckpoint,
 } from '../advisory-activation.js';
 import { listActiveSkills, listTransitionActiveSkills, writeSkillActiveStateCopiesForStateDir } from '../../state/skill-active.js';
+import { __setCanonicalModeBindingLeaseTestHooksForTests, resolveValidatedCanonicalModeBinding } from '../../state/mode-binding-lease.js';
+import { executeStateOperation, outsideStateFileWriteTransaction, withStateFileWriteTransaction, writeStateFile } from '../../state/operations.js';
 import {
   administrativelyAbandonRalplanAdvisory,
   commitPreparedRalplanAdvisoryActivationInternal,
@@ -20,9 +22,43 @@ const roots: string[] = [];
 const activateOrResumeRalplanAdvisory = (
   input: Omit<ActivateOrResumeRalplanAdvisoryInput, 'producer' | 'threadKind' | 'resumeOnly'>,
 ) => activateRalplanAdvisoryWithProvenance({ ...input, producer: 'native', threadKind: 'root-or-drift' });
-afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+afterEach(async () => {
+  __setCanonicalModeBindingLeaseTestHooksForTests({});
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 describe('central Ralplan Advisory activation owner', () => {
+  it('fails Advisory closed on unsupported platforms before creating intent or state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-unsupported-'));
+    roots.push(cwd);
+    __setCanonicalModeBindingLeaseTestHooksForTests({ platform: 'win32' });
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory unsupported', generationId: 'generation-a',
+    }), /unsupported on win32/);
+    assert.equal(existsSync(join(cwd, '.omx')), false);
+    assert.equal(existsSync(join(cwd, '.omx-state-locks')), false);
+  });
+
+  it('rejects a byte-identical state-root replacement before commit and retains the intent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-state-root-swap-'));
+    roots.push(cwd);
+    const stateRoot = join(cwd, '.omx', 'state');
+    const displaced = join(cwd, '.omx', 'state.displaced');
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory state root swap', generationId: 'generation-a',
+      failpoint: async (checkpoint) => {
+        if (checkpoint !== 'before_commit') return;
+        await rename(stateRoot, displaced);
+        await cp(displaced, stateRoot, { recursive: true });
+      },
+    }), /state root identity changed/);
+    const advisoryRoot = join(stateRoot, 'sessions', 'session-a', 'ralplan-advisory');
+    await readFile(join(advisoryRoot, 'rollover-intent.json'));
+    assert.equal(existsSync(join(advisoryRoot, 'current.json')), false);
+  });
+
   it('keeps activation preparation and commit imports behind the central owner boundary', async () => {
     const advisorySource = await readFile(join(process.cwd(), 'src', 'ralplan', 'advisory.ts'), 'utf8');
     assert.doesNotMatch(advisorySource, /export async function activateRalplanAdvisory\b/);
@@ -35,6 +71,131 @@ describe('central Ralplan Advisory activation owner', () => {
       const source = await readFile(join(process.cwd(), ...relative), 'utf8');
       assert.doesNotMatch(source, /prepareRalplanAdvisoryActivationInternal|readAuthorizedPendingRalplanActivation|commitPreparedRalplanAdvisoryActivationInternal/);
     }
+  });
+
+  it('holds sanctioned mode writers outside the complete Advisory handoff', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-mode-binding-lock-'));
+    roots.push(cwd);
+    const result = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory serialized handoff', generationId: 'generation-a',
+      failpoint: async (checkpoint) => {
+        if (checkpoint !== 'after_mode') return;
+        const competitor = await executeStateOperation('state_write', {
+          workingDirectory: cwd,
+          session_id: 'session-a',
+          mode: 'ralplan',
+          state: { active: true, workflow_variant: 'standard', current_phase: 'draft' },
+        });
+        assert.equal(competitor.isError, true);
+        assert.match(String((competitor.payload as { error?: string }).error), /timed out waiting for .*lock|lease helper (request timed out|exited)/);
+      },
+    });
+    assert.equal(result.projection.corruption, null);
+  });
+
+  it('releases a failed activation lease and never removes a successor lock', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-mode-binding-release-'));
+    roots.push(cwd);
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory failed lease release', generationId: 'generation-a',
+      failpoint: (checkpoint) => { if (checkpoint === 'after_mode') throw new Error('forced-activation-failure'); },
+    }), /forced-activation-failure/);
+    await withStateFileWriteTransaction(bindingPath, async () => undefined);
+
+    const lockPath = (await resolveValidatedCanonicalModeBinding(bindingPath)).leasePath;
+    const displaced = `${lockPath}.old-owner`;
+    await assert.rejects(withStateFileWriteTransaction(bindingPath, async () => {
+      const ownerEntry = (await readdir(lockPath)).find((entry) => entry.startsWith('owner-'));
+      assert.ok(ownerEntry);
+      await rename(lockPath, displaced);
+      await mkdir(lockPath);
+      await writeFile(join(lockPath, 'owner-successor-token'), 'successor-token');
+    }), /ownership lost/);
+    assert.equal(await readFile(join(lockPath, 'owner-successor-token'), 'utf8'), 'successor-token');
+    assert.ok((await readdir(displaced)).some((entry) => entry.startsWith('owner-')));
+  });
+
+  it('rejects a symlinked lock namespace without touching its target or running work', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-lock-symlink-'));
+    const external = await mkdtemp(join(tmpdir(), 'omx-advisory-lock-external-'));
+    roots.push(cwd, external);
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await symlink(external, join(cwd, '.omx-state-locks'));
+    let ran = false;
+    await assert.rejects(withStateFileWriteTransaction(bindingPath, async () => { ran = true; }), /real directory/);
+    assert.equal(ran, false);
+    assert.deepEqual(await readdir(external), []);
+  });
+
+  it('rejects unsafe activation identities before creating lease or lifecycle artifacts', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-invalid-identity-'));
+    roots.push(cwd);
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: '..', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory invalid identity', generationId: 'generation-a',
+    }), /sessionId_invalid/);
+    assert.equal(existsSync(join(cwd, '.omx-state-locks')), false);
+    assert.equal(existsSync(join(cwd, '.omx', 'state')), false);
+  });
+
+  it('pins the lock namespace and rejects a replacement without admitting a second owner', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-lock-namespace-swap-'));
+    roots.push(cwd);
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    const namespacePath = join(cwd, '.omx-state-locks');
+    const displaced = join(cwd, '.omx-state-locks.displaced');
+    let secondRan = false;
+    await assert.rejects(withStateFileWriteTransaction(bindingPath, async () => {
+      await rename(namespacePath, displaced);
+      await mkdir(namespacePath);
+      const second = outsideStateFileWriteTransaction(() => withStateFileWriteTransaction(bindingPath, async () => {
+        secondRan = true;
+      }));
+      await assert.rejects(second, /namespace identity mismatch/);
+    }), /namespace changed/);
+    assert.equal(secondRan, false);
+    assert.ok((await readdir(namespacePath)).length <= 1);
+    assert.ok((await readdir(displaced)).length <= 1);
+  });
+
+  it('reclaims a dead helper lease while the parent process remains alive', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-dead-lock-helper-'));
+    roots.push(cwd);
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    let spawned = 0;
+    let firstChild: import('node:child_process').ChildProcessWithoutNullStreams | undefined;
+    __setCanonicalModeBindingLeaseTestHooksForTests({
+      onHelperSpawn: (child) => {
+        spawned += 1;
+        if (spawned === 1) firstChild = child;
+      },
+      afterAcquire: () => { firstChild?.kill('SIGKILL'); },
+    });
+    await assert.rejects(withStateFileWriteTransaction(bindingPath, async () => undefined), /helper/);
+    await withStateFileWriteTransaction(bindingPath, async () => undefined);
+    assert.equal(spawned, 2);
+  });
+
+  it('lets a detached excluded writer acquire a fresh reentrant lease after activation releases', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-detached-writer-'));
+    roots.push(cwd);
+    const bindingPath = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    let detached: Promise<void> | undefined;
+    await activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory detached writer', generationId: 'generation-a',
+      failpoint: (checkpoint) => {
+        if (checkpoint !== 'after_mode') return;
+        detached = withStateFileWriteTransaction(bindingPath, async () => {
+          const bytes = await readFile(bindingPath, 'utf8');
+          await writeStateFile(bindingPath, bytes);
+        });
+      },
+    });
+    await detached;
   });
 
   it('keeps one generation recoverable across every publication checkpoint', async () => {

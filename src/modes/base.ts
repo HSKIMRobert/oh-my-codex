@@ -30,7 +30,7 @@ import {
   getStateFilename,
   resolveWritableStateScope,
 } from '../mcp/state-paths.js';
-import { completeRalplanSession, writeStateFile } from '../state/operations.js';
+import { completeRalplanSession, outsideStateFileWriteTransaction, withStateFileWriteTransaction, writeStateFile } from '../state/operations.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
 import {
   readAuthorizedPendingRalplanActivation,
@@ -190,6 +190,21 @@ export async function startMode(
   projectRoot?: string,
   explicitSessionId?: string,
   startProfile?: RalplanAdvisoryStartProfile,
+): Promise<ModeState> {
+  const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
+  const path = join(scope.stateDir, getStateFilename(mode));
+  return withStateFileWriteTransaction(path, () => startModeUnderCanonicalLock(
+    mode, taskDescription, maxIterations, projectRoot, explicitSessionId, startProfile,
+  ), getBaseStateDir(projectRoot));
+}
+
+async function startModeUnderCanonicalLock(
+  mode: ModeName,
+  taskDescription: string,
+  maxIterations: number,
+  projectRoot: string | undefined,
+  explicitSessionId: string | undefined,
+  startProfile: RalplanAdvisoryStartProfile | undefined,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
   const primaryStatePath = join(scope.stateDir, getStateFilename(mode));
@@ -402,6 +417,21 @@ async function updateModeStateInternal(
   externalBeforeCommit?: (site: string) => void | Promise<void>,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
+  const path = join(scope.stateDir, getStateFilename(mode));
+  return withStateFileWriteTransaction(path, () => updateModeStateUnderCanonicalLock(
+    mode, updates, projectRoot, explicitSessionId, pipelineProgressWrite, externalBeforeCommit, scope,
+  ), getBaseStateDir(projectRoot));
+}
+
+async function updateModeStateUnderCanonicalLock(
+  mode: string,
+  updates: Partial<ModeState>,
+  projectRoot: string | undefined,
+  explicitSessionId: string | undefined,
+  pipelineProgressWrite: boolean,
+  externalBeforeCommit: ((site: string) => void | Promise<void>) | undefined,
+  scope: Awaited<ReturnType<typeof resolveWritableStateScope>>,
+): Promise<ModeState> {
   const baseStateDir = getBaseStateDir(projectRoot);
   const revalidateWritableScope = createWritableCommitRevalidator({
     operation: 'updateModeState',
@@ -412,7 +442,9 @@ async function updateModeStateInternal(
   });
   const beforeCommit: typeof revalidateWritableScope = async (commit) => {
     await revalidateWritableScope(commit);
-    await externalBeforeCommit?.(commit.site);
+    if (externalBeforeCommit) {
+      await outsideStateFileWriteTransaction(() => externalBeforeCommit(commit.site));
+    }
   };
   const current = mode === 'ralph' && scope.sessionId
     ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)

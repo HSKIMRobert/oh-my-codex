@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { startMode } from '../modes/base.js';
 import { getBaseStateDir } from '../mcp/state-paths.js';
 import { getSkillActiveStatePathsForStateDir, listActiveSkills, mergeRootSkillStateForExactSession, skillActiveOwnershipMatchesExactSession, updateSkillActiveStateCopiesForExactSessionTransaction } from '../state/skill-active.js';
-import { syncExplicitSessionModeState } from '../state/operations.js';
+import { assertStateFileWriteTransactionIdentity, outsideStateFileWriteTransaction, syncExplicitSessionModeState, withStateFileWriteTransaction } from '../state/operations.js';
+import { assertCanonicalModeBindingLeaseSupported } from '../state/mode-binding-lease.js';
 import {
   commitPreparedRalplanAdvisoryActivationInternal,
   prepareRalplanAdvisoryActivationInternal,
@@ -175,6 +176,32 @@ export function activateOrResumeRalplanAdvisory(
 export async function activateOrResumeRalplanAdvisory(
   input: ActivateOrResumeRalplanAdvisoryInput,
 ): Promise<AdvisoryActivationResult | null> {
+  assertCanonicalModeBindingLeaseSupported();
+  for (const [field, value] of [
+    ['sessionId', input.sessionId], ['rootThreadId', input.rootThreadId],
+    ['activationTurnId', input.activationTurnId], ['generationId', input.generationId],
+  ] as const) {
+    if (value !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value) || value === '.' || value === '..')) {
+      throw new Error(`ralplan_advisory_${field}_invalid`);
+    }
+  }
+  if (input.producer !== 'native' || input.threadKind !== 'root-or-drift') {
+    if (input.resumeOnly) return null;
+    throw new Error('ralplan_advisory_activation_authority_required');
+  }
+  const bindingPath = join(getBaseStateDir(input.cwd), 'sessions', input.sessionId, 'ralplan-state.json');
+  const isolatedInput = input.failpoint
+    ? { ...input, failpoint: (checkpoint: AdvisoryActivationCheckpoint) => outsideStateFileWriteTransaction(() => input.failpoint!(checkpoint)) }
+    : input;
+  return withStateFileWriteTransaction(
+    bindingPath, () => activateOrResumeRalplanAdvisoryUnderCanonicalLock(isolatedInput),
+    getBaseStateDir(input.cwd),
+  );
+}
+
+async function activateOrResumeRalplanAdvisoryUnderCanonicalLock(
+  input: ActivateOrResumeRalplanAdvisoryInput,
+): Promise<AdvisoryActivationResult | null> {
   if (input.producer !== 'native' || input.threadKind !== 'root-or-drift') {
     if (input.resumeOnly) return null;
     throw new Error('ralplan_advisory_activation_authority_required');
@@ -268,6 +295,10 @@ export async function activateOrResumeRalplanAdvisory(
   await verifyRootSkill();
   await input.failpoint?.('after_root_skill');
   await input.failpoint?.('before_commit');
+  await assertStateFileWriteTransactionIdentity(
+    join(stateDir, 'sessions', input.sessionId, 'ralplan-state.json'),
+    stateDir,
+  );
   await verifyAllActivationProjections(projections);
 
   await commitPreparedRalplanAdvisoryActivationInternal({

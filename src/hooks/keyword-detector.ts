@@ -626,7 +626,7 @@ export async function persistDeepInterviewModeState(
       },
       { nowIso },
     );
-    await writeStateFile(statePath, JSON.stringify(nextState, null, 2));
+    await writeStateFile(statePath, JSON.stringify(nextState, null, 2), stateDir);
     return;
   }
 
@@ -659,7 +659,7 @@ export async function persistDeepInterviewModeState(
         }
       : {}),
   };
-  await writeStateFile(statePath, JSON.stringify(nextState, null, 2));
+  await writeStateFile(statePath, JSON.stringify(nextState, null, 2), stateDir);
 }
 
 function resolveSeedStateFilePath(
@@ -915,7 +915,7 @@ async function persistStatefulSkillSeedState(
   }
 
   await mkdir(dirname(absolutePath), { recursive: true });
-  await writeStateFile(absolutePath, JSON.stringify(baseState, null, 2));
+  await writeStateFile(absolutePath, JSON.stringify(baseState, null, 2), stateDir);
 
   return {
     ...nextSkill,

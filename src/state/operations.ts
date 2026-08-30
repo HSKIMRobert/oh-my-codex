@@ -53,6 +53,12 @@ import {
   writeSkillActiveStateWithPrimaryTransactionForStateDir,
 } from './skill-active.js';
 import {
+  assertModeBindingOwnerIdentity as assertStateFileWriteTransactionIdentity,
+  outsideModeBindingOwnerTransaction as outsideStateFileWriteTransaction,
+  withModeBindingOwnerTransaction as withStateFileWriteTransaction,
+} from './mode-binding-lease.js';
+export { assertStateFileWriteTransactionIdentity, outsideStateFileWriteTransaction, withStateFileWriteTransaction };
+import {
   isTrackedWorkflowMode,
   type TrackedWorkflowMode,
 } from './workflow-transition.js';
@@ -83,37 +89,23 @@ export interface StateOperationResponse {
   isError?: boolean;
 }
 
-const stateWriteQueues = new Map<string, Promise<void>>();
-
-async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const tail = stateWriteQueues.get(path) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const queued = tail.finally(() => gate);
-  stateWriteQueues.set(path, queued);
-
-  await tail.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    release();
-    if (stateWriteQueues.get(path) === queued) {
-      stateWriteQueues.delete(path);
-    }
-  }
+const stateOperationTestHooks: { afterStateClearPrimary?: () => void } = {};
+export function __setStateOperationTestHooksForTests(hooks: typeof stateOperationTestHooks): void {
+  stateOperationTestHooks.afterStateClearPrimary = hooks.afterStateClearPrimary;
 }
-
 /**
  * The sole writer primitive for `.omx/state/` session-scoped workflow state.
  * Every module that persists `{mode}-state.json` MUST route through this function
  * so that the single-writer invariant is preserved.
  */
-export async function writeStateFile(path: string, data: string): Promise<void> {
-  await writeAtomicFile(path, data);
+export async function writeStateFile(path: string, data: string, authorizedBaseStateDir?: string): Promise<void> {
+  await withStateFileWriteTransaction(path, () => writeAtomicFile(path, data), authorizedBaseStateDir);
 }
 
+/**
+ * Holds the canonical successor-safe state lock across a multi-projection owner
+ * transaction. Nested sanctioned writes to the same path inherit the lease.
+ */
 /**
  * Durably pin a mode projection already published by the canonical workflow
  * writer. Keeping the path resolution and descriptor validation in the state
@@ -189,7 +181,7 @@ async function writeClearedSessionScopedModeState(
   });
   const payload = JSON.stringify(clearedState, null, 2);
   await beforeCommit?.({ site: 'state-clear.primary', kind: 'write', path });
-  await writeAtomicFile(path, payload);
+  await writeStateFile(path, payload);
 }
 
 async function clearSessionNativeStopState(
@@ -809,7 +801,7 @@ export async function executeStateOperation(
         let ensureRalphArtifacts = false;
         let skillActivePrimaryCommitted = false;
 
-        await withStateWriteLock(path, async () => {
+        await withStateFileWriteTransaction(path, async () => {
           let existing: Record<string, unknown> = {};
           if (existsSync(path)) {
             try {
@@ -987,22 +979,17 @@ export async function executeStateOperation(
               path,
               async () => {
                 await beforeCommit({ site: 'mode.primary', kind: 'write', path });
-                await writeAtomicFile(path, payload);
+                await writeStateFile(path, payload);
               },
               { beforeCommit },
             );
             skillActivePrimaryCommitted = true;
           } else {
             await beforeCommit({ site: 'mode.primary', kind: 'write', path });
-            await writeAtomicFile(path, payload);
+            await writeStateFile(path, payload);
           }
-        });
-
         if (validationError) {
-          return {
-            payload: { error: validationError },
-            isError: true,
-          };
+          return;
         }
 
         if (mode === SKILL_ACTIVE_STATE_MODE) {
@@ -1039,6 +1026,14 @@ export async function executeStateOperation(
               beforeCommit,
             });
           }
+          }
+        }, baseStateDir);
+
+        if (validationError) {
+          return {
+            payload: { error: validationError },
+            isError: true,
+          };
         }
 
         return {
@@ -1058,37 +1053,41 @@ export async function executeStateOperation(
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
 
         if (allSessions) {
-          const removedPaths: string[] = [];
-          const paths = await getAllScopedStatePaths(mode, cwd);
-          for (const path of paths) {
-            if (!existsSync(path)) continue;
-            await unlink(path);
-            removedPaths.push(path);
-          }
-          const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
-            ? []
-            : await getAllScopedStatePaths(SKILL_ACTIVE_STATE_MODE, cwd);
-          if (canonicalPaths.some((path) => existsSync(path))) {
-            await syncCanonicalSkillStateForMode({
-              cwd,
-              baseStateDir,
-              mode,
-              active: false,
-              source: 'state-operations',
-              allSessions: true,
-            });
-          }
+          const ownerPath = join(baseStateDir, getStateFilename(mode));
+          return await withStateFileWriteTransaction(ownerPath, async () => {
+            const removedPaths: string[] = [];
+            const paths = await getAllScopedStatePaths(mode, cwd);
+            for (const path of paths) {
+              if (!existsSync(path)) continue;
+              await withStateFileWriteTransaction(path, () => unlink(path));
+              removedPaths.push(path);
+            }
+            outsideStateFileWriteTransaction(() => stateOperationTestHooks.afterStateClearPrimary?.());
+            const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
+              ? []
+              : await getAllScopedStatePaths(SKILL_ACTIVE_STATE_MODE, cwd);
+            if (canonicalPaths.some((path) => existsSync(path))) {
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: false,
+                source: 'state-operations',
+                allSessions: true,
+              });
+            }
 
-          return {
-            payload: {
-              cleared: true,
-              mode,
-              all_sessions: true,
-              removed: removedPaths.length,
-              paths: removedPaths,
-              warning: 'all_sessions clears global and session-scoped state files',
-            },
-          };
+            return {
+              payload: {
+                cleared: true,
+                mode,
+                all_sessions: true,
+                removed: removedPaths.length,
+                paths: removedPaths,
+                warning: 'all_sessions clears global and session-scoped state files',
+              },
+            };
+          }, baseStateDir);
         }
 
         const stateScope = await resolveWritableStateScope(cwd, explicitSessionId);
@@ -1102,31 +1101,34 @@ export async function executeStateOperation(
           baseStateDir,
         });
         const path = join(stateScope.stateDir, getStateFilename(mode));
-        if (
-          mode !== SKILL_ACTIVE_STATE_MODE
-          && effectiveSessionId
-          && existsSync(getStatePath(mode, cwd))
-        ) {
-          await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
-        } else if (existsSync(path)) {
-          await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
-          await unlink(path);
-        }
-        const nativeStopCleared = effectiveSessionId
-          ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)
-          : [];
-        if (mode !== SKILL_ACTIVE_STATE_MODE) {
-          await syncCanonicalSkillStateForMode({
-            cwd,
-            baseStateDir,
-            mode,
-            active: false,
-            sessionId: effectiveSessionId,
-            source: 'state-operations',
-            beforeCommit,
-          });
-        }
-        return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
+        return await withStateFileWriteTransaction(path, async () => {
+          if (
+            mode !== SKILL_ACTIVE_STATE_MODE
+            && effectiveSessionId
+            && existsSync(getStatePath(mode, cwd))
+          ) {
+            await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
+          } else if (existsSync(path)) {
+            await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
+            await withStateFileWriteTransaction(path, () => unlink(path));
+          }
+          outsideStateFileWriteTransaction(() => stateOperationTestHooks.afterStateClearPrimary?.());
+          const nativeStopCleared = effectiveSessionId
+            ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)
+            : [];
+          if (mode !== SKILL_ACTIVE_STATE_MODE) {
+            await syncCanonicalSkillStateForMode({
+              cwd,
+              baseStateDir,
+              mode,
+              active: false,
+              sessionId: effectiveSessionId,
+              source: 'state-operations',
+              beforeCommit,
+            });
+          }
+          return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
+        }, baseStateDir);
       }
 
       case 'state_list_active': {

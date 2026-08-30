@@ -9,13 +9,15 @@ type PendingRequest = {
   reject: (error: Error) => void;
 };
 
-export class DarwinJsonChildClient {
+export class JsonChildClient {
   private buffered = '';
   private nextRequestId = 1;
   private pending = new Map<number, PendingRequest>();
+  private initialResponse: Record<string, unknown> | null = null;
   private terminalError: Error | null = null;
   private closePromise: Promise<void> | null = null;
   private exited = false;
+  private exitDescription = 'unknown';
   private resolveExit!: () => void;
   private readonly exitPromise = new Promise<void>((resolve) => { this.resolveExit = resolve; });
 
@@ -31,8 +33,11 @@ export class DarwinJsonChildClient {
     child.once('error', (error) => this.finish(new Error(`${label} process error`, { cause: error })));
     child.stdin.once('error', (error) => this.finish(new Error(`${label} stdin error`, { cause: error })));
     child.once('exit', (code, signal) => {
+      this.exitDescription = String(code ?? signal ?? 'unknown');
+    });
+    child.once('close', () => {
       this.exited = true;
-      this.finish(new Error(`${label} exited (${code ?? signal ?? 'unknown'})`));
+      this.finish(new Error(`${label} exited (${this.exitDescription})`));
       this.resolveExit();
     });
   }
@@ -54,6 +59,7 @@ export class DarwinJsonChildClient {
       const id = response.id;
       const waiter = typeof id === 'number' ? this.pending.get(id) : undefined;
       if (!waiter) {
+        if (id === 0 && !this.initialResponse) this.initialResponse = response;
         if (response.event) this.onEvent?.(response);
         continue;
       }
@@ -100,6 +106,13 @@ export class DarwinJsonChildClient {
   }
 
   async initialize(): Promise<Record<string, unknown>> {
+    if (this.initialResponse) {
+      const response = this.initialResponse;
+      this.initialResponse = null;
+      if (response.ok !== true) throw new Error(String(response.error ?? `${this.label} initialization failed`));
+      if (response.ready !== true) throw new Error(`${this.label} initialization failed`);
+      return response;
+    }
     const response = await this.waitForResponse(0);
     if (response.ready !== true) throw new Error(`${this.label} initialization failed`);
     return response;
@@ -124,18 +137,32 @@ export class DarwinJsonChildClient {
   }
 
   private async closeChild(): Promise<void> {
-    if (!this.terminalError) await this.request({ op: 'close' }).catch(() => undefined);
+    let closeError: Error | null = null;
+    if (!this.terminalError) {
+      try { await this.request({ op: 'close' }); }
+      catch (error) { closeError = error instanceof Error ? error : new Error(String(error)); }
+    }
     this.child.stdin.end();
-    if (this.exited) return;
+    if (this.exited) {
+      if (closeError) throw closeError;
+      return;
+    }
     const exitedGracefully = await Promise.race([
       this.exitPromise.then(() => true),
       new Promise<false>((resolve) => setTimeout(() => resolve(false), CLOSE_TIMEOUT_MS)),
     ]);
-    if (exitedGracefully) return;
+    if (exitedGracefully) {
+      if (closeError) throw closeError;
+      return;
+    }
     this.child.kill('SIGKILL');
     await Promise.race([
       this.exitPromise,
       new Promise<void>((resolve) => setTimeout(resolve, CLOSE_TIMEOUT_MS)),
     ]);
+    if (closeError) throw closeError;
   }
 }
+
+/** Backward-compatible name for the Darwin pinned-file protocol. */
+export { JsonChildClient as DarwinJsonChildClient };
