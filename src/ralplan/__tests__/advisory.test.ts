@@ -23,6 +23,7 @@ import {
   validateAdvisoryInactiveState,
   withRalplanAdvisoryCurrentLock,
 } from '../advisory.js';
+import { PINNED_FILE_TEST_HOOKS } from '../../state/pinned-file.js';
 import { updateModeState } from '../../modes/base.js';
 import { executeStateOperation } from '../../state/operations.js';
 import {
@@ -1065,6 +1066,32 @@ describe('ralplan advisory fence and journal', () => {
     release();
     await winner;
     assert.equal(existsSync(lockPath), false);
+  });
+
+  it('preserves a live replacement that wins dead-owner lock quarantine', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-dead-lock-replacement-'));
+    roots.push(cwd);
+    const sessionId = 'session-a';
+    const root = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory');
+    await mkdir(root, { recursive: true });
+    const lockPath = join(root, 'current.lock');
+    await writeFile(lockPath, `${JSON.stringify({ schema_version: 1, pid: process.pid + 100_000 })}\n`);
+    let replaced = false;
+    PINNED_FILE_TEST_HOOKS.beforeQuarantineRename = async (path) => {
+      if (replaced || path !== lockPath) return;
+      replaced = true;
+      await rm(lockPath);
+      await writeFile(lockPath, `${JSON.stringify({ schema_version: 1, pid: process.pid, token: 'live-replacement' })}\n`);
+    };
+    try {
+      await assert.rejects(
+        withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => undefined),
+        /current_lock_held/,
+      );
+      assert.equal(JSON.parse(await readFile(lockPath, 'utf8')).pid, process.pid);
+    } finally {
+      PINNED_FILE_TEST_HOOKS.beforeQuarantineRename = undefined;
+    }
   });
 });
 

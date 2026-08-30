@@ -1,8 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { appendFile, lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
-import { dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
+import {
+  createPinnedFileExclusive,
+  createPinnedDirectory,
+  quarantinePinnedFile,
+  removePinnedFile,
+  snapshotPinnedFile,
+  snapshotPinnedParent,
+  type PinnedDirectoryIdentity,
+} from '../state/pinned-file.js';
 import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
 
@@ -361,67 +370,52 @@ async function canonicalCwd(cwd: string): Promise<string> {
 
 const INCOMPLETE_ADVISORY_LOCK_STALE_MS = 30_000;
 
-async function reclaimIncompleteAdvisoryLock(lockPath: string): Promise<boolean> {
+async function reclaimAdvisoryLockByIdentity(
+  lockPath: string,
+  minimumAgeMs: number,
+): Promise<boolean> {
   const reclaimPath = `${lockPath}.reclaim`;
-  let reclaim: Awaited<ReturnType<typeof open>>;
+  const parent = await snapshotPinnedParent(lockPath);
   try {
-    reclaim = await open(reclaimPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-    await reclaim.writeFile(`${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`);
-    await reclaim.sync();
+    await createPinnedFileExclusive(reclaimPath, `${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`, parent);
   } catch {
     return false;
   }
   try {
-    let expectedIdentity: { dev: number; ino: number } | null = null;
-    let handle: Awaited<ReturnType<typeof open>>;
+    const expected = await snapshotPinnedFile(lockPath).catch(() => null);
+    if (!expected || Date.now() - expected.mtimeMs < minimumAgeMs) return false;
+    const quarantineName = `${basename(lockPath)}.stale-${process.pid}-${Date.now()}-${randomUUID()}`;
     try {
-      handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const quarantinePath = await quarantinePinnedFile(lockPath, quarantineName, expected, parent);
+      await removePinnedFile(quarantinePath, expected, parent);
+      return true;
     } catch {
-      return false;
-    }
-    try {
-      const opened = await handle.stat();
-      const before = await lstat(lockPath);
-      if (!opened.isFile() || opened.nlink !== 1 || !before.isFile() || before.isSymbolicLink()
-        || before.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino
-        || Date.now() - before.mtimeMs < INCOMPLETE_ADVISORY_LOCK_STALE_MS) {
-        return false;
-      }
-      const after = await lstat(lockPath);
-      if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs
-        || after.size !== before.size) {
-        return false;
-      }
-      expectedIdentity = { dev: before.dev, ino: before.ino };
-    } finally {
-      await handle.close();
-    }
-    const quarantinePath = `${lockPath}.stale-${process.pid}-${Date.now()}-${randomUUID()}`;
-    try {
-      await rename(lockPath, quarantinePath);
-      const quarantined = await lstat(quarantinePath);
-      const reclaimable = quarantined.isFile() && !quarantined.isSymbolicLink()
-        && quarantined.dev === expectedIdentity?.dev && quarantined.ino === expectedIdentity?.ino;
-      await rm(quarantinePath, { force: true });
-      return reclaimable;
-    } catch {
-      await rm(quarantinePath, { force: true }).catch(() => {});
       return false;
     }
   } finally {
-    await reclaim.close().catch(() => {});
-    await rm(reclaimPath, { force: true });
+    const reclaim = await snapshotPinnedFile(reclaimPath).catch(() => null);
+    if (reclaim) await removePinnedFile(reclaimPath, reclaim, parent).catch(() => {});
   }
 }
 
-async function acquireAdvisoryLock(lockPath: string, directory: string, heldError: string): Promise<Awaited<ReturnType<typeof open>>> {
+interface AdvisoryLockLease {
+  path: string;
+  snapshot: NonNullable<Awaited<ReturnType<typeof snapshotPinnedFile>>>;
+  parent: Awaited<ReturnType<typeof snapshotPinnedParent>>;
+}
+
+async function acquireAdvisoryLock(lockPath: string, heldError: string): Promise<AdvisoryLockLease> {
+  const parent = await snapshotPinnedParent(lockPath);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const handle = await open(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-      await handle.writeFile(`${JSON.stringify({ schema_version: 1, pid: process.pid, created_at: new Date().toISOString() })}\n`);
-      await handle.sync();
-      await syncDirectory(directory);
-      return handle;
+      await createPinnedFileExclusive(
+        lockPath,
+        `${JSON.stringify({ schema_version: 1, pid: process.pid, created_at: new Date().toISOString() })}\n`,
+        parent,
+      );
+      const snapshot = await snapshotPinnedFile(lockPath);
+      if (!snapshot) throw new Error(heldError);
+      return { path: lockPath, snapshot, parent };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const owner = await readStrictJson(lockPath).catch(() => null);
@@ -429,8 +423,8 @@ async function acquireAdvisoryLock(lockPath: string, directory: string, heldErro
         ? Number(owner.pid)
         : null;
       if (pid === null) {
-        if (attempt > 0 || !await reclaimIncompleteAdvisoryLock(lockPath)) throw new Error(heldError);
-        await syncDirectory(directory);
+        if (attempt > 0 || !await reclaimAdvisoryLockByIdentity(lockPath, INCOMPLETE_ADVISORY_LOCK_STALE_MS)) throw new Error(heldError);
+        await syncDirectory(dirname(lockPath));
         continue;
       }
       if (attempt > 0) throw new Error(heldError);
@@ -440,19 +434,33 @@ async function acquireAdvisoryLock(lockPath: string, directory: string, heldErro
       } catch (probeError) {
         if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
       }
-      await rm(lockPath, { force: false });
-      await syncDirectory(directory);
+      if (!await reclaimAdvisoryLockByIdentity(lockPath, 0)) throw new Error(heldError);
+      await syncDirectory(dirname(lockPath));
     }
   }
   throw new Error(heldError);
 }
 
-async function withCurrentLock<T>(root: string, work: () => Promise<T>): Promise<T> {
-  await mkdir(root, { recursive: true });
+async function withCurrentLock<T>(
+  root: string,
+  work: () => Promise<T>,
+  expectedParent?: PinnedDirectoryIdentity,
+): Promise<T> {
+  const parent = await snapshotPinnedParent(root);
+  if (expectedParent && (parent.dev !== expectedParent.dev || parent.ino !== expectedParent.ino)) {
+    throw new Error('ralplan_advisory_state_authority_changed');
+  }
+  try {
+    const identity = await lstat(root);
+    if (!identity.isDirectory() || identity.isSymbolicLink()) throw new Error('ralplan_advisory_state_authority_changed');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await createPinnedDirectory(root, expectedParent ?? parent);
+  }
   const lockPath = join(root, 'current.lock');
-  const lock = await acquireAdvisoryLock(lockPath, root, 'ralplan_advisory_current_lock_held');
+  const lock = await acquireAdvisoryLock(lockPath, 'ralplan_advisory_current_lock_held');
   try { return await work(); }
-  finally { await lock.close().catch(() => {}); await rm(lockPath, { force: true }); await syncDirectory(root).catch(() => {}); }
+  finally { await removePinnedFile(lock.path, lock.snapshot, lock.parent).catch(() => {}); await syncDirectory(root).catch(() => {}); }
 }
 
 export async function withRalplanAdvisoryCurrentLock<T>(
@@ -467,15 +475,16 @@ export async function withRalplanAdvisoryCurrentLock<T>(
 async function withGenerationLock<T>(cwd: string, sessionId: string, generationId: string, work: () => Promise<T>): Promise<T> {
   const dir = generationDir(await canonicalCwd(cwd), sessionId, generationId);
   const lockPath = join(dir, 'generation.lock');
-  const lock = await acquireAdvisoryLock(lockPath, dir, 'ralplan_advisory_generation_lock_held');
+  const lock = await acquireAdvisoryLock(lockPath, 'ralplan_advisory_generation_lock_held');
   try { return await work(); }
-  finally { await lock.close().catch(() => {}); await rm(lockPath, { force: true }); await syncDirectory(dir).catch(() => {}); }
+  finally { await removePinnedFile(lock.path, lock.snapshot, lock.parent).catch(() => {}); await syncDirectory(dir).catch(() => {}); }
 }
 
 interface AdvisoryActivationInput {
   cwd: string; sessionId: string; rootThreadId: string; activationTurnId: string;
   predecessorGenerationId?: string; generationId?: string; nowIso?: string; activationPrompt?: string;
   failpoint?: (name: 'rollover_intent' | 'rollover_activation' | 'rollover_pointer' | 'intent_committed') => void | Promise<void>;
+  authoritySessionParent?: PinnedDirectoryIdentity;
 }
 
 async function prepareActivationIntentUnlocked(
@@ -517,7 +526,7 @@ export async function prepareRalplanAdvisoryActivationInternal(input: Omit<Advis
   const cwd = await canonicalCwd(input.cwd);
   if (![input.sessionId, input.rootThreadId, input.activationTurnId].every(safeId)) throw new Error('ralplan_advisory_identity_missing');
   const root = advisoryRoot(cwd, input.sessionId);
-  return withCurrentLock(root, () => prepareActivationIntentUnlocked(cwd, root, input));
+  return withCurrentLock(root, () => prepareActivationIntentUnlocked(cwd, root, input), input.authoritySessionParent);
 }
 
 export async function readAuthorizedPendingRalplanActivation(input: {

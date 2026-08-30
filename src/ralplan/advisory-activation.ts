@@ -16,6 +16,7 @@ import {
   type AdvisoryProjection,
 } from './advisory.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
+import { snapshotPinnedParent } from '../state/pinned-file.js';
 
 async function ensureOwnedDirectory(path: string): Promise<void> {
   try {
@@ -59,6 +60,8 @@ export interface ActivateOrResumeRalplanAdvisoryInput {
   nowIso?: string;
   resumeOnly?: boolean;
   failpoint?: (checkpoint: AdvisoryActivationCheckpoint) => void | Promise<void>;
+  /** @internal Test-only boundary after authority pinning and before lifecycle mutation. */
+  beforeIntentPreparation?: () => void | Promise<void>;
 }
 
 type AdvisoryActivationResult = { activation: AdvisoryActivation; projection: AdvisoryProjection };
@@ -188,6 +191,8 @@ export async function activateOrResumeRalplanAdvisory(
   const sessionsDir = join(authorityStateDir, 'sessions');
   await ensureOwnedDirectory(sessionsDir);
   await ensureOwnedDirectory(authoritySessionDir);
+  const authoritySessionParent = await snapshotPinnedParent(join(authoritySessionDir, 'ralplan-advisory'));
+  await input.beforeIntentPreparation?.();
   const authority = {
     cwd: input.cwd, sessionId: input.sessionId, producer: input.producer, threadKind: input.threadKind,
     rootThreadId: input.rootThreadId, activationTurnId: input.activationTurnId, prompt: input.prompt,
@@ -239,6 +244,7 @@ export async function activateOrResumeRalplanAdvisory(
     activation = await prepareRalplanAdvisoryActivationInternal({
       cwd: input.cwd, sessionId: input.sessionId, rootThreadId: input.rootThreadId,
       activationTurnId: input.activationTurnId, activationPrompt: input.prompt,
+      authoritySessionParent,
       ...(input.generationId ? { generationId: input.generationId } : {}),
       ...(input.predecessorGenerationId ? { predecessorGenerationId: input.predecessorGenerationId } : {}),
       ...(input.nowIso ? { nowIso: input.nowIso } : {}),

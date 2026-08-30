@@ -378,6 +378,27 @@ describe('central Ralplan Advisory activation owner', () => {
     }
   });
 
+  it('rejects a session authority swap after pinning and before intent creation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-post-pin-swap-'));
+    roots.push(cwd);
+    const outside = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-post-pin-target-'));
+    roots.push(outside);
+    const sessionDir = join(cwd, '.omx', 'state', 'sessions', 'session-a');
+    const movedDir = `${sessionDir}-moved`;
+    await mkdir(sessionDir, { recursive: true });
+
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory post pin swap', generationId: 'generation-a',
+      beforeIntentPreparation: async () => {
+        await rename(sessionDir, movedDir);
+        await symlink(outside, sessionDir);
+      },
+    }), /state_authority_changed|pinned_file_parent_(?:changed|invalid)/);
+    assert.equal(existsSync(join(outside, 'ralplan-advisory')), false);
+    assert.equal(existsSync(join(movedDir, 'ralplan-advisory')), false);
+  });
+
   it('keeps fast repair atomic when a Standard writer wins immediately after the mirror transaction', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-fast-repair-race-'));
     roots.push(cwd);

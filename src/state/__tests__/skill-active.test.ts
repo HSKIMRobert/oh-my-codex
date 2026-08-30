@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rename, rm, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -794,7 +794,7 @@ describe('skill-active state helpers', () => {
           { active: true, skill: 'new', phase: 'executing', session_id: sessionId, active_skills: [{ skill: 'new', phase: 'executing', active: true, session_id: sessionId }] },
           sessionId,
           sessionPath,
-          async () => writeFile(sessionPath, 'primary-new'),
+          async () => undefined,
           {
             beforeCommit: async (event) => {
               if (event.site !== 'skill-active.session-copy') return;
@@ -809,6 +809,43 @@ describe('skill-active state helpers', () => {
       );
       assert.equal(await readFile(rootPath, 'utf8'), successorRoot);
       assert.equal(await readFile(join(lockPath, 'owner-successor-token'), 'utf8'), 'successor-token');
+    });
+  });
+  it('rejects a session-parent swap through commit and rollback without touching the replacement', async () => {
+    await withTempRepo('omx-skill-active-parent-swap-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-parent-swap';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const movedDir = join(stateDir, 'sessions', `${sessionId}-moved`);
+      const outside = await mkdtemp(join(tmpdir(), 'omx-skill-active-parent-swap-target-'));
+      const sessionPath = join(sessionDir, 'skill-active-state.json');
+      const sentinelPath = join(outside, 'sentinel.txt');
+      try {
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(sessionPath, '{"active":false}\n');
+        await writeFile(sentinelPath, 'unchanged');
+        await assert.rejects(
+          writeSkillActiveStateCopiesForStateDir(
+            stateDir,
+            { active: true, skill: 'ralplan', session_id: sessionId },
+            sessionId,
+            { active: true, skill: 'ralplan', session_id: sessionId },
+            {
+              beforeCommit: async (event) => {
+                if (event.site !== 'skill-active.session-copy') return;
+                await rename(sessionDir, movedDir);
+                await symlink(outside, sessionDir);
+              },
+            },
+          ),
+          /pinned_file_parent_(?:changed|invalid)|failed to atomically replace/,
+        );
+        assert.equal(await readFile(sentinelPath, 'utf8'), 'unchanged');
+        assert.equal(existsSync(join(outside, 'skill-active-state.json')), false);
+        assert.equal(await readFile(join(movedDir, 'skill-active-state.json'), 'utf8'), '{"active":false}\n');
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
     });
   });
   it('rejects live stale takeover, cleans dead stale locks, and preserves recovery', async () => {

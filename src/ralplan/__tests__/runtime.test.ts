@@ -467,7 +467,7 @@ describe('ralplan advisory runtime', () => {
   });
 
   it('rejects Architect mutation during Critic review and reused reviewer artifact paths', async () => {
-    for (const scenario of ['mutated-architect', 'reused-path'] as const) {
+    for (const scenario of ['mutated-architect', 'reused-path', 'critic-plan-reuse'] as const) {
       const cwd = await mkdtemp(join(tmpdir(), `omx-ralplan-advisory-review-artifact-${scenario}-`));
       const sessionId = `sess-advisory-${scenario}`;
       try {
@@ -497,7 +497,11 @@ describe('ralplan advisory runtime', () => {
             return {
               verdict: 'approve', agent_role: 'critic', provenance_kind: 'native_subagent',
               session_id: sessionId, thread_id: 'thread-critic',
-              artifact_path: scenario === 'reused-path' ? '.omx/artifacts/architect.md' : '.omx/artifacts/critic.md',
+              artifact_path: scenario === 'reused-path'
+                ? '.omx/artifacts/architect.md'
+                : scenario === 'critic-plan-reuse'
+                  ? '.omx/plans/advisory.md'
+                  : '.omx/artifacts/critic.md',
             };
           },
         }, {
@@ -508,7 +512,9 @@ describe('ralplan advisory runtime', () => {
         assert.equal(result.status, 'failed');
         assert.match(result.error ?? '', scenario === 'mutated-architect'
           ? /architect_artifact_changed_during_critic_review/
-          : /review_artifact_path_reused/);
+          : scenario === 'reused-path'
+            ? /review_artifact_path_reused/
+            : /critic_artifact_reuses_plan_path/);
         assert.equal(result.planningComplete, false);
       } finally {
         await rm(cwd, { recursive: true, force: true });

@@ -142,7 +142,12 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
           : `Ralplan ${result.status}: ${result.error ?? result.phase}`);
         return;
       }
-      await startMode('ralplan', task.trim(), 5, cwd, sessionId);
+      const existing = sessionId
+        ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
+        : await readModeState('ralplan', cwd);
+      if (!(existing?.active === true && existing.workflow_variant === 'advisory')) {
+        await startMode('ralplan', task.trim(), 5, cwd, sessionId);
+      }
     }
     const state = sessionId
       ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)

@@ -1,5 +1,5 @@
 import { constants as fsConstants, existsSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
@@ -51,6 +51,7 @@ import {
   type SkillActiveStateLike,
   writeSkillActiveStateCopiesForStateDir,
   writeSkillActiveStateWithPrimaryTransactionForStateDir,
+  withRootSkillActiveStateLock,
 } from './skill-active.js';
 import {
   isTrackedWorkflowMode,
@@ -58,6 +59,15 @@ import {
 } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
 import { readCurrentRalplanAdvisory, validateAdvisoryInactiveState, validateAdvisoryPreparedInactiveWrite } from '../ralplan/advisory.js';
+import {
+  createPinnedFileExclusive,
+  removePinnedFile,
+  replacePinnedFile,
+  snapshotPinnedFile,
+  snapshotPinnedParent,
+  type PinnedDirectoryIdentity,
+  type PinnedFileSnapshot,
+} from './pinned-file.js';
 export const SUPPORTED_STATE_READ_MODES = [
   'autopilot',
   'autoresearch',
@@ -195,23 +205,22 @@ async function readStateFileRecord(path: string, requireCurrentRecord: boolean):
   return parsed as Record<string, unknown>;
 }
 
-async function acquireStateFileWriteLock(path: string): Promise<Awaited<ReturnType<typeof open>>> {
+interface StateFileLockLease {
+  lockPath: string;
+  snapshot: PinnedFileSnapshot;
+  parent: PinnedDirectoryIdentity;
+}
+
+async function acquireStateFileWriteLock(path: string): Promise<StateFileLockLease> {
   const lockPath = `${path}.write-lock`;
   await mkdir(dirname(path), { recursive: true });
-  const parent = await lstat(dirname(path));
-  if (!parent.isDirectory() || parent.isSymbolicLink()) {
-    throw new Error('state_file_write_parent_unsafe');
-  }
+  const parent = await snapshotPinnedParent(lockPath);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const handle = await open(
-        lockPath,
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-        0o600,
-      );
-      await handle.writeFile(`${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`);
-      await handle.sync();
-      return handle;
+      await createPinnedFileExclusive(lockPath, `${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`, parent);
+      const snapshot = await snapshotPinnedFile(lockPath);
+      if (!snapshot) throw new Error('state_file_write_lock_missing');
+      return { lockPath, snapshot, parent };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       let owner: Record<string, unknown> | null = null;
@@ -233,7 +242,9 @@ async function acquireStateFileWriteLock(path: string): Promise<Awaited<ReturnTy
       } catch (probeError) {
         if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
       }
-      await rm(lockPath, { force: false });
+      const snapshot = await snapshotPinnedFile(lockPath);
+      if (!snapshot) throw new Error('state_file_write_lock_held');
+      await removePinnedFile(lockPath, snapshot, parent);
     }
   }
   throw new Error('state_file_write_lock_held');
@@ -244,22 +255,29 @@ export async function writeStateFileTransaction(
   data: string,
   options: StateFileWriteTransactionOptions = {},
 ): Promise<void> {
-  await withStateFileWriteLock(path, async () => {
+  await withStateFileWriteLock(path, async (lock) => {
+    const snapshot = await snapshotPinnedFile(path);
     const current = await readStateFileRecord(path, options.requireCurrentRecord === true);
     await options.validateCurrent?.(current);
-    await writeAtomicFile(path, data);
+    try {
+      await replacePinnedFile(path, data, snapshot, lock.parent);
+    } catch (error) {
+      if ((error as Error).message.includes('pinned_file_cas_mismatch')
+        || (error as NodeJS.ErrnoException).code === 'ESTALE') {
+        throw new Error('state_file_write_cas_mismatch');
+      }
+      throw error;
+    }
     await options.afterWrite?.();
   });
 }
 
-export async function withStateFileWriteLock<T>(path: string, work: () => Promise<T>): Promise<T> {
-  const lockPath = `${path}.write-lock`;
+export async function withStateFileWriteLock<T>(path: string, work: (lock: StateFileLockLease) => Promise<T>): Promise<T> {
   const lock = await acquireStateFileWriteLock(path);
   try {
-    return await work();
+    return await work(lock);
   } finally {
-    await lock.close().catch(() => {});
-    await rm(lockPath, { force: true });
+    await removePinnedFile(lock.lockPath, lock.snapshot, lock.parent).catch(() => {});
   }
 }
 
@@ -287,14 +305,19 @@ async function writeStateFileCas(
   });
 }
 
-async function unlinkStateFileCas(path: string, expectedInput?: Awaited<ReturnType<typeof lstat>>): Promise<void> {
-  const expected = expectedInput ?? await lstat(path);
-  await withStateFileWriteLock(path, async () => {
-    const current = await lstat(path);
-    if (current.dev !== expected.dev || current.ino !== expected.ino || current.mtimeMs !== expected.mtimeMs) {
-      throw new Error('state_file_write_cas_mismatch');
+async function unlinkStateFileCas(path: string, expectedInput?: PinnedFileSnapshot): Promise<void> {
+  const expected = expectedInput ?? await snapshotPinnedFile(path);
+  if (!expected) throw new Error('state_file_write_cas_mismatch');
+  await withStateFileWriteLock(path, async (lock) => {
+    try {
+      await removePinnedFile(path, expected, lock.parent);
+    } catch (error) {
+      if ((error as Error).message.includes('pinned_file_cas_mismatch')
+        || (error as NodeJS.ErrnoException).code === 'ESTALE') {
+        throw new Error('state_file_write_cas_mismatch');
+      }
+      throw error;
     }
-    await unlink(path);
   });
 }
 
@@ -643,10 +666,6 @@ function serializeAtomicJson(value: unknown): string {
   return serialized;
 }
 
-async function writeAtomicJson(path: string, serialized: string): Promise<void> {
-  await writeAtomicFile(path, serialized);
-}
-
 async function readJsonRecordIfExists(path: string): Promise<Record<string, unknown> | null> {
   if (!existsSync(path)) return null;
   try {
@@ -699,6 +718,8 @@ export async function completeRalplanSession(options: {
   const rootStatePath = join(options.baseStateDir, getStateFilename('ralplan'));
   const existingRootState = await readJsonRecordIfExists(rootStatePath);
   const shouldWriteRootState = shouldWriteRootRalplanTerminalState(existingRootState, sessionId);
+  let terminalSessionPath: string | null = null;
+  let terminalSessionState: Record<string, unknown> | null = null;
 
   if (sessionId) {
     const sessionStatePath = join(writableScope.stateDir, getStateFilename('ralplan'));
@@ -708,6 +729,8 @@ export async function completeRalplanSession(options: {
     await mkdir(dirname(sessionStatePath), { recursive: true });
     await beforeCommit({ site: 'ralplan.session-state', kind: 'write', path: sessionStatePath });
     await writeStateFileCas(sessionStatePath, sessionStatePayload, existingSessionState);
+    terminalSessionPath = sessionStatePath;
+    terminalSessionState = sessionState;
   }
   if (shouldWriteRootState) {
     const rootStatePayload = serializeAtomicJson(rootState);
@@ -716,38 +739,47 @@ export async function completeRalplanSession(options: {
     await writeStateFileCas(rootStatePath, rootStatePayload, existingRootState);
   }
 
-  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(options.baseStateDir, sessionId);
-  const rootSkillState = await readSkillActiveState(rootPath);
-  const rootEntries = filterCompletedRalplanRootEntries(
-    listActiveSkills(rootSkillState ?? {}),
-    completedSessionId,
-    rootScopeCompletion,
-  );
-  if (rootEntries.length > 0 || (shouldWriteRootState && rootSkillState !== null)) {
-    const nextRootSkillState = buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso);
-    const rootSkillStatePayload = serializeAtomicJson(nextRootSkillState);
-    await mkdir(dirname(rootPath), { recursive: true });
-    await beforeCommit({ site: 'ralplan.root-skill-write', kind: 'write', path: rootPath });
-    await writeAtomicJson(rootPath, rootSkillStatePayload);
-  } else if (rootSkillState !== null && !isTerminalSkillActiveTombstone(rootSkillState)) {
-    await beforeCommit({ site: 'ralplan.root-skill-unlink', kind: 'unlink', path: rootPath });
-    await unlink(rootPath).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== 'ENOENT') throw error;
-    });
-  }
-  if (sessionPath && sessionId) {
-    const sessionSkillState = await readSkillActiveState(sessionPath);
-    const sessionEntries = collectCompletedRalplanSessionEntries(sessionSkillState, rootSkillState, sessionId);
-    if (sessionEntries.length > 0 || sessionSkillState !== null) {
-      const nextSessionSkillState = sessionEntries.length > 0
-        ? buildRalplanSkillStateFromEntries(sessionSkillState ?? rootSkillState, rootState, sessionEntries, sessionId, nowIso)
-        : buildRalplanTerminalSkillState(sessionSkillState, rootState, sessionId, nowIso);
-      const sessionSkillStatePayload = serializeAtomicJson(nextSessionSkillState);
-      await mkdir(dirname(sessionPath), { recursive: true });
-      await beforeCommit({ site: 'ralplan.session-skill-write', kind: 'write', path: sessionPath });
-      await writeAtomicJson(sessionPath, sessionSkillStatePayload);
+  const writeTerminalSkillMirrors = async (): Promise<void> => {
+    if (terminalSessionPath && JSON.stringify(await readStateFileRecord(terminalSessionPath, true)) !== JSON.stringify(terminalSessionState)) {
+      throw new Error('ralplan_terminal_binding_cas_mismatch');
     }
-  }
+    const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(options.baseStateDir, sessionId);
+    await withRootSkillActiveStateLock(rootPath, async () => {
+      const rootParent = await snapshotPinnedParent(rootPath);
+      const rootSnapshot = await snapshotPinnedFile(rootPath);
+      const rootSkillState = await readSkillActiveState(rootPath);
+      const rootEntries = filterCompletedRalplanRootEntries(
+        listActiveSkills(rootSkillState ?? {}),
+        completedSessionId,
+        rootScopeCompletion,
+      );
+      if (rootEntries.length > 0 || (shouldWriteRootState && rootSkillState !== null)) {
+        const nextRootSkillState = buildRalplanSkillStateFromEntries(rootSkillState, rootState, rootEntries, undefined, nowIso);
+        const rootSkillStatePayload = serializeAtomicJson(nextRootSkillState);
+        await beforeCommit({ site: 'ralplan.root-skill-write', kind: 'write', path: rootPath });
+        await replacePinnedFile(rootPath, rootSkillStatePayload, rootSnapshot, rootParent);
+      } else if (rootSkillState !== null && !isTerminalSkillActiveTombstone(rootSkillState) && rootSnapshot) {
+        await beforeCommit({ site: 'ralplan.root-skill-unlink', kind: 'unlink', path: rootPath });
+        await removePinnedFile(rootPath, rootSnapshot, rootParent);
+      }
+      if (sessionPath && sessionId) {
+        const sessionParent = await snapshotPinnedParent(sessionPath);
+        const sessionSnapshot = await snapshotPinnedFile(sessionPath);
+        const sessionSkillState = await readSkillActiveState(sessionPath);
+        const sessionEntries = collectCompletedRalplanSessionEntries(sessionSkillState, rootSkillState, sessionId);
+        if (sessionEntries.length > 0 || sessionSkillState !== null) {
+          const nextSessionSkillState = sessionEntries.length > 0
+            ? buildRalplanSkillStateFromEntries(sessionSkillState ?? rootSkillState, rootState, sessionEntries, sessionId, nowIso)
+            : buildRalplanTerminalSkillState(sessionSkillState, rootState, sessionId, nowIso);
+          const sessionSkillStatePayload = serializeAtomicJson(nextSessionSkillState);
+          await beforeCommit({ site: 'ralplan.session-skill-write', kind: 'write', path: sessionPath });
+          await replacePinnedFile(sessionPath, sessionSkillStatePayload, sessionSnapshot, sessionParent);
+        }
+      }
+    });
+  };
+  if (terminalSessionPath) await withStateFileWriteLock(terminalSessionPath, writeTerminalSkillMirrors);
+  else await writeTerminalSkillMirrors();
   return true;
 }
 
@@ -1115,7 +1147,6 @@ export async function executeStateOperation(
               path,
               async () => {
                 await beforeCommit({ site: 'mode.primary', kind: 'write', path });
-                await writeAtomicFile(path, payload);
               },
               { beforeCommit },
             );
@@ -1237,7 +1268,8 @@ export async function executeStateOperation(
         ) {
           await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
         } else if (existsSync(path)) {
-          const expected = await lstat(path);
+          const expected = await snapshotPinnedFile(path);
+          if (!expected) throw new Error('state_file_write_cas_mismatch');
           await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
           await unlinkStateFileCas(path, expected);
         }

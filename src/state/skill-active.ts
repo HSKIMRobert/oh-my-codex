@@ -3,6 +3,14 @@ import { constants as fsConstants, existsSync } from 'fs';
 import { lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'fs/promises';
 import { basename, dirname, join } from 'path';
 import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.js';
+import {
+  removePinnedFile,
+  replacePinnedFile,
+  snapshotPinnedFile,
+  snapshotPinnedParent,
+  type PinnedDirectoryIdentity,
+  type PinnedFileSnapshot,
+} from './pinned-file.js';
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import { pickPrimaryWorkflowMode } from './workflow-transition.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
@@ -398,7 +406,7 @@ async function readRootStateForWrite(rootPath: string): Promise<SkillActiveState
   return normalizeSkillActiveState(parsed) ?? parsed as SkillActiveStateLike;
 }
 
-interface RootSkillActiveLock {
+export interface RootSkillActiveLock {
   path: string;
   token: string;
 }
@@ -602,7 +610,7 @@ async function releaseRootSkillActiveStateLock(lock: RootSkillActiveLock): Promi
 
 }
 
-async function withRootSkillActiveStateLock<T>(rootPath: string, operation: (lock: RootSkillActiveLock) => Promise<T>): Promise<T> {
+export async function withRootSkillActiveStateLock<T>(rootPath: string, operation: (lock: RootSkillActiveLock) => Promise<T>): Promise<T> {
   const lock = await acquireRootSkillActiveStateLock(rootPath);
   try {
     await assertRootSkillActiveLockOwner(lock);
@@ -653,17 +661,15 @@ async function writeRootSkillActiveStateAtomically(
   rootState: SkillActiveStateLike,
   beforeCommit?: BeforeWritableCommit,
   lock?: RootSkillActiveLock,
+  expectedParent?: PinnedDirectoryIdentity,
 ): Promise<void> {
-  const tempPath = `${rootPath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
   const payload = `${JSON.stringify({ version: 1, ...rootState }, null, 2)}\n`;
   await beforeCommit?.({ site: 'skill-active.root-copy', kind: 'write', path: rootPath });
   try {
     if (lock) await assertRootSkillActiveLockOwner(lock);
-    await writeFile(tempPath, payload);
+    await replacePinnedFile(rootPath, payload, await snapshotPinnedFile(rootPath), expectedParent);
     if (lock) await assertRootSkillActiveLockOwner(lock);
-    await rename(tempPath, rootPath);
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
     if (error instanceof SkillActiveStateWriteError) throw error;
     throw new SkillActiveStateWriteError('atomic-replace-failed', `failed to atomically replace root skill-active state: ${rootPath}`, { cause: error });
   }
@@ -674,27 +680,21 @@ async function restoreRootSkillActiveStateBytesIfOwned(
   rootPath: string,
   previousRoot: Buffer | null,
   lock: RootSkillActiveLock,
+  expectedParent?: PinnedDirectoryIdentity,
 ): Promise<void> {
   await assertRootSkillActiveLockOwner(lock);
   if (previousRoot === null) {
-    await unlink(rootPath).catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    });
+    const current = await snapshotPinnedFile(rootPath);
+    if (current) await removePinnedFile(rootPath, current, expectedParent);
     return;
   }
-  const tempPath = `${rootPath}.rollback-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
-  try {
-    await writeFile(tempPath, previousRoot);
-    await assertRootSkillActiveLockOwner(lock);
-    await rename(tempPath, rootPath);
-  } finally {
-    await rm(tempPath, { force: true }).catch(() => undefined);
-  }
+  await replacePinnedFile(rootPath, previousRoot, await snapshotPinnedFile(rootPath), expectedParent);
+  await assertRootSkillActiveLockOwner(lock);
 }
 
 interface SessionMirrorSnapshot {
   bytes: Buffer | null;
-  identity: { dev: number; ino: number } | null;
+  identity: PinnedFileSnapshot | null;
 }
 
 async function readSessionMirrorSnapshot(sessionPath: string): Promise<SessionMirrorSnapshot> {
@@ -712,7 +712,10 @@ async function readSessionMirrorSnapshot(sessionPath: string): Promise<SessionMi
       || current.nlink !== 1 || opened.dev !== current.dev || opened.ino !== current.ino) {
       throw new SkillActiveStateWriteError('malformed-session', `unsafe session skill-active state: ${sessionPath}`);
     }
-    return { bytes: await handle.readFile(), identity: { dev: opened.dev, ino: opened.ino } };
+    return {
+      bytes: await handle.readFile(),
+      identity: { dev: opened.dev, ino: opened.ino, size: opened.size, mtimeMs: opened.mtimeMs },
+    };
   } finally {
     await handle.close();
   }
@@ -724,52 +727,19 @@ async function replaceSessionMirrorAtomically(
   expected: SessionMirrorSnapshot,
   lock: RootSkillActiveLock,
   beforeCommit?: BeforeWritableCommit,
+  expectedParent?: PinnedDirectoryIdentity,
 ): Promise<void> {
-  const parentPath = dirname(sessionPath);
-  const parentIdentity = await lstat(parentPath);
-  if (!parentIdentity.isDirectory() || parentIdentity.isSymbolicLink()) {
-    throw new SkillActiveStateWriteError('malformed-session', `unsafe session skill-active parent: ${parentPath}`);
-  }
-  const parent = await open(parentPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-  const descriptorParent = process.platform === 'linux' ? `/proc/self/fd/${parent.fd}` : parentPath;
-  const pinnedSessionPath = join(descriptorParent, basename(sessionPath));
-  const tempPath = join(descriptorParent, `${basename(sessionPath)}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`);
   let commitStarted = false;
   try {
     await beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
     commitStarted = true;
     await assertRootSkillActiveLockOwner(lock);
-    const beforeParent = await lstat(parentPath);
-    if (beforeParent.dev !== parentIdentity.dev || beforeParent.ino !== parentIdentity.ino
-      || !beforeParent.isDirectory() || beforeParent.isSymbolicLink()) {
-      throw new SkillActiveStateWriteError('malformed-session', `session skill-active parent changed: ${parentPath}`);
-    }
-    const current = await readSessionMirrorSnapshot(pinnedSessionPath);
-    if (current.identity?.dev !== expected.identity?.dev || current.identity?.ino !== expected.identity?.ino
-      || (current.identity === null) !== (expected.identity === null)) {
-      throw new SkillActiveStateWriteError('malformed-session', `session skill-active state changed: ${sessionPath}`);
-    }
-    const temp = await open(
-      tempPath,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-      0o600,
-    );
-    try { await temp.writeFile(payload); await temp.sync(); } finally { await temp.close(); }
+    await replacePinnedFile(sessionPath, payload, expected.identity, expectedParent);
     await assertRootSkillActiveLockOwner(lock);
-    const afterParent = await lstat(parentPath);
-    if (afterParent.dev !== parentIdentity.dev || afterParent.ino !== parentIdentity.ino
-      || !afterParent.isDirectory() || afterParent.isSymbolicLink()) {
-      throw new SkillActiveStateWriteError('malformed-session', `session skill-active parent changed: ${parentPath}`);
-    }
-    await rename(tempPath, pinnedSessionPath);
-    await parent.sync();
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
     if (!commitStarted) throw error;
     if (error instanceof SkillActiveStateWriteError) throw error;
     throw new SkillActiveStateWriteError('atomic-replace-failed', `failed to atomically replace session skill-active state: ${sessionPath}`, { cause: error });
-  } finally {
-    await parent.close();
   }
 }
 
@@ -809,10 +779,11 @@ export async function updateRootSkillActiveStateForStateDir(
 ): Promise<void> {
   const { rootPath } = getSkillActiveStatePathsForStateDir(stateDir);
   await withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const rootParent = await snapshotPinnedParent(rootPath);
     const currentRoot = await readRootStateForWrite(rootPath);
     const nextRoot = update(currentRoot);
     if (nextRoot === null) return;
-    await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+    await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock, rootParent);
   });
 }
 
@@ -831,6 +802,8 @@ export async function updateSkillActiveStateCopiesForExactSessionTransaction(
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
   if (!sessionPath) throw new Error('skill-active exact-session transaction requires a session path');
   return withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const sessionParent = await snapshotPinnedParent(sessionPath);
+    const rootParent = await snapshotPinnedParent(rootPath);
     const previousSessionSnapshot = await readSessionMirrorSnapshot(sessionPath);
     const previousSession = previousSessionSnapshot.bytes;
     const currentRoot = await readRootStateForWrite(rootPath);
@@ -859,9 +832,10 @@ export async function updateSkillActiveStateCopiesForExactSessionTransaction(
         previousSessionSnapshot,
         lock,
         options.beforeCommit,
+        sessionParent,
       );
       sessionCommitted = true;
-      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock, rootParent);
       return nextSession;
     } catch (error) {
       let rollbackError: unknown;
@@ -869,15 +843,16 @@ export async function updateSkillActiveStateCopiesForExactSessionTransaction(
         try {
           if (previousSession === null) {
             await assertRootSkillActiveLockOwner(lock);
-            await unlink(sessionPath).catch((unlinkError: unknown) => {
-              if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError;
-            });
+            const committed = await snapshotPinnedFile(sessionPath);
+            if (committed) await removePinnedFile(sessionPath, committed, sessionParent);
           } else {
             await replaceSessionMirrorAtomically(
               sessionPath,
               previousSession,
               await readSessionMirrorSnapshot(sessionPath),
               lock,
+              undefined,
+              sessionParent,
             );
           }
         } catch (ownershipOrRestoreError) {
@@ -903,30 +878,45 @@ export async function writeSkillActiveStateWithPrimaryTransactionForStateDir(
   const sessionPayload = `${JSON.stringify(normalized, null, 2)}\n`;
 
   await withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const sessionParent = await snapshotPinnedParent(primaryPath);
+    const rootParent = await snapshotPinnedParent(rootPath);
     const currentRoot = await readRootStateForWrite(rootPath);
     const nextRoot = mergeRootStateForSession(currentRoot, normalized, safeString(normalized.session_id).trim());
-    const previousPrimary = existsSync(primaryPath) ? await readFile(primaryPath) : null;
+    const previousPrimarySnapshot = await readSessionMirrorSnapshot(primaryPath);
+    const previousPrimary = previousPrimarySnapshot.bytes;
     const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
     let primaryCommitted = false;
     try {
       await primaryWrite();
-      primaryCommitted = true;
-      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
       await replaceSessionMirrorAtomically(
         sessionPath,
         sessionPayload,
-        await readSessionMirrorSnapshot(sessionPath),
+        previousPrimarySnapshot,
         lock,
         options.beforeCommit,
+        sessionParent,
       );
+      primaryCommitted = true;
+      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock, rootParent);
     } catch (error) {
       let rollbackError: unknown;
       if (primaryCommitted) {
-        if (previousPrimary === null) await unlink(primaryPath).catch(() => undefined);
-        else await writeFile(primaryPath, previousPrimary);
+        if (previousPrimary === null) {
+          const current = await snapshotPinnedFile(primaryPath);
+          if (current) await removePinnedFile(primaryPath, current, sessionParent);
+        } else {
+          await replaceSessionMirrorAtomically(
+            primaryPath,
+            previousPrimary,
+            await readSessionMirrorSnapshot(primaryPath),
+            lock,
+            undefined,
+            sessionParent,
+          );
+        }
       }
       try {
-        await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
+        await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock, rootParent);
       } catch (ownershipOrRestoreError) {
         rollbackError = ownershipOrRestoreError;
       }
@@ -945,15 +935,20 @@ async function writeSkillActiveStateCopiesToPaths(
   sessionOnlyWhenRootMissing = false,
 ): Promise<void> {
   const normalized = { version: 1, ...state };
-  const writeSessionCopy = async (ownedLock: RootSkillActiveLock): Promise<SessionMirrorSnapshot | null> => {
+  const writeSessionCopy = async (ownedLock: RootSkillActiveLock): Promise<{
+    snapshot: SessionMirrorSnapshot;
+    parent: PinnedDirectoryIdentity;
+  } | null> => {
     if (!sessionPath) return null;
     const sessionPayload = `${JSON.stringify(normalized, null, 2)}\n`;
     await mkdir(dirname(sessionPath), { recursive: true });
+    const parent = await snapshotPinnedParent(sessionPath);
     const previous = await readSessionMirrorSnapshot(sessionPath);
-    await replaceSessionMirrorAtomically(sessionPath, sessionPayload, previous, ownedLock, beforeCommit);
-    return previous;
+    await replaceSessionMirrorAtomically(sessionPath, sessionPayload, previous, ownedLock, beforeCommit, parent);
+    return { snapshot: previous, parent };
   };
   const writeRootTransaction = async (ownedLock: RootSkillActiveLock): Promise<void> => {
+    const rootParent = await snapshotPinnedParent(rootPath);
     const currentRoot = await readRootStateForWrite(rootPath);
     if (sessionPath && sessionOnlyWhenRootMissing && currentRoot === null) {
       await writeSessionCopy(ownedLock);
@@ -963,23 +958,24 @@ async function writeSkillActiveStateCopiesToPaths(
       ? mergeRootStateForSession(currentRoot, normalized, safeString(normalized.session_id).trim())
       : { version: 1, ...(rootState ?? normalized) };
     if (!sessionPath) {
-      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, beforeCommit, ownedLock);
+      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, beforeCommit, ownedLock, rootParent);
       return;
     }
     const previousSession = await writeSessionCopy(ownedLock);
     try {
-      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, beforeCommit, ownedLock);
+      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, beforeCommit, ownedLock, rootParent);
     } catch (error) {
-      if (previousSession?.bytes === null) {
-        await unlink(sessionPath).catch((unlinkError: unknown) => {
-          if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError;
-        });
+      if (previousSession?.snapshot.bytes === null) {
+        const current = await snapshotPinnedFile(sessionPath);
+        if (current) await removePinnedFile(sessionPath, current, previousSession.parent);
       } else if (previousSession) {
         await replaceSessionMirrorAtomically(
           sessionPath,
-          previousSession.bytes,
+          previousSession.snapshot.bytes!,
           await readSessionMirrorSnapshot(sessionPath),
           ownedLock,
+          undefined,
+          previousSession.parent,
         );
       }
       throw error;

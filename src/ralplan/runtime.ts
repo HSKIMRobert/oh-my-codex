@@ -751,6 +751,10 @@ export async function runRalplanConsensus(
         if (criticArtifactManifest.entries[0]?.path === architectArtifactManifest?.entries[0]?.path) {
           throw new Error('ralplan_advisory_review_artifact_path_reused');
         }
+        if (criticArtifactManifest.entries[0]?.path
+          === (await digestAdvisoryArtifacts(cwd, [latestPlanPath!])).entries[0]?.path) {
+          throw new Error('ralplan_advisory_critic_artifact_reuses_plan_path');
+        }
       }
       assertRoleLaneReuse(reusableRoleLanes.critic, criticReview, 'critic');
       criticReviews.push(criticReview);
@@ -773,7 +777,8 @@ export async function runRalplanConsensus(
       if (advisory && architectReview.verdict === 'approve' && criticReview.verdict === 'approve') {
         const architectPath = requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path');
         const criticPath = requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path');
-        if ((await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256
+        if ((await digestAdvisoryArtifacts(cwd, [latestPlanPath!])).sha256 !== advisoryPlanDigestBeforeReviews
+          || (await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256
           || (await digestAdvisoryArtifacts(cwd, [criticPath])).sha256 !== criticArtifactManifest?.sha256) {
           throw new Error('ralplan_advisory_review_artifact_changed_before_lifecycle');
         }
@@ -813,7 +818,8 @@ export async function runRalplanConsensus(
         const revalidate = async () => {
           const architectPath = requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path');
           const criticPath = requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path');
-          if ((await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256
+          if ((await digestAdvisoryArtifacts(cwd, [latestPlanPath!])).sha256 !== advisoryPlanDigestBeforeReviews
+            || (await digestAdvisoryArtifacts(cwd, [architectPath])).sha256 !== architectArtifactManifest?.sha256
             || (await digestAdvisoryArtifacts(cwd, [criticPath])).sha256 !== criticArtifactManifest?.sha256) {
             throw new Error('ralplan_advisory_review_artifact_changed_during_closeout');
           }
