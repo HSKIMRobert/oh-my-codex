@@ -731,11 +731,7 @@ async function replaceSessionMirrorAtomically(
     throw new SkillActiveStateWriteError('malformed-session', `unsafe session skill-active parent: ${parentPath}`);
   }
   const parent = await open(parentPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-  const descriptorParent = process.platform === 'linux'
-    ? `/proc/self/fd/${parent.fd}`
-    : process.platform === 'darwin'
-      ? `/dev/fd/${parent.fd}`
-      : parentPath;
+  const descriptorParent = process.platform === 'linux' ? `/proc/self/fd/${parent.fd}` : parentPath;
   const pinnedSessionPath = join(descriptorParent, basename(sessionPath));
   const tempPath = join(descriptorParent, `${basename(sessionPath)}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`);
   let commitStarted = false;
@@ -743,6 +739,11 @@ async function replaceSessionMirrorAtomically(
     await beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
     commitStarted = true;
     await assertRootSkillActiveLockOwner(lock);
+    const beforeParent = await lstat(parentPath);
+    if (beforeParent.dev !== parentIdentity.dev || beforeParent.ino !== parentIdentity.ino
+      || !beforeParent.isDirectory() || beforeParent.isSymbolicLink()) {
+      throw new SkillActiveStateWriteError('malformed-session', `session skill-active parent changed: ${parentPath}`);
+    }
     const current = await readSessionMirrorSnapshot(pinnedSessionPath);
     if (current.identity?.dev !== expected.identity?.dev || current.identity?.ino !== expected.identity?.ino
       || (current.identity === null) !== (expected.identity === null)) {
@@ -755,6 +756,11 @@ async function replaceSessionMirrorAtomically(
     );
     try { await temp.writeFile(payload); await temp.sync(); } finally { await temp.close(); }
     await assertRootSkillActiveLockOwner(lock);
+    const afterParent = await lstat(parentPath);
+    if (afterParent.dev !== parentIdentity.dev || afterParent.ino !== parentIdentity.ino
+      || !afterParent.isDirectory() || afterParent.isSymbolicLink()) {
+      throw new SkillActiveStateWriteError('malformed-session', `session skill-active parent changed: ${parentPath}`);
+    }
     await rename(tempPath, pinnedSessionPath);
     await parent.sync();
   } catch (error) {
