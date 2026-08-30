@@ -9,6 +9,13 @@ import { startMode } from '../../modes/base.js';
 import { __setStateOperationTestHooksForTests, executeStateOperation, withStateFileWriteTransaction, writeStateFile } from '../operations.js';
 import { __setCanonicalModeBindingLeaseTestHooksForTests, resolveValidatedCanonicalModeBinding } from '../mode-binding-lease.js';
 import { JsonChildClient } from '../pinned-atomic-file-darwin-client.js';
+import {
+  formatProcessOwnerToken,
+  hashHistoricalProcessStartIdentity,
+  parseProcessOwnerToken,
+  readHistoricalProcessStartIdentity,
+  readProcessStartIdentity,
+} from '../process-identity.js';
 
 const roots: string[] = [];
 const operationsModuleUrl = new URL('../operations.js', import.meta.url).href;
@@ -89,6 +96,78 @@ describe('canonical mode binding lease', () => {
     assert.equal(ran, true);
     assert.deepEqual(await readdir(lockPath), []);
   });
+
+  it('parses legacy owners and emits v3 owners bound to process start identity', async () => {
+    const legacy = `${process.pid}-${Date.now()}-${'1'.repeat(24)}`;
+    assert.deepEqual(parseProcessOwnerToken(legacy), {
+      version: 'legacy', pid: process.pid, issuedAtMs: Number(legacy.split('-')[1]), nonce: '1'.repeat(24),
+    });
+    const identity = await readProcessStartIdentity(process.pid);
+    const token = formatProcessOwnerToken({ pid: process.pid, issuedAtMs: Date.now(), nonce: '2'.repeat(24), processStartIdentity: identity });
+    assert.equal(parseProcessOwnerToken(token)?.version, 'v3');
+    assert.match(token, /^v3-\d+-\d+-[0-9a-f]{24}-(?:[0-9a-f]{24}|unavailable)$/u);
+  });
+
+  for (const ownerCase of ['live', 'reused', 'dead', 'unavailable', 'dead-unavailable'] as const) {
+    it(`${ownerCase === 'live' || ownerCase === 'unavailable' ? 'preserves' : 'reclaims'} a v3 ${ownerCase} owner`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-mode-lease-v3-${ownerCase}-`));
+      roots.push(cwd);
+      const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+      await withStateFileWriteTransaction(path, async () => undefined);
+      const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+      const liveIdentity = await readProcessStartIdentity(process.pid);
+      const pid = ownerCase === 'dead' || ownerCase === 'dead-unavailable' ? 99_999_999 : process.pid;
+      const processStartIdentity = ownerCase === 'reused' ? 'definitely-not-this-process'
+        : ownerCase === 'unavailable' || ownerCase === 'dead-unavailable' ? null : liveIdentity;
+      const token = formatProcessOwnerToken({
+        pid, issuedAtMs: Date.now() - 10_000, nonce: '3'.repeat(24), processStartIdentity,
+      });
+      const ownerPath = join(lockPath, `owner-${token}`);
+      await writeFile(ownerPath, token);
+      let ran = false;
+      const contender = withStateFileWriteTransaction(path, async () => { ran = true; });
+      if (ownerCase === 'live' || ownerCase === 'unavailable') {
+        await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 150));
+        assert.equal(ran, false);
+        assert.equal(await readFile(ownerPath, 'utf8'), token);
+        await unlink(ownerPath);
+      }
+      await contender;
+      assert.equal(ran, true);
+      assert.deepEqual(await readdir(lockPath), []);
+    });
+  }
+
+  for (const ownerCase of ['live', 'reused', 'dead', 'unknown', 'dead-unknown'] as const) {
+    it(`${ownerCase === 'live' || ownerCase === 'unknown' ? 'preserves' : 'reclaims'} a persisted historical v2 ${ownerCase} owner`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-mode-lease-historical-v2-${ownerCase}-`));
+      roots.push(cwd);
+      const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+      await withStateFileWriteTransaction(path, async () => undefined);
+      const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+      const pid = ownerCase === 'dead' || ownerCase === 'dead-unknown' ? 99_999_999 : process.pid;
+      const historicalIdentity = await readHistoricalProcessStartIdentity(process.pid);
+      const hash = ownerCase === 'unknown' || ownerCase === 'dead-unknown' ? 'unknown'
+        : ownerCase === 'reused' ? hashHistoricalProcessStartIdentity('different-process-start')
+          : ownerCase === 'dead' ? 'a'.repeat(16)
+            : historicalIdentity ? hashHistoricalProcessStartIdentity(historicalIdentity) : 'unknown';
+      const token = `v2-${pid}-${hash}-${Date.now() - 10_000}-${'4'.repeat(24)}`;
+      assert.equal(parseProcessOwnerToken(token)?.version, 'v2');
+      const ownerPath = join(lockPath, `owner-${token}`);
+      await writeFile(ownerPath, token);
+      let ran = false;
+      const contender = withStateFileWriteTransaction(path, async () => { ran = true; });
+      if (ownerCase === 'live' || ownerCase === 'unknown') {
+        await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 150));
+        assert.equal(ran, false);
+        assert.equal(await readFile(ownerPath, 'utf8'), token);
+        await unlink(ownerPath);
+      }
+      await contender;
+      assert.equal(ran, true);
+      assert.deepEqual(await readdir(lockPath), []);
+    });
+  }
 
   it('keeps persistent namespace identity evidence out of git worktree status', async () => {
     const ignore = await readFile(join(process.cwd(), '.gitignore'), 'utf8');
@@ -281,10 +360,12 @@ describe('canonical mode binding lease', () => {
       await withStateFileWriteTransaction(path, async () => {
         const entries = await readdir(lockPath);
         assert.equal(entries.length, 1);
-        assert.match(entries[0], /^owner-\d+-\d+-[0-9a-f]{24}$/u);
+        assert.match(entries[0], /^owner-v3-\d+-\d+-[0-9a-f]{24}-(?:[0-9a-f]{24}|unavailable)$/u);
         const token = entries[0].slice('owner-'.length);
         assert.equal(await readFile(join(lockPath, entries[0]), 'utf8'), token);
-        assert.doesNotThrow(() => process.kill(Number.parseInt(token.split('-', 1)[0], 10), 0));
+        const parsed = parseProcessOwnerToken(token);
+        assert.ok(parsed);
+        assert.doesNotThrow(() => process.kill(parsed.pid, 0));
       });
 
       assert.equal(await readFile(sentinel, 'utf8'), phase);

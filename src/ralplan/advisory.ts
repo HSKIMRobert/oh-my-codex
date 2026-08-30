@@ -2,10 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
-import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
+import type { AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
 import {
-  JOURNAL_STEPS,
   classifyAdvisoryPrompt,
   validateAdvisoryInactiveState,
   type AdvisoryActivation,
@@ -27,9 +26,16 @@ import {
   fenceTransitionSemanticsValid, fenceValid, journalValid, releasedEventValid,
 } from './advisory-lifecycle-validation.js';
 import {
+  applyTerminalSkillReduction,
+  commitInterruptedAdvisoryRecovery,
+  createAdvisoryCloseoutJournal,
+  revalidateAdvisoryEvidence,
+  revalidateStoredAdvisoryEvidence,
+  transitionAdvisoryJournalToRecoveryRequired,
+} from './advisory-recovery-journal.js';
+import {
   advisoryEventsPath as ralplanAdvisoryEventsPath,
   advisoryGenerationDir as generationDir,
-  advisoryObject as object,
   advisoryRoot,
   canonicalAdvisoryCwd as canonicalCwd,
   emitAdvisoryEvent,
@@ -457,26 +463,6 @@ function terminalState(outcome: AdvisoryOutcome, integrity: AdvisoryIntegritySta
   return outcome === 'approved' ? 'closed' : 'abandoned';
 }
 
-function newJournal(
-  generationId: string,
-  outcome: AdvisoryOutcome,
-  integrity: AdvisoryIntegrityStatus,
-  evidenceDigest: string | undefined,
-  terminalModeUpdates: Record<string, unknown> | undefined,
-  terminalSkillUpdates: AdvisoryJournal['terminal_skill_updates'],
-  now: string,
-): AdvisoryJournal {
-  return {
-    schema_version: 1, generation_id: generationId, outcome, integrity_status: integrity,
-    ...(evidenceDigest ? { evidence_bundle_sha256: evidenceDigest } : {}),
-    ...(terminalModeUpdates ? { terminal_mode_updates: terminalModeUpdates } : {}),
-    ...(terminalSkillUpdates ? { terminal_skill_updates: terminalSkillUpdates } : {}),
-    terminal_timestamp: now,
-    phase: 'prepared', created_at: now, updated_at: now,
-    steps: Object.fromEntries(JOURNAL_STEPS.map((step) => [step, 'pending'])) as Record<JournalStep, 'pending' | 'applied'>,
-  };
-}
-
 export interface TerminalizeAdvisoryOptions {
   cwd: string; sessionId: string; generationId: string; closingTurnId: string; iteration: number;
   outcome: AdvisoryOutcome; integrityStatus: AdvisoryIntegrityStatus; lifecycle?: AdvisoryReviewLifecycle;
@@ -534,10 +520,15 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
         sessionId: options.sessionId, nowIso: now,
       });
     }
-    journal = newJournal(
-      options.generationId, options.outcome, options.integrityStatus,
-      options.lifecycle?.evidence_bundle_sha256, options.terminalModeUpdates, terminalSkillUpdates, now,
-    );
+    journal = createAdvisoryCloseoutJournal({
+      generationId: options.generationId,
+      outcome: options.outcome,
+      integrity: options.integrityStatus,
+      evidenceDigest: options.lifecycle?.evidence_bundle_sha256,
+      terminalModeUpdates: options.terminalModeUpdates,
+      terminalSkillUpdates,
+      now,
+    });
     await options.beforeMutation?.('journal_prepare');
     await writeAtomic(journalPath, journal);
   }
@@ -557,16 +548,22 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     const expectedSkill = step === 'session_skill' || step === 'root_skill'
       ? journal.terminal_skill_updates?.[step]
       : undefined;
-    if (journal.steps[step] === 'applied'
-      && await closeoutStepPostcondition(fence.canonical_cwd, options.sessionId, step, journal.terminal_mode_updates, expectedSkill)) continue;
+    const postconditionSatisfied = await closeoutStepPostcondition(
+      fence.canonical_cwd, options.sessionId, step, journal.terminal_mode_updates, expectedSkill,
+    );
+    if ((step === 'session_skill' || step === 'root_skill') && postconditionSatisfied) {
+      if (journal.steps[step] !== 'applied') await mark(step);
+      continue;
+    }
+    if (journal.steps[step] === 'applied' && postconditionSatisfied) continue;
     if ((step === 'session_skill' || step === 'root_skill') && expectedSkill !== undefined) {
-      await options.beforeMutation?.(`mirror_${step}`);
-      const base = getBaseStateDir(fence.canonical_cwd);
-      const path = step === 'session_skill'
-        ? join(base, 'sessions', options.sessionId, 'skill-active-state.json')
-        : join(base, 'skill-active-state.json');
-      if (expectedSkill === null) await rm(path, { force: true });
-      else await writeAtomic(path, expectedSkill);
+      await applyTerminalSkillReduction({
+        cwd: fence.canonical_cwd,
+        sessionId: options.sessionId,
+        terminalModeUpdates: journal.terminal_mode_updates ?? {},
+        terminalTimestamp: journal.terminal_timestamp,
+        beforeCommit: () => options.beforeMutation?.(`mirror_${step}`),
+      });
     } else {
       await options.beforeMutation?.(`mirror_${step}`);
       await options.applyStep?.(step, journal.terminal_mode_updates, journal.terminal_timestamp);
@@ -577,17 +574,25 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     await mark(step);
   }
   if (journal.steps.post_digest !== 'applied') {
-    const digest = await options.revalidateEvidence?.();
-    if (options.lifecycle && digest !== options.lifecycle.evidence_bundle_sha256) {
-      await options.beforeMutation?.('fence_recovery_required');
-      await emitAdvisoryEvent(fence.canonical_cwd, {
-        type: 'ralplan_advisory_digest_mismatch', generationId: fence.generation_id, iteration: fence.iteration,
-        transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'evidence_digest_changed',
-        path: journalPath, digest: digest ?? options.lifecycle.evidence_bundle_sha256,
-      });
-      fence = await appendFenceEvent(fence.canonical_cwd, fence, {
-        state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
-        outcome: journal.outcome, integrity_status: 'unproven', updated_at: journal.terminal_timestamp,
+    const evidence = options.lifecycle && options.revalidateEvidence
+      ? await revalidateAdvisoryEvidence(options.lifecycle.evidence_bundle_sha256, options.revalidateEvidence)
+      : null;
+    if (options.lifecycle && evidence?.kind !== 'matched') {
+      fence = await transitionAdvisoryJournalToRecoveryRequired({
+        fence,
+        journal,
+        journalPath,
+        evidence,
+        changedReason: 'evidence_digest_changed',
+        unreadableReason: 'evidence_unreadable',
+        terminalTimestamp: journal.terminal_timestamp,
+        appendFenceEvent: (next) => appendFenceEvent(fence.canonical_cwd, fence, next),
+        hooks: {
+          beforePrepare: () => options.beforeMutation?.('journal_recovery_prepare'),
+          afterPrepare: () => options.failpoint?.('recovery_wal'),
+          beforeFence: () => options.beforeMutation?.('fence_recovery_required'),
+          beforeCommit: () => options.beforeMutation?.('journal_recovery_commit'),
+        },
       });
       return readProjectionForGeneration(fence.canonical_cwd, options.sessionId, options.generationId);
     }
@@ -665,7 +670,16 @@ async function reconcileRalplanAdvisoryUnlocked(
   const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
   if (!projection || projection.corruption || !projection.fence || !projection.journal) return projection;
   const { fence, journal } = projection;
-  if (fence.state === 'recovery_required') return projection;
+  if (fence.state === 'recovery_required') {
+    if (journal.phase !== 'committed') {
+      await commitInterruptedAdvisoryRecovery(
+        join(generationDir(cwd, sessionId, fence.generation_id), 'closeout-journal.json'),
+        journal,
+      );
+      return readCurrentRalplanAdvisory(cwd, sessionId);
+    }
+    return projection;
+  }
   const guardReplay = async (checkpoint: string): Promise<void> => {
     await beforeReplayCheck?.(checkpoint);
     const conflict = await liveAdvisoryBindingConflict(cwd, sessionId, fence.generation_id);
@@ -701,7 +715,7 @@ async function reconcileRalplanAdvisoryUnlocked(
       const { updateModeState } = await import('../modes/base.js');
       await updateModeState(
         'ralplan',
-        journal.terminal_mode_updates!,
+        { ...journal.terminal_mode_updates!, updated_at: journal.terminal_timestamp },
         cwd,
         sessionId,
         (site) => guardReplay(`mode_commit_${site}`),
@@ -714,13 +728,13 @@ async function reconcileRalplanAdvisoryUnlocked(
       if (!await closeoutStepPostcondition(cwd, sessionId, step, journal.terminal_mode_updates, expectedSkill)) {
         reconciled = true;
         if ((step === 'session_skill' || step === 'root_skill') && expectedSkill !== undefined) {
-          const base = getBaseStateDir(cwd);
-          const path = step === 'session_skill'
-            ? join(base, 'sessions', sessionId, 'skill-active-state.json')
-            : join(base, 'skill-active-state.json');
-          await guardReplay(`mirror_${step}`);
-          if (expectedSkill === null) await rm(path, { force: true });
-          else await writeAtomic(path, expectedSkill);
+          await applyTerminalSkillReduction({
+            cwd,
+            sessionId,
+            terminalModeUpdates: journal.terminal_mode_updates ?? {},
+            terminalTimestamp: journal.terminal_timestamp,
+            beforeCommit: () => guardReplay(`mirror_${step}`),
+          });
         } else {
           await guardReplay(`mirror_${step}`);
           await canonicalPatch();
@@ -737,38 +751,22 @@ async function reconcileRalplanAdvisoryUnlocked(
     }
     if (journal.steps.post_digest !== 'applied') {
       if (fence.evidence_bundle_sha256) {
-        const { readModeStateForExplicitSession } = await import('../modes/base.js');
-        const state = await readModeStateForExplicitSession('ralplan', sessionId, cwd);
-        const history = Array.isArray(state?.review_history) ? state.review_history : [];
-        const item = object(history[fence.iteration - 1]);
-        const draft = object(item?.draft);
-        const architect = object(item?.architect_review);
-        const critic = object(item?.critic_review);
-        const lifecycle = await projectAdvisoryReviewLifecycle({
-          cwd, sessionId, generationId: fence.generation_id,
-          activationTurnId: fence.activation_turn_id, activationCreatedAt: fence.created_at,
-          rootThreadId: fence.root_thread_id, iteration: fence.iteration,
-          planPaths: [String(draft?.planPath ?? state?.latest_plan_path ?? '')],
-          architect: {
-            threadId: String(architect?.thread_id ?? ''), artifactPath: String(architect?.artifact_path ?? ''),
-            verdict: String(architect?.verdict ?? ''), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
-          },
-          critic: {
-            threadId: String(critic?.thread_id ?? ''), artifactPath: String(critic?.artifact_path ?? ''),
-            verdict: String(critic?.verdict ?? ''), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
-          },
-        });
-        if (lifecycle.evidence_bundle_sha256 !== fence.evidence_bundle_sha256) {
-          await guardReplay('emit_digest_mismatch');
-          await emitAdvisoryEvent(fence.canonical_cwd, {
-            type: 'ralplan_advisory_digest_mismatch', generationId: fence.generation_id, iteration: fence.iteration,
-            transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'reconcile_evidence_digest_changed',
-            path: journalPath, digest: lifecycle.evidence_bundle_sha256,
-          });
-          await guardReplay('fence_recovery_required');
-          await appendFenceEvent(fence.canonical_cwd, fence, {
-            state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
-            outcome: journal.outcome, integrity_status: 'unproven', updated_at: new Date().toISOString(),
+        const evidence = await revalidateStoredAdvisoryEvidence({ cwd, sessionId, fence });
+        if (evidence.kind !== 'matched') {
+          await transitionAdvisoryJournalToRecoveryRequired({
+            fence,
+            journal,
+            journalPath,
+            evidence,
+            changedReason: 'reconcile_evidence_digest_changed',
+            unreadableReason: 'reconcile_evidence_unreadable',
+            terminalTimestamp: () => new Date().toISOString(),
+            appendFenceEvent: (next) => appendFenceEvent(fence.canonical_cwd, fence, next),
+            hooks: {
+              beforePrepare: () => guardReplay('journal_recovery_prepare'),
+              beforeEmit: () => guardReplay('emit_digest_mismatch'),
+              beforeFence: () => guardReplay('fence_recovery_required'),
+            },
           });
           return readCurrentRalplanAdvisory(cwd, sessionId);
         }
@@ -839,7 +837,8 @@ export async function reconcileRalplanAdvisory(
   const initialConflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
   if (initialConflict) return { ...projection, corruption: initialConflict };
   if (projection.corruption) return projection;
-  return withGenerationLock(cwd, sessionId, projection.activation.generation_id, async () => {
+  return withRalplanAdvisoryCurrentLock(cwdCanonical, sessionId, () =>
+    withGenerationLock(cwd, sessionId, projection.activation.generation_id, async () => {
     const conflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
     if (conflict) return { ...projection, corruption: conflict };
     try {
@@ -851,7 +850,7 @@ export async function reconcileRalplanAdvisory(
       }
       throw error;
     }
-  });
+    }));
 }
 
 export async function observeRalplanAdvisoryPrompt(input: {

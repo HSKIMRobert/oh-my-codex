@@ -1,12 +1,12 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { ralplanCommand } from '../ralplan.js';
 import { cancelModesForTest } from '../index.js';
-import { prepareAdvisoryCloseout, readCurrentRalplanAdvisory } from '../../ralplan/advisory.js';
+import { prepareAdvisoryCloseout, readCurrentRalplanAdvisory, terminalizeRalplanAdvisory } from '../../ralplan/advisory.js';
 import { reconcileRalplanAdvisory } from '../../ralplan/advisory.js';
 import { activateOrResumeRalplanAdvisory } from '../../ralplan/advisory-activation.js';
 
@@ -35,6 +35,82 @@ async function commitActivation(cwd: string, sessionId: string, activation: Awai
 }
 
 describe('ralplan advisory CLI', () => {
+  it('preserves an active Advisory in production dispatch without an injected executor', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-production-run-'));
+    roots.push(cwd);
+    const sessionId = 'session-production-run';
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionDir = join(stateDir, 'sessions', sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateDir }));
+    await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
+      active: true, mode: 'ralplan', workflow_variant: 'advisory', advisory_generation_id: 'generation-production',
+      session_id: sessionId, task_description: 'review only', current_phase: 'architect-review',
+    }));
+    const output: string[] = [];
+    await ralplanCommand(['run', '--task', 'review only', '--session', sessionId], {
+      cwd: () => cwd,
+      stdout: (line) => output.push(line),
+    });
+    assert.match(output.at(-1) ?? '', /non-authorizing Ralplan Advisory lifecycle/);
+    assert.doesNotMatch(output.at(-1) ?? '', /ralplan_execution_handoff/);
+    const state = JSON.parse(await readFile(join(sessionDir, 'ralplan-state.json'), 'utf8'));
+    assert.equal(state.workflow_variant, 'advisory');
+    assert.equal(state.advisory_generation_id, 'generation-production');
+  });
+
+  for (const advisoryState of ['inactive-pending', 'inactive-recovery', 'terminal-closed'] as const) {
+    it(`${advisoryState === 'terminal-closed' ? 'allows Standard after' : 'resumes'} ${advisoryState} canonical Advisory state`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-cli-${advisoryState}-`));
+      roots.push(cwd);
+      const sessionId = `session-${advisoryState}`;
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateDir }));
+      const activation = await activateRalplanAdvisory({
+        cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: `generation-${advisoryState}`,
+      });
+      await commitActivation(cwd, sessionId, activation);
+      const lifecycle = {
+        complete: true, sequence_valid: true, iteration: 1, iteration_id: '5'.repeat(64),
+        plan_manifest_sha256: '1'.repeat(64), architect_review_sha256: '2'.repeat(64),
+        critic_review_sha256: '3'.repeat(64), evidence_bundle_sha256: '4'.repeat(64),
+        evidence_scope: 'local_runtime' as const, host_observable: false as const, host_verified: false as const,
+      };
+      if (advisoryState === 'inactive-pending') {
+        await prepareAdvisoryCloseout({
+          cwd, sessionId, generationId: activation.generation_id, closingTurnId: 'turn-close', iteration: 1, lifecycle,
+        });
+        await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
+          active: false, mode: 'ralplan', session_id: sessionId, task_description: 'advisory task',
+          workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
+        }));
+      } else {
+        await terminalizeRalplanAdvisory({
+          cwd, sessionId, generationId: activation.generation_id, closingTurnId: 'turn-close', iteration: 1,
+          outcome: 'approved', integrityStatus: 'proven', lifecycle,
+          revalidateEvidence: async () => advisoryState === 'terminal-closed'
+            ? lifecycle.evidence_bundle_sha256 : '0'.repeat(64),
+        });
+      }
+      const output: string[] = [];
+      await ralplanCommand(['run', '--task', 'new standard task', '--session', sessionId], {
+        cwd: () => cwd, stdout: (line) => output.push(line),
+      });
+      const state = JSON.parse(await readFile(join(sessionDir, 'ralplan-state.json'), 'utf8'));
+      if (advisoryState === 'terminal-closed') {
+        assert.notEqual(state.workflow_variant, 'advisory');
+        assert.match(output.at(-1) ?? '', /consensus runtime/);
+      } else {
+        assert.equal(state.workflow_variant, 'advisory');
+        assert.equal(state.advisory_generation_id, activation.generation_id);
+        assert.match(output.at(-1) ?? '', /non-authorizing Ralplan Advisory lifecycle/);
+        assert.doesNotMatch(output.at(-1) ?? '', /ralplan_execution_handoff|authorize execution/);
+      }
+    });
+  }
+
   it('accepts no caller evidence and reconstructs a closed non-authorizing result', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-'));
     roots.push(cwd);

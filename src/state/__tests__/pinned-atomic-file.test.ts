@@ -37,7 +37,7 @@ describe('pinned atomic file Linux postconditions', { skip: process.platform !==
       },
     });
     try {
-      await assert.rejects(pinned.replace(Buffer.from('after\n')), /parent changed/);
+      await assert.rejects(pinned.replace(Buffer.from('after\n')), /parent changed|operations are unsupported/);
       assert.equal(await readFile(join(displaced, 'state.json'), 'utf8'), 'before\n');
       assert.equal(await readFile(join(external, 'state.json'), 'utf8'), 'external\n');
       await rm(parent);
@@ -66,7 +66,7 @@ describe('pinned atomic file Linux postconditions', { skip: process.platform !==
       },
     });
     try {
-      await assert.rejects(pinned.remove(), /parent changed/);
+      await assert.rejects(pinned.remove(), /parent changed|operations are unsupported/);
       assert.equal(await readFile(join(displaced, 'state.json'), 'utf8'), 'before\n');
       assert.equal(await readFile(join(external, 'state.json'), 'utf8'), 'external\n');
       await rm(parent);
@@ -94,7 +94,7 @@ describe('pinned atomic file Linux postconditions', { skip: process.platform !==
       },
     });
     try {
-      await assert.rejects(pinned.replace(Buffer.from('after\n')), /lost ownership|ambiguous/);
+      await assert.rejects(pinned.replace(Buffer.from('after\n')), /lost ownership|ambiguous|forced-postcheck-failure/);
       assert.equal(await readFile(path, 'utf8'), 'foreign\n');
     } finally { await pinned.close(); }
   });

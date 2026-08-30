@@ -559,7 +559,7 @@ export async function completeRalplanSession(options: {
   const completedSessionId = sessionId ?? optionalSessionId(options.state.session_id);
   const rootScopeCompletion = !sessionId;
 
-  const nowIso = new Date().toISOString();
+  const nowIso = stringValue(options.state.updated_at).trim() || new Date().toISOString();
   const rootState = buildRalplanTerminalState(options.state, sessionId, nowIso);
   const rootStatePath = join(options.baseStateDir, getStateFilename('ralplan'));
   const existingRootState = await readJsonRecordIfExists(rootStatePath);

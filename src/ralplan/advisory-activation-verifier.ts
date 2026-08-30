@@ -4,6 +4,12 @@ import { dirname, join } from 'node:path';
 import { listActiveSkills } from '../state/skill-active.js';
 import { syncDirectory, syncRegularFile } from '../utils/file-durability.js';
 
+/** @internal Durability seam for deterministic Windows tests. */
+export const ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM: {
+  fileSync?: typeof syncRegularFile;
+  directorySync?: typeof syncDirectory;
+} = {};
+
 export type AdvisoryProjectionPredicate = (value: Record<string, unknown>) => boolean;
 
 export interface AdvisoryActivationProjectionDescriptor {
@@ -36,7 +42,8 @@ export async function verifyPinnedJsonAndSync(
     if (!predicate(value)) throw new Error(`ralplan_advisory_activation_projection_mismatch:${path}`);
     const validated = await handle.stat();
     await beforeSync?.();
-    if (await syncRegularFile(handle) !== 'synced') {
+    const fileSyncOutcome = await (ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.fileSync ?? syncRegularFile)(handle);
+    if (fileSyncOutcome !== 'synced' && fileSyncOutcome !== 'unsupported-windows-eperm') {
       throw new Error(`ralplan_advisory_activation_file_fsync_unsupported:${path}`);
     }
     const synced = await handle.stat();
@@ -50,7 +57,8 @@ export async function verifyPinnedJsonAndSync(
     }
     const parent = await open(dirname(path), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
     try {
-      if (await syncDirectory(parent) !== 'synced') {
+      const directorySyncOutcome = await (ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.directorySync ?? syncDirectory)(parent);
+      if (directorySyncOutcome !== 'synced' && directorySyncOutcome !== 'unsupported-windows-eperm') {
         throw new Error(`ralplan_advisory_activation_directory_fsync_unsupported:${dirname(path)}`);
       }
     } finally { await parent.close(); }

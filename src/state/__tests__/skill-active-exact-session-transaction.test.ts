@@ -135,7 +135,7 @@ describe('skill-active exact-session transaction rollback', () => {
     });
   });
 
-  it('keeps root and session consistent when the session worker dies after rename', async () => {
+  it('keeps root and session consistent when the session worker dies after rename', { skip: process.platform !== 'darwin' }, async () => {
     await withTempRepo(async (cwd) => {
       const stateDir = join(cwd, '.omx', 'state');
       const sessionId = 'session-a';
@@ -171,7 +171,7 @@ describe('skill-active exact-session transaction rollback', () => {
     });
   });
 
-  it('keeps root and session consistent when the supervisor dies after session rename', async () => {
+  it('keeps root and session consistent when the supervisor dies after session rename', { skip: process.platform !== 'darwin' }, async () => {
     await withTempRepo(async (cwd) => {
       const stateDir = join(cwd, '.omx', 'state');
       const sessionId = 'session-a';

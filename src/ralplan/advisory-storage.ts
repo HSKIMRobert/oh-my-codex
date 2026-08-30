@@ -69,12 +69,13 @@ export function advisoryEventsPath(cwd: string, now = new Date()): string {
 }
 export async function emitAdvisoryEvent(cwd: string, event: {
   type: string; generationId: string; iteration?: number; transition: string; checkpoint: string;
-  reason: string; path: string; digest?: string;
+  reason: string; error?: string; path: string; digest?: string;
 }): Promise<void> {
   const path = advisoryEventsPath(cwd);
   await mkdir(dirname(path), { recursive: true }).catch(() => undefined);
   await appendFile(path, `${JSON.stringify({ timestamp: new Date().toISOString(), type: event.type,
     generation_id: event.generationId, ...(event.iteration !== undefined ? { iteration: event.iteration } : {}),
     state_transition: event.transition, checkpoint: event.checkpoint, reason: event.reason,
+    ...(event.error ? { error: event.error } : {}),
     relative_path: relative(cwd, event.path), ...(event.digest ? { digest_prefix: event.digest.slice(0, 12) } : {}) })}\n`).catch(() => undefined);
 }

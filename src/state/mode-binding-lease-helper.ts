@@ -3,6 +3,14 @@ import { constants as fsConstants } from 'node:fs';
 import { lstat, mkdir, open, readdir, rename, stat, type FileHandle, unlink, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { createInterface } from 'node:readline';
+import {
+  formatProcessOwnerToken,
+  hashHistoricalProcessStartIdentity,
+  hashProcessStartIdentity,
+  parseProcessOwnerToken,
+  readHistoricalProcessStartIdentity,
+  readProcessStartIdentity,
+} from './process-identity.js';
 
 const INITIAL_RETRY_MS = 20;
 const MAX_RETRY_MS = 500;
@@ -27,7 +35,7 @@ function sameIdentity(value: Identity, expected: Identity): boolean {
 }
 
 function validOwnerToken(value: string): boolean {
-  return /^\d+-\d+-[0-9a-f]{24}$/u.test(value);
+  return parseProcessOwnerToken(value) !== null;
 }
 
 async function readPinnedRecord(name: string, token: string): Promise<PinnedRecord> {
@@ -95,33 +103,33 @@ async function readPinnedOwner(): Promise<OwnerState> {
   const stableDisplaced = presentRecord(displaced) ? displaced : undefined;
   const stableCandidate = presentRecord(candidate) ? candidate : undefined;
   if (stableCandidate && stableOwner) return { kind: 'unstable' };
-  const isDeadRecord = (record: NonNullable<typeof stableDisplaced>) => record.kind === 'valid' && tokenIsStaleAndDead(record.owner.token)
-    || record.kind === 'partial' && isOld(record.owner) && tokenIsStaleAndDead(record.owner.token);
-  const isBoundOrDead = (record: NonNullable<typeof stableDisplaced>) => record.owner.claimantToken !== undefined
-    || isDeadRecord(record);
+  const isDeadRecord = async (record: NonNullable<typeof stableDisplaced>) => record.kind === 'valid' && await tokenIsStaleAndDead(record.owner.token)
+    || record.kind === 'partial' && isOld(record.owner) && await tokenIsStaleAndDead(record.owner.token);
+  const isBoundOrDead = async (record: NonNullable<typeof stableDisplaced>) => record.owner.claimantToken !== undefined
+    || await isDeadRecord(record);
   if (stableCandidate && stableDisplaced && !stableOwner) {
-    if (!isBoundOrDead(stableDisplaced)) return { kind: 'unstable' };
+    if (!await isBoundOrDead(stableDisplaced)) return { kind: 'unstable' };
     if (stableDisplaced.owner.claimantToken !== stableCandidate.owner.token) return { kind: 'ambiguous', reason: 'candidate-claimant-mismatch' };
     return {
       kind: 'preparing', candidate: stableCandidate.owner, candidateComplete: stableCandidate.kind === 'valid', displaced: stableDisplaced.owner,
     };
   }
   if (stableOwner && stableDisplaced) {
-    if (!isBoundOrDead(stableDisplaced)) return { kind: 'unstable' };
+    if (!await isBoundOrDead(stableDisplaced)) return { kind: 'unstable' };
     if (stableDisplaced.owner.claimantToken !== undefined && stableDisplaced.owner.claimantToken !== stableOwner.owner.token
       || stableOwner.owner.identity.dev === stableDisplaced.owner.identity.dev
         && stableOwner.owner.identity.ino === stableDisplaced.owner.identity.ino) return { kind: 'ambiguous', reason: 'published-binding-mismatch' };
     if (stableOwner.kind === 'valid') return { kind: 'published', owner: stableOwner.owner, displaced: stableDisplaced.owner };
-    return isOld(stableOwner.owner) && tokenIsStaleAndDead(stableOwner.owner.token)
+    return isOld(stableOwner.owner) && await tokenIsStaleAndDead(stableOwner.owner.token)
       ? { kind: 'partial-published', owner: stableOwner.owner, displaced: stableDisplaced.owner }
       : { kind: 'unstable' };
   }
-  if (stableDisplaced) return isBoundOrDead(stableDisplaced)
+  if (stableDisplaced) return await isBoundOrDead(stableDisplaced)
     ? { kind: 'interrupted', displaced: stableDisplaced.owner }
     : { kind: 'unstable' };
   if (stableCandidate) return { kind: 'unstable' };
   if (stableOwner?.kind === 'valid') return { kind: 'valid', owner: stableOwner.owner };
-  if (stableOwner?.kind === 'partial' && isOld(stableOwner.owner) && tokenIsStaleAndDead(stableOwner.owner.token)) {
+  if (stableOwner?.kind === 'partial' && isOld(stableOwner.owner) && await tokenIsStaleAndDead(stableOwner.owner.token)) {
     return { kind: 'recoverable', owner: stableOwner.owner };
   }
   return stableOwner ? { kind: 'unstable' } : { kind: 'ownerless' };
@@ -213,16 +221,32 @@ async function maybeCrashReclaimPhase(phase: string): Promise<void> {
   process.kill(process.pid, 'SIGKILL');
 }
 
-function ownerIsDead(value: string): boolean {
-  const pid = Number.parseInt(value.split('-', 1)[0] ?? '', 10);
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return false; }
+async function ownerIsDead(value: string): Promise<boolean> {
+  const parsed = parseProcessOwnerToken(value);
+  if (!parsed) return false;
+  try { process.kill(parsed.pid, 0); }
   catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+  if (parsed.version === 'v2' && parsed.processStartHash === 'unknown'
+    || parsed.version === 'v3' && parsed.processStartHash === 'unavailable') return false;
+  if (parsed.version === 'v2' || parsed.version === 'v3') {
+    const reader = parsed.version === 'v2' ? readHistoricalProcessStartIdentity : readProcessStartIdentity;
+    const hash = parsed.version === 'v2' ? hashHistoricalProcessStartIdentity : hashProcessStartIdentity;
+    const current = await reader(parsed.pid);
+    if (current === null || hash(current) === parsed.processStartHash) return false;
+    // A live PID identity mismatch is security-sensitive: re-sample before
+    // reclaim so a transient platform probe cannot evict the real owner.
+    await new Promise<void>((resolve) => setTimeout(resolve, INITIAL_RETRY_MS));
+    const confirmed = await reader(parsed.pid);
+    return confirmed !== null
+      && hash(confirmed) === hash(current)
+      && hash(confirmed) !== parsed.processStartHash;
+  }
+  return false;
 }
 
-function tokenIsStaleAndDead(value: string): boolean {
-  const issuedAt = Number.parseInt(value.split('-')[1] ?? '', 10);
-  return Number.isInteger(issuedAt) && Date.now() - issuedAt >= PARTIAL_OWNER_STALE_MS && ownerIsDead(value);
+async function tokenIsStaleAndDead(value: string): Promise<boolean> {
+  const parsed = parseProcessOwnerToken(value);
+  return parsed !== null && Date.now() - parsed.issuedAtMs >= PARTIAL_OWNER_STALE_MS && await ownerIsDead(value);
 }
 
 async function runPinnedClaimMode(args: string[]): Promise<void> {
@@ -238,6 +262,20 @@ async function runPinnedClaimMode(args: string[]): Promise<void> {
     || !sameIdentity(current, lockIdentity) || !sameIdentity(parent, namespaceIdentity)) {
     respond({ claimed: false }); return;
   }
+  const bootstrapName = `owner-${BOOTSTRAP_OWNER_TOKEN}`;
+  const initialEntries = await readdir('.');
+  if (initialEntries.includes(bootstrapName) && initialEntries.length > 1) {
+    const bootstrap = await readPinnedRecord(bootstrapName, BOOTSTRAP_OWNER_TOKEN);
+    if (bootstrap.kind === 'valid') {
+      const confirmedEntries = await readdir('.');
+      const confirmed = await readPinnedRecord(bootstrapName, BOOTSTRAP_OWNER_TOKEN);
+      if (confirmed.kind === 'valid' && sameOwner(bootstrap.owner, confirmed.owner)
+        && confirmedEntries.includes(bootstrapName) && confirmedEntries.length > 1) {
+        await unlink(bootstrapName);
+        respond({ claimed: false }); return;
+      }
+    }
+  }
   const observed = await readPinnedOwner();
   if (observed.kind === 'unstable') { respond({ claimed: false }); return; }
   if (observed.kind === 'ambiguous') {
@@ -247,15 +285,15 @@ async function runPinnedClaimMode(args: string[]): Promise<void> {
   }
   if (observed.kind === 'valid') {
     if (observed.owner.token === replacementToken) { respond({ claimed: true }); return; }
-    if (!tokenIsStaleAndDead(observed.owner.token)) { respond({ claimed: false }); return; }
+    if (!await tokenIsStaleAndDead(observed.owner.token)) { respond({ claimed: false }); return; }
   }
   if (observed.kind === 'published' && observed.owner.token !== replacementToken
-    && !tokenIsStaleAndDead(observed.owner.token)) { respond({ claimed: false }); return; }
+    && !await tokenIsStaleAndDead(observed.owner.token)) { respond({ claimed: false }); return; }
   if (observed.kind === 'preparing' && observed.candidate.token !== replacementToken
-    && !tokenIsStaleAndDead(observed.candidate.token)) { respond({ claimed: false }); return; }
+    && !await tokenIsStaleAndDead(observed.candidate.token)) { respond({ claimed: false }); return; }
   if (observed.kind === 'interrupted' && observed.displaced.claimantToken
     && observed.displaced.claimantToken !== replacementToken
-    && !tokenIsStaleAndDead(observed.displaced.claimantToken)) { respond({ claimed: false }); return; }
+    && !await tokenIsStaleAndDead(observed.displaced.claimantToken)) { respond({ claimed: false }); return; }
   const confirmed = await readPinnedOwner();
   const changed = !sameOwnerState(confirmed, observed);
   if (changed || !sameIdentity(await stat('.'), lockIdentity) || !sameIdentity(await stat('..'), namespaceIdentity)) {
@@ -361,7 +399,14 @@ const [key = '', nonce = '', expectedDev = '', expectedIno = ''] = process.argv.
 if (!key || basename(key) !== key || !nonce || !expectedDev || !expectedIno) {
   throw new Error('invalid canonical state lock helper arguments');
 }
-const token = `${process.pid}-${nonce}`;
+const [issuedAt = '', randomNonce = ''] = nonce.split('-', 2);
+const processStartIdentity = await readProcessStartIdentity(process.pid);
+const token = formatProcessOwnerToken({
+  pid: process.pid,
+  issuedAtMs: Number(issuedAt),
+  nonce: randomNonce,
+  processStartIdentity,
+});
 const lockName = `${key}.lock`;
 const namespaceIdentity = { dev: Number(expectedDev), ino: Number(expectedIno) };
 let lockIdentity: Identity | null = null;
@@ -411,7 +456,10 @@ async function tryClaimExisting(expected: Identity): Promise<boolean> {
 }
 
 async function acquire(): Promise<void> {
-  const deadline = Date.now() + 30_000;
+  // Keep the helper below the caller's explicit 35s initialization ceiling,
+  // while leaving enough room for Darwin process-start revalidation under the
+  // documented 64-contender recovery stress.
+  const deadline = Date.now() + 34_000;
   let retryMs = INITIAL_RETRY_MS;
   for (;;) {
     await assertPinnedNamespace();

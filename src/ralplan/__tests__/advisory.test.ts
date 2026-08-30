@@ -236,19 +236,58 @@ describe('ralplan advisory fence and journal', () => {
     });
     assert.equal(complete.fence?.state, 'closed');
     assert.equal(complete.journal?.phase, 'committed');
-    assert.equal(writes, 4);
+    assert.equal(writes, 2);
   });
 
   it('moves to recovery_required when the post-write bundle digest changes', async () => {
-    const { cwd, sessionId, lifecycle } = await fixture();
-    const result = await terminalizeRalplanAdvisory({
-      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
-      outcome: 'approved', integrityStatus: 'proven', lifecycle,
-      revalidateEvidence: async () => '0'.repeat(64),
-    });
-    assert.equal(result.fence?.state, 'recovery_required');
-    assert.equal(result.journal?.phase, 'prepared');
+    for (const failure of ['changed', 'unreadable'] as const) {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      const result = await terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'approved', integrityStatus: 'proven', lifecycle,
+        revalidateEvidence: failure === 'changed'
+          ? async () => '0'.repeat(64)
+          : async () => { throw new Error('artifact unreadable'); },
+      });
+      assert.equal(result.fence?.state, 'recovery_required');
+      assert.equal(result.journal?.phase, 'committed');
+      const events = (await readFile(ralplanAdvisoryEventsPath(cwd), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+      const mismatch = events.find((event) => event.type === 'ralplan_advisory_digest_mismatch');
+      assert.equal(mismatch.reason, failure === 'changed' ? 'evidence_digest_changed' : 'evidence_unreadable');
+      assert.equal('digest_prefix' in mismatch, failure === 'changed');
+      assert.equal(mismatch.error, failure === 'unreadable' ? 'ralplan_advisory_evidence_unreadable' : undefined);
+      assert.doesNotMatch(JSON.stringify(mismatch), /artifact unreadable/);
+    }
   });
+
+  for (const crashPoint of ['recovery_wal', 'journal_recovery_commit'] as const) {
+    it(`reconciles recovery closeout after a crash at ${crashPoint}`, async () => {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      await assert.rejects(terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'approved', integrityStatus: 'proven', lifecycle,
+        revalidateEvidence: async () => '0'.repeat(64),
+        failpoint: crashPoint === 'recovery_wal'
+          ? (name) => { if (name === crashPoint) throw new Error(`crash-${crashPoint}`); }
+          : undefined,
+        beforeMutation: crashPoint === 'journal_recovery_commit'
+          ? (name) => { if (name === crashPoint) throw new Error(`crash-${crashPoint}`); }
+          : undefined,
+      }), new RegExp(`crash-${crashPoint}`));
+      const interrupted = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.equal(interrupted?.corruption, null);
+      assert.equal(interrupted?.journal?.integrity_status, 'unproven');
+      assert.equal(interrupted?.journal?.steps.post_digest, 'applied');
+      if (crashPoint === 'recovery_wal') assert.equal(interrupted?.fence?.state, 'pending_closeout');
+      else assert.equal(interrupted?.fence?.state, 'recovery_required');
+
+      const reconciled = await reconcileRalplanAdvisory(cwd, sessionId);
+      assert.equal(reconciled?.corruption, null);
+      assert.equal(reconciled?.fence?.state, 'recovery_required');
+      assert.equal(reconciled?.journal?.phase, 'committed');
+      assert.equal(reconciled?.journal?.steps.fence_terminal, 'applied');
+    });
+  }
 
   it('rejects approved+proven without complete lifecycle digests and revalidation, while approved+unproven recovers', async () => {
     const first = await fixture();
@@ -284,7 +323,7 @@ describe('ralplan advisory fence and journal', () => {
     });
     assert.equal(abandoned.projection?.fence?.state, 'abandoned');
     assert.equal(await readFile(journalPath, 'utf8'), originalJournal);
-    assert.equal(abandoned.projection?.journal?.phase, 'prepared');
+    assert.equal(abandoned.projection?.journal?.phase, 'committed');
     assert.equal(abandoned.projection?.journal?.outcome, 'approved');
     assert.equal(abandoned.projection?.admin_event?.action, 'abandon');
     assert.equal(validateAdvisoryInactiveState({
@@ -411,10 +450,6 @@ describe('ralplan advisory fence and journal', () => {
         applyStep: async (step, stored) => { if (step === 'session_mode') await updateModeState('ralplan', stored!, cwd, sessionId); },
         ...(outcome === 'approved' ? { revalidateEvidence: async () => lifecycle.evidence_bundle_sha256 } : {}),
       });
-      const storedSkillProjections = new Map<string, any>();
-      for (const path of [join(sessionDir, 'skill-active-state.json'), join(stateDir, 'skill-active-state.json')]) {
-        storedSkillProjections.set(path, JSON.parse(await readFile(path, 'utf8')));
-      }
       for (const path of [join(sessionDir, 'ralplan-state.json'), join(stateDir, 'ralplan-state.json')]) {
         const drifted = JSON.parse(await readFile(path, 'utf8'));
         drifted.active = true;
@@ -433,9 +468,10 @@ describe('ralplan advisory fence and journal', () => {
       }
       for (const path of [join(sessionDir, 'skill-active-state.json'), join(stateDir, 'skill-active-state.json')]) {
         const skill = JSON.parse(await readFile(path, 'utf8'));
-        assert.deepEqual(skill, storedSkillProjections.get(path));
         assert.equal(skill.active_skills.some((entry: any) => entry.skill === 'ralplan' && entry.active !== false), false);
         assert.equal(skill.active_skills.some((entry: any) => entry.skill === 'team' && entry.unrelated === 'keep'), true);
+        assert.equal(skill.active_skills.find((entry: any) => entry.skill === 'team')?.phase, 'drifted');
+        assert.equal(skill.drifted_field, 'remove-me');
       }
     }
   });
@@ -579,8 +615,13 @@ describe('ralplan advisory fence and journal', () => {
     await writeFile(join(stateDir, 'skill-active-state.json'), JSON.stringify(drift));
     const reconciled = await reconcileRalplanAdvisory(cwd, sessionId);
     assert.equal(reconciled?.fence?.state, 'abandoned');
-    assert.deepEqual(JSON.parse(await readFile(join(sessionDir, 'skill-active-state.json'), 'utf8')), stored.terminal_skill_updates.session_skill);
-    assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'skill-active-state.json'), 'utf8')), stored.terminal_skill_updates.root_skill);
+    for (const path of [join(sessionDir, 'skill-active-state.json'), join(stateDir, 'skill-active-state.json')]) {
+      const skill = JSON.parse(await readFile(path, 'utf8'));
+      assert.equal(skill.active_skills.some((entry: any) => entry.skill === 'ralplan' && entry.active !== false), false);
+      assert.notDeepEqual(skill, path.includes('/sessions/')
+        ? stored.terminal_skill_updates.session_skill
+        : stored.terminal_skill_updates.root_skill);
+    }
   });
 
   it('reports current and lifecycle-event corruption without treating it as valid evidence', async () => {

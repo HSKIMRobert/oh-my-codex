@@ -145,20 +145,33 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
       const existing = sessionId
         ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
         : await readModeState('ralplan', cwd);
+      const advisorySessionId = sessionId ?? (typeof existing?.session_id === 'string' ? existing.session_id : undefined);
+      const advisory = advisorySessionId ? await readCurrentRalplanAdvisory(cwd, advisorySessionId) : null;
+      const advisoryNeedsResume = Boolean(advisory
+        && (!advisory.fence || !['closed', 'abandoned', 'released'].includes(advisory.fence.state)));
       // The shell bootstrap has no consensus executor and therefore cannot
       // reconstruct Advisory provenance. Preserve the existing Advisory
       // binding instead of laundering it through a Standard startMode write.
-      if (!(existing?.active === true && existing.workflow_variant === 'advisory')) {
+      const unprojectedActiveAdvisory = existing?.workflow_variant === 'advisory' && existing.active === true && !advisory;
+      if (!unprojectedActiveAdvisory && !advisoryNeedsResume) {
         await startMode('ralplan', task.trim(), 5, cwd, sessionId);
       }
     }
-    const state = sessionId
+    const storedState = sessionId
       ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
       : await readModeState('ralplan', cwd);
-    if (!state) throw new Error('No Ralplan state found.');
-    const instruction = state.workflow_variant === 'advisory'
+    if (!storedState) throw new Error('No Ralplan state found.');
+    const stateSessionId = sessionId ?? (typeof storedState.session_id === 'string' ? storedState.session_id : undefined);
+    const projection = stateSessionId ? await readCurrentRalplanAdvisory(cwd, stateSessionId) : null;
+    const resumeAdvisory = Boolean(projection
+      && (!projection.fence || !['closed', 'abandoned', 'released'].includes(projection.fence.state)));
+    const state = resumeAdvisory && projection
+      ? { ...storedState, workflow_variant: 'advisory' as const, advisory_generation_id: projection.activation.generation_id }
+      : storedState;
+    const instruction = resumeAdvisory || state.workflow_variant === 'advisory'
       ? [
-        `Resume the non-authoritative Ralplan Advisory lifecycle for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        `Resume the non-authorizing Ralplan Advisory lifecycle for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'This Advisory is non-authoritative and cannot grant execution authority.',
         'Complete Planner, Architect, and Critic review in order and preserve their immutable evidence baselines.',
         'Close the Advisory lifecycle and return control to the caller; the result remains non-authorizing.',
       ].join('\n')
