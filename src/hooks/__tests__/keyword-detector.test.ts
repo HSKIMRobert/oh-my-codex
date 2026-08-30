@@ -3020,6 +3020,54 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('keeps an unscoped Team transition-visible while excluding exact Advisory from generic supersession', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-team-advisory-transition-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionId = 'sess-team-advisory-transition';
+    try {
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      const advisoryEntry = {
+        skill: 'ralplan', phase: 'reviewing', active: true, session_id: sessionId,
+        workflow_variant: 'advisory' as const, advisory_generation_id: 'generation-a',
+      };
+      await writeFile(
+        join(stateDir, 'sessions', sessionId, SKILL_ACTIVE_STATE_FILE),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'ralplan',
+          session_id: sessionId,
+          workflow_variant: 'advisory',
+          advisory_generation_id: 'generation-a',
+          active_skills: [
+            { skill: 'team', phase: 'running', active: true },
+            advisoryEntry,
+            { skill: 'ultraqa', phase: 'executing', active: true, session_id: sessionId },
+          ],
+        }, null, 2),
+      );
+
+      const result = await recordSkillActivation({
+        stateDir,
+        text: '$autoresearch continue',
+        sessionId,
+        nowIso: '2026-04-10T00:00:00.000Z',
+      });
+
+      assert.equal(result?.transition_error, undefined);
+      assert.deepEqual(result?.active_skills?.map((entry) => entry.skill), [
+        'ralplan', 'team', 'ultraqa', 'autoresearch',
+      ]);
+      const preservedAdvisory = result?.active_skills?.find((entry) => entry.skill === 'ralplan');
+      assert.equal(preservedAdvisory?.active, true);
+      assert.equal(preservedAdvisory?.session_id, advisoryEntry.session_id);
+      assert.equal(preservedAdvisory?.workflow_variant, advisoryEntry.workflow_variant);
+      assert.equal(preservedAdvisory?.advisory_generation_id, advisoryEntry.advisory_generation_id);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 
   it('seeds executing state for autoresearch prompt-submit activation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-autoresearch-'));

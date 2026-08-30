@@ -25,7 +25,6 @@ import { readTeamModeConfig } from '../config/team-mode.js';
 import {
   SKILL_ACTIVE_STATE_FILE,
   listActiveSkills,
-  listTransitionActiveSkills,
   readSkillActiveState,
   writeSkillActiveStateCopiesForStateDir,
   type SkillActiveEntry,
@@ -4007,7 +4006,11 @@ export async function recordSkillActivation(
   const previousEntries = listActiveSkills(previous ?? {});
   const protectedAdvisoryEntries = previousEntries.filter((entry) => entry.skill === 'ralplan'
     && (entry.workflow_variant === 'advisory' || previous?.workflow_variant === 'advisory'));
-  const transitionEntries = listTransitionActiveSkills(previous ?? {}, input.sessionId);
+  // `previous` is already the authenticated session-visible projection. Keep
+  // its legacy unscoped entries transition-visible, but never feed Advisory
+  // Ralplan into generic supersession or overlap policy.
+  const transitionEntries = previousEntries.filter((entry) => !(entry.skill === 'ralplan'
+    && (entry.workflow_variant === 'advisory' || previous?.workflow_variant === 'advisory')));
   const previousWorkflowEntries = transitionEntries.filter((entry) => (
     isTrackedWorkflowMode(entry.skill)
     && (input.allowSecondaryAutopilot !== false || entry.skill !== 'autopilot' || entry.skill === match.skill)
