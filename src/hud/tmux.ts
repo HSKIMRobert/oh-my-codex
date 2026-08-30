@@ -752,34 +752,50 @@ export function buildHudLayoutHookSlot(hookName: string): string {
   for (let i = 0; i < hookName.length; i++) {
     hash = (hash * 31 + hookName.charCodeAt(i)) | 0;
   }
+  return `window-layout-changed[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
+}
+
+export function buildHudSplitHookSlot(hookName: string): string {
+  let hash = 0;
+  for (let i = 0; i < hookName.length; i++) {
+    hash = (hash * 31 + hookName.charCodeAt(i)) | 0;
+  }
   return `after-split-window[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
 }
 
 function hudHookIdentityOption(hookSlot: string): string {
-  const match = /^(client-resized|after-split-window)\[([0-9]+)\]$/.exec(hookSlot);
+  const match = /^(client-resized|window-layout-changed|after-split-window)\[([0-9]+)\]$/.exec(hookSlot);
   if (!match) throw new Error('invalid_tmux_hook_slot');
   return `@omx_hook_identity_${match[1].replaceAll('-', '_')}_${match[2]}`;
 }
 
-function hudHookIdentityToken(hookName: string, hookSlot: string): string {
+function hudHookIdentityToken(context: HudResizeHookContext, hookSlot: string): string {
   let hash = 2166136261;
-  for (const char of `${hookName}:${hookSlot}`) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  for (const char of `${context.hookName}:${context.leaderPanePid}:${context.hudPanePid}:${hookSlot}`) {
+    hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  }
   return `omx-${(hash >>> 0).toString(16)}`;
 }
 
 function buildHudHookRegistrationSuffix(context: HudResizeHookContext, hookSlot: string): string[] {
   return [
     ';', 'set-option', '-t', context.sessionId,
-    hudHookIdentityOption(hookSlot), hudHookIdentityToken(context.hookName, hookSlot),
+    hudHookIdentityOption(hookSlot), hudHookIdentityToken(context, hookSlot),
   ];
+}
+
+function buildHudHookUnsetCommand(context: HudResizeHookContext, hookSlot: string): string {
+  return hookSlot.startsWith('window-layout-changed[')
+    ? `set-hook -u -w -t ${context.windowId} ${hookSlot}`
+    : `set-hook -u -t ${context.sessionId} ${hookSlot}`;
 }
 
 function buildGuardedHudHookUnregisterArgs(context: HudResizeHookContext, hookSlot: string): string[] {
   const identityOption = hudHookIdentityOption(hookSlot);
   return [
     'if-shell', '-F', '-t', context.sessionId,
-    `#{==:${identityOption},${hudHookIdentityToken(context.hookName, hookSlot)}}`,
-    `set-hook -u -t ${context.sessionId} ${hookSlot} ; set-option -u -t ${context.sessionId} ${identityOption}`,
+    `#{==:${identityOption},${hudHookIdentityToken(context, hookSlot)}}`,
+    `${buildHudHookUnsetCommand(context, hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`,
     '',
   ];
 }
@@ -794,6 +810,7 @@ export interface HudResizeHookContext {
   hookName: string;
   hookSlot: string;
   layoutHookSlot: string;
+  splitHookSlot: string;
 }
 
 function readHudResizeHookPaneIncarnations(
@@ -847,6 +864,7 @@ export function parseHudResizeHookContext(
     hookName,
     hookSlot: buildHudResizeHookSlot(hookName),
     layoutHookSlot: buildHudLayoutHookSlot(hookName),
+    splitHookSlot: buildHudSplitHookSlot(hookName),
   };
 }
 
@@ -900,7 +918,7 @@ function deferTmuxHookFormatExpansion(command: string): string {
 
 function buildHudHookSelfUnregister(context: HudResizeHookContext): string {
   const identityOption = hudHookIdentityOption(context.hookSlot);
-  return `if-shell -F -t ${context.sessionId} ${quoteHudHookShellArgument(`#{==:${identityOption},${hudHookIdentityToken(context.hookName, context.hookSlot)}}`)} ${quoteHudHookShellArgument(`set-hook -u -t ${context.sessionId} ${context.hookSlot} ; set-option -u -t ${context.sessionId} ${identityOption}`)} ''`;
+  return `if-shell -F -t ${context.sessionId} ${quoteHudHookShellArgument(`#{==:${identityOption},${hudHookIdentityToken(context, context.hookSlot)}}`)} ${quoteHudHookShellArgument(`${buildHudHookUnsetCommand(context, context.hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`)} ''`;
 }
 
 function buildAtomicHudHookCommand(
@@ -963,6 +981,7 @@ function buildHudLayoutReconcileHookCommand(
   omxBin: string,
   leaderPaneId: string,
   context: HudResizeHookContext,
+  hookSlot: string,
   options: RegisterHudResizeHookOptions = {},
 ): string {
   const env = options.env ?? process.env;
@@ -985,7 +1004,7 @@ function buildHudLayoutReconcileHookCommand(
     'hud',
     '--reconcile-tmux',
   ].join(' ');
-  const layoutContext = { ...context, hookSlot: context.layoutHookSlot };
+  const layoutContext = { ...context, hookSlot };
   if (process.platform === 'win32') {
     const nativeReconcile = `Set-Location -LiteralPath '${cwd.replace(/'/g, "''")}'; & '${process.execPath.replace(/'/g, "''")}' '${omxBin.replace(/'/g, "''")}' hud --reconcile-tmux | Out-Null`;
     const success = `${buildHudHookSelfUnregister(layoutContext)} ; run-shell -b ${quoteHudHookShellArgument(nativeReconcile)}`;
@@ -1751,10 +1770,15 @@ export function registerHudResizeHook(
   }
   if (omxBin) {
     try {
-      const reconcileCmd = shellEscapeSingle(
-        buildHudLayoutReconcileHookCommand(tmuxBin, omxBin, canonicalLeaderPaneId, context, options),
-      );
-      execTmuxSync(['set-hook', '-t', context.sessionId, context.layoutHookSlot, `run-shell -b ${reconcileCmd}`, ...buildHudHookRegistrationSuffix(context, context.layoutHookSlot)]);
+      for (const hookSlot of [context.splitHookSlot, context.layoutHookSlot]) {
+        const reconcileCmd = shellEscapeSingle(
+          buildHudLayoutReconcileHookCommand(tmuxBin, omxBin, canonicalLeaderPaneId, context, hookSlot, options),
+        );
+        const targetArgs = hookSlot === context.layoutHookSlot
+          ? ['-w', '-t', context.windowId]
+          : ['-t', context.sessionId];
+        execTmuxSync(['set-hook', ...targetArgs, hookSlot, `run-shell -b ${reconcileCmd}`, ...buildHudHookRegistrationSuffix(context, hookSlot)]);
+      }
     } catch {
       // Keep the resize hook installed so older tmux builds still recover on
       // client resize even when layout-change hook registration is unavailable.
@@ -1790,10 +1814,12 @@ export function unregisterHudResizeHook(
   } catch {
     ok = false;
   }
-  try {
-    execTmuxSync(buildGuardedHudHookUnregisterArgs(context, context.layoutHookSlot));
-  } catch {
-    ok = false;
+  for (const hookSlot of [context.splitHookSlot, context.layoutHookSlot]) {
+    try {
+      execTmuxSync(buildGuardedHudHookUnregisterArgs(context, hookSlot));
+    } catch {
+      ok = false;
+    }
   }
   return ok;
 }
