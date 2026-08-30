@@ -769,7 +769,7 @@ function hudHookIdentityToken(hookName: string, hookSlot: string): string {
 
 function buildHudHookRegistrationSuffix(context: HudResizeHookContext, hookSlot: string): string[] {
   return [
-    '\\;', 'set-option', '-t', context.sessionId,
+    ';', 'set-option', '-t', context.sessionId,
     hudHookIdentityOption(hookSlot), hudHookIdentityToken(context.hookName, hookSlot),
   ];
 }

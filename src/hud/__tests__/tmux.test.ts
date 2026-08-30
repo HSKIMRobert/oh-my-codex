@@ -88,6 +88,10 @@ describe('HUD resize hook helpers', () => {
     }
     assert.match(registrations[0]?.[4] ?? '', /resize-pane/);
     assert.match(registrations[0]?.[4] ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
+    for (const registration of registrations) {
+      assert.equal(registration[5], ';');
+      assert.deepEqual(registration.slice(6, 9), ['set-option', '-t', '$7']);
+    }
     assert.equal(registrations[1]?.[3], layoutHookSlot);
     assert.match(registrations[1]?.[4] ?? '', /--reconcile-tmux/);
     assert.match(registrations[1]?.[4] ?? '', /OMX_TMUX_HUD_OWNER/);
