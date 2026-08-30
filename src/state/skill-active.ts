@@ -6,6 +6,7 @@ import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.j
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import { pickPrimaryWorkflowMode } from './workflow-transition.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
+import { pinAtomicFile } from './pinned-atomic-file.js';
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = `${SKILL_ACTIVE_STATE_MODE}-state.json`;
@@ -299,10 +300,18 @@ export function mergeRootSkillStateForExactSession(
  *     normalized session id (unscoped root entry owned by the session).
  * This prevents stale root-scoped entries from surviving a mode clear (#3451-A).
  */
+export function skillActiveOwnershipMatchesExactSession(
+  value: Pick<SkillActiveStateLike, 'session_id' | 'owner_codex_session_id'>,
+  normalizedSessionId: string,
+): boolean {
+  const sessionId = safeString(value.session_id).trim();
+  if (sessionId === normalizedSessionId) return true;
+  return sessionId.length === 0
+    && safeString(value.owner_codex_session_id).trim() === normalizedSessionId;
+}
+
 function entryMatchesSessionOrOwner(entry: SkillActiveEntry, normalizedSessionId: string): boolean {
-  if (safeString(entry.session_id).trim() === normalizedSessionId) return true;
-  return safeString(entry.session_id).trim().length === 0
-    && safeString(entry.owner_codex_session_id).trim() === normalizedSessionId;
+  return skillActiveOwnershipMatchesExactSession(entry, normalizedSessionId);
 }
 
 /** Owner metadata for read-only provenance preflight; never infers ownership from storage. */
@@ -745,43 +754,51 @@ export async function updateSkillActiveStateCopiesForExactSessionTransaction(
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
   if (!sessionPath) throw new Error('skill-active exact-session transaction requires a session path');
   return withRootSkillActiveStateLock(rootPath, async (lock) => {
-    const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
-    const previousSession = existsSync(sessionPath) ? await readFile(sessionPath) : null;
-    const currentRoot = await readRootStateForWrite(rootPath);
-    let currentSession: SkillActiveStateLike | null = null;
-    if (previousSession !== null) {
-      try {
-        currentSession = normalizeSkillActiveState(JSON.parse(previousSession.toString('utf8')));
-      } catch (error) {
-        throw new SkillActiveStateWriteError(
-          'malformed-session', `malformed session skill-active state: ${sessionPath}`, { cause: error },
-        );
-      }
-      if (!currentSession) {
-        throw new SkillActiveStateWriteError('malformed-session', `invalid session skill-active state: ${sessionPath}`);
-      }
-    }
-    const nextSession = { version: 1, ...await update(currentRoot, currentSession) };
-    const nextRoot = options.projectRoot
-      ? options.projectRoot(currentRoot, nextSession)
-      : mergeRootStateForSession(currentRoot, nextSession, sessionId);
+    const pinnedSession = await pinAtomicFile(sessionPath);
     try {
-      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
-      await options.beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
-      await assertRootSkillActiveLockOwner(lock);
-      await writeFile(sessionPath, `${JSON.stringify(nextSession, null, 2)}\n`);
-      return nextSession;
-    } catch (error) {
-      let rollbackError: unknown;
-      try {
-        if (previousSession === null) await unlink(sessionPath).catch(() => undefined);
-        else await writeFile(sessionPath, previousSession);
-        await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
-      } catch (ownershipOrRestoreError) {
-        rollbackError = ownershipOrRestoreError;
+      const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
+      const previousSession = pinnedSession.bytes;
+      const currentRoot = await readRootStateForWrite(rootPath);
+      let currentSession: SkillActiveStateLike | null = null;
+      if (previousSession !== null) {
+        try {
+          currentSession = normalizeSkillActiveState(JSON.parse(previousSession.toString('utf8')));
+        } catch (error) {
+          throw new SkillActiveStateWriteError(
+            'malformed-session', `malformed session skill-active state: ${sessionPath}`, { cause: error },
+          );
+        }
+        if (!currentSession) {
+          throw new SkillActiveStateWriteError('malformed-session', `invalid session skill-active state: ${sessionPath}`);
+        }
       }
-      throw rollbackError ?? error;
-    }
+      const nextSession = { version: 1, ...await update(currentRoot, currentSession) };
+      const nextRoot = options.projectRoot
+        ? options.projectRoot(currentRoot, nextSession)
+        : mergeRootStateForSession(currentRoot, nextSession, sessionId);
+      let sessionCommitted = false;
+      try {
+        await options.beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
+        await assertRootSkillActiveLockOwner(lock);
+        await pinnedSession.replace(Buffer.from(`${JSON.stringify(nextSession, null, 2)}\n`));
+        sessionCommitted = true;
+        await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+        return nextSession;
+      } catch (error) {
+        let rollbackError: unknown;
+        try {
+          await assertRootSkillActiveLockOwner(lock);
+          if (sessionCommitted) {
+            if (previousSession === null) await pinnedSession.remove();
+            else await pinnedSession.replace(previousSession);
+          }
+          await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
+        } catch (ownershipOrRestoreError) {
+          rollbackError = ownershipOrRestoreError;
+        }
+        throw rollbackError ?? error;
+      }
+    } finally { await pinnedSession.close(); }
   });
 }
 

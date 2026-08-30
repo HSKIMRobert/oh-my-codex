@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -250,6 +250,185 @@ describe('central Ralplan Advisory activation owner', () => {
     assert.equal(await readFile(rootPath, 'utf8'), foreignBytes);
   });
 
+  it('rejects conflicting exact-session root top-level binding metadata byte-exactly', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-root-top-conflict-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory root top conflict', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    const stateDir = join(cwd, '.omx', 'state');
+    const rootPath = join(stateDir, 'skill-active-state.json');
+    const sessionPath = join(stateDir, 'sessions', 'session-a', 'skill-active-state.json');
+    const root = JSON.parse(await readFile(rootPath, 'utf8'));
+    root.session_id = 'session-a';
+    root.workflow_variant = 'advisory';
+    root.advisory_generation_id = 'generation-foreign';
+    const foreignRootBytes = `${JSON.stringify(root, null, 2)}\n`;
+    await writeFile(rootPath, foreignRootBytes);
+    const sessionBytes = await readFile(sessionPath, 'utf8');
+
+    await assert.rejects(activateOrResumeRalplanAdvisory(input), /root_skill_binding_conflict/);
+    assert.equal(await readFile(rootPath, 'utf8'), foreignRootBytes);
+    assert.equal(await readFile(sessionPath, 'utf8'), sessionBytes);
+  });
+
+  it('rejects wrong-typed exact-session root top-level binding fields byte-exactly', async () => {
+    for (const [field, value] of [
+      ['workflow_variant', { forged: true }],
+      ['advisory_generation_id', 42],
+    ] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-root-top-type-${field}-`));
+      roots.push(cwd);
+      const input = {
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: `$ralplan --advisory root top type ${field}`, generationId: 'generation-a',
+      };
+      await activateOrResumeRalplanAdvisory(input);
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionPath = join(stateDir, 'sessions', 'session-a', 'skill-active-state.json');
+      const root = JSON.parse(await readFile(rootPath, 'utf8'));
+      root.session_id = 'session-a';
+      root[field] = value;
+      const foreignRootBytes = `${JSON.stringify(root, null, 2)}\n`;
+      await writeFile(rootPath, foreignRootBytes);
+      const sessionBytes = await readFile(sessionPath, 'utf8');
+
+      await assert.rejects(activateOrResumeRalplanAdvisory(input), /root_skill_binding_conflict/);
+      assert.equal(await readFile(rootPath, 'utf8'), foreignRootBytes);
+      assert.equal(await readFile(sessionPath, 'utf8'), sessionBytes);
+    }
+  });
+
+  it('rejects wrong-typed nested root and session binding fields byte-exactly', async () => {
+    for (const [surface, field, value] of [
+      ['root-entry', 'workflow_variant', false],
+      ['root-entry', 'advisory_generation_id', 0],
+      ['session-entry', 'workflow_variant', { forged: true }],
+      ['session-entry', 'advisory_generation_id', []],
+    ] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-${surface}-${field}-`));
+      roots.push(cwd);
+      const input = {
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: `$ralplan --advisory ${surface} ${field}`, generationId: 'generation-a',
+      };
+      await activateOrResumeRalplanAdvisory(input);
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionPath = join(stateDir, 'sessions', 'session-a', 'skill-active-state.json');
+      const targetPath = surface === 'root-entry' ? rootPath : sessionPath;
+      const target = JSON.parse(await readFile(targetPath, 'utf8'));
+      const entry = target.active_skills.find((candidate: { skill?: string }) => candidate.skill === 'ralplan');
+      entry[field] = value;
+      await writeFile(targetPath, `${JSON.stringify(target, null, 2)}\n`);
+      const rootBytes = await readFile(rootPath, 'utf8');
+      const sessionBytes = await readFile(sessionPath, 'utf8');
+
+      await assert.rejects(activateOrResumeRalplanAdvisory(input), /skill_binding_conflict/);
+      assert.equal(await readFile(rootPath, 'utf8'), rootBytes);
+      assert.equal(await readFile(sessionPath, 'utf8'), sessionBytes);
+    }
+  });
+
+  it('rejects conflicting legacy-unscoped root ownership byte-exactly', async () => {
+    for (const surface of ['top-level', 'root-entry'] as const) {
+      for (const field of ['workflow_variant', 'advisory_generation_id'] as const) {
+        const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-legacy-owner-${surface}-${field}-`));
+        roots.push(cwd);
+        const input = {
+          cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+          prompt: `$ralplan --advisory legacy owner ${surface} ${field}`, generationId: 'generation-a',
+        };
+        await activateOrResumeRalplanAdvisory(input);
+        const rootPath = join(cwd, '.omx', 'state', 'skill-active-state.json');
+        const root = JSON.parse(await readFile(rootPath, 'utf8'));
+        const target = surface === 'top-level'
+          ? root
+          : root.active_skills.find((entry: Record<string, unknown>) => entry.skill === 'ralplan');
+        delete target.session_id;
+        target.owner_codex_session_id = 'session-a';
+        target[field] = field === 'workflow_variant' ? 'standard' : 'generation-foreign';
+        await writeFile(rootPath, `${JSON.stringify(root, null, 2)}\n`);
+        const before = await readFile(rootPath, 'utf8');
+
+        await assert.rejects(activateOrResumeRalplanAdvisory(input), /root_skill_binding_conflict/);
+        assert.equal(await readFile(rootPath, 'utf8'), before, `${surface}:${field}`);
+      }
+    }
+  });
+
+  it('never follows an initial or validation-time session mirror symlink', async () => {
+    for (const timing of ['initial', 'during-validation'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-session-symlink-${timing}-`));
+      roots.push(cwd);
+      const input = {
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: `$ralplan --advisory session symlink ${timing}`, generationId: 'generation-a',
+      };
+      await activateOrResumeRalplanAdvisory(input);
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionPath = join(stateDir, 'sessions', 'session-a', 'skill-active-state.json');
+      const externalPath = join(cwd, `external-${timing}.json`);
+      const externalBytes = `external-${timing}\n`;
+      await writeFile(externalPath, externalBytes);
+      const rootBytes = await readFile(rootPath, 'utf8');
+      if (timing === 'initial') {
+        await unlink(sessionPath);
+        await symlink(externalPath, sessionPath);
+      }
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        ...input,
+        failpoint: timing === 'during-validation'
+          ? async (checkpoint) => {
+              if (checkpoint !== 'before_skill_mirror_commit') return;
+              await unlink(sessionPath);
+              await symlink(externalPath, sessionPath);
+            }
+          : undefined,
+      }), /ELOOP|file-changed|session mirror changed|atomic-replace-failed|recovery is ambiguous/);
+      assert.equal(await readFile(externalPath, 'utf8'), externalBytes, timing);
+      assert.equal(await readFile(rootPath, 'utf8'), rootBytes, timing);
+    }
+  });
+
+  it('rejects a Darwin-style parent-directory swap without mutating either directory or root', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-session-parent-swap-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory session parent swap', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionDir = join(stateDir, 'sessions', 'session-a');
+    const displacedDir = join(stateDir, 'sessions', 'session-a-displaced');
+    const externalDir = join(cwd, 'external-session');
+    const externalSkillPath = join(externalDir, 'skill-active-state.json');
+    const originalSkillPath = join(sessionDir, 'skill-active-state.json');
+    const rootPath = join(stateDir, 'skill-active-state.json');
+    await mkdir(externalDir);
+    const externalBytes = 'external-parent-swap\n';
+    await writeFile(externalSkillPath, externalBytes);
+    const originalBytes = await readFile(originalSkillPath, 'utf8');
+    const rootBytes = await readFile(rootPath, 'utf8');
+
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input,
+      failpoint: async (checkpoint) => {
+        if (checkpoint !== 'before_skill_mirror_commit') return;
+        await rename(sessionDir, displacedDir);
+        await symlink(externalDir, sessionDir, 'dir');
+      },
+    }), /parent changed|unsupported|ENOTSUP/);
+    assert.equal(await readFile(externalSkillPath, 'utf8'), externalBytes);
+    assert.equal(await readFile(join(displacedDir, 'skill-active-state.json'), 'utf8'), originalBytes);
+    assert.equal(await readFile(rootPath, 'utf8'), rootBytes);
+  });
+
   it('keeps fast repair atomic when a Standard writer wins immediately after the mirror transaction', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-fast-repair-race-'));
     roots.push(cwd);
@@ -292,6 +471,40 @@ describe('central Ralplan Advisory activation owner', () => {
       assert.ok(entry, path);
       assert.equal(entry.workflow_variant, undefined, path);
       assert.equal(entry.advisory_generation_id, undefined, path);
+    }
+  });
+
+  it('rejects fast-path success when mode or run state drifts during the skill mirror commit', async () => {
+    for (const surface of ['mode', 'run'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-fast-${surface}-drift-`));
+      roots.push(cwd);
+      const input = {
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: `$ralplan --advisory fast ${surface} drift`, generationId: 'generation-a',
+      };
+      await activateOrResumeRalplanAdvisory(input);
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionDir = join(stateDir, 'sessions', 'session-a');
+      const targetPath = join(sessionDir, surface === 'mode' ? 'ralplan-state.json' : 'run-state.json');
+      const advisoryRoot = join(sessionDir, 'ralplan-advisory');
+      const currentPath = join(advisoryRoot, 'current.json');
+      const currentBytes = await readFile(currentPath, 'utf8');
+
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        ...input,
+        failpoint: async (checkpoint) => {
+          if (checkpoint !== 'before_skill_mirror_commit') return;
+          const state = JSON.parse(await readFile(targetPath, 'utf8'));
+          if (surface === 'mode') delete state.workflow_variant;
+          else state.active = false;
+          await writeFile(targetPath, `${JSON.stringify(state, null, 2)}\n`);
+        },
+      }), /projection_mismatch/);
+
+      assert.equal(await readFile(currentPath, 'utf8'), currentBytes, surface);
+      assert.equal(existsSync(join(advisoryRoot, 'rollover-intent.json')), false, surface);
+      const drifted = JSON.parse(await readFile(targetPath, 'utf8'));
+      assert.equal(surface === 'mode' ? drifted.workflow_variant : drifted.active, surface === 'mode' ? undefined : false);
     }
   });
 
