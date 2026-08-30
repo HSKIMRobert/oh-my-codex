@@ -1695,7 +1695,7 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.equal(result.status, 'recreated');
     assert.deepEqual(killed, ['%2']);
     assert.equal(created[0]?.options?.targetPaneId, '%1');
-    assert.equal(created[0]?.options?.fullWidth, true);
+    assert.equal(Object.hasOwn(created[0]?.options ?? {}, 'fullWidth'), false);
   });
 
   it('recreates a single owned HUD pane when tmux layout narrows it below the window width', async () => {
@@ -1797,7 +1797,7 @@ describe('reconcileHudForPromptSubmit', () => {
 
     assert.equal(result.status, 'recreated');
     assert.deepEqual(killed, ['%2']);
-    assert.equal(created[0]?.options?.fullWidth, true);
+    assert.equal(Object.hasOwn(created[0]?.options ?? {}, 'fullWidth'), false);
     assert.equal(created[0]?.options?.targetPaneId, '%1');
   });
 

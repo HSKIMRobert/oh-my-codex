@@ -40,7 +40,7 @@ describe('HUD resize hook helpers', () => {
     const hookName = buildHudResizeHookName('$7', '@3', '%1');
     assert.equal(hookName, 'omx_hud_resize_7_3_1');
     for (const slot of [buildHudResizeHookSlot(hookName), buildHudLayoutHookSlot(hookName)]) {
-      assert.match(slot, /^(?:client-resized|window-layout-changed)\[\d+\]$/);
+      assert.match(slot, /^(?:client-resized|after-split-window)\[\d+\]$/);
       const index = Number.parseInt(slot.replace(/^.*\[|\]$/g, ''), 10);
       assert.ok(index >= 0 && index < 2147483647);
     }
@@ -93,8 +93,10 @@ describe('HUD resize hook helpers', () => {
       assert.deepEqual(registration.slice(6, 9), ['set-option', '-t', '$7']);
     }
     assert.equal(registrations[1]?.[3], layoutHookSlot);
+    assert.match(layoutHookSlot, /^after-split-window\[/);
     assert.match(registrations[1]?.[4] ?? '', /--reconcile-tmux/);
     assert.match(registrations[1]?.[4] ?? '', /OMX_TMUX_HUD_OWNER/);
+    assert.doesNotMatch(registrations[1]?.[4] ?? '', /\\; /);
   });
 
   it('guards registered hooks against recycled leader or HUD pane IDs', () => {
@@ -111,6 +113,8 @@ describe('HUD resize hook helpers', () => {
       for (const token of ['pane_id', '%1', 'pane_pid', '101', '%9', '109']) {
         assert.match(command, new RegExp(token));
       }
+      assert.match(command, /##\{pane_id}/);
+      assert.match(command, /##\{pane_pid}/);
     }
   });
 
@@ -181,7 +185,7 @@ describe('HUD resize hook helpers', () => {
     assert.deepEqual(guarded.map((args) => args[3]), ['$7', '$7']);
 
     const expectedIdentity = (hookSlot: string): { option: string; predicate: string } => {
-      const match = /^(client-resized|window-layout-changed)\[([0-9]+)\]$/.exec(hookSlot);
+      const match = /^(client-resized|after-split-window)\[([0-9]+)\]$/.exec(hookSlot);
       assert.ok(match);
       const option = `@omx_hook_identity_${match[1]!.replaceAll('-', '_')}_${match[2]}`;
       let hash = 2166136261;
@@ -199,7 +203,7 @@ describe('HUD resize hook helpers', () => {
       assert.equal(guarded[index]?.[4], identity.predicate);
       assert.equal(
         guarded[index]?.[5],
-        `set-hook -u -t $7 ${hookSlot} \\; set-option -u -t $7 ${identity.option}`,
+        `set-hook -u -t $7 ${hookSlot} ; set-option -u -t $7 ${identity.option}`,
       );
       assert.equal(guarded[index]?.[6], '');
     }

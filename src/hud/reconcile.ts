@@ -198,17 +198,6 @@ function needsHudTopologyRecreate(pane: TmuxPaneSnapshot, leaderPane?: TmuxPaneS
   return !spansExpectedWidth || !touchesWindowBottom;
 }
 
-function shouldCreateFullWidthHud(leaderPane?: TmuxPaneSnapshot): boolean {
-  return Boolean(
-    leaderPane
-    && typeof leaderPane.paneLeft === 'number'
-    && typeof leaderPane.paneWidth === 'number'
-    && typeof leaderPane.windowWidth === 'number'
-    && leaderPane.paneLeft === 0
-    && leaderPane.paneWidth === leaderPane.windowWidth,
-  );
-}
-
 function needsHudHeightResize(pane: TmuxPaneSnapshot, desiredHeight: number): boolean {
   return typeof pane.paneHeight !== 'number' || pane.paneHeight !== desiredHeight;
 }
@@ -561,7 +550,7 @@ export async function reconcileHudForPromptSubmit(
   const createFullWidth = hudPaneIds
     .map((paneId) => panes.find((pane) => pane.paneId === paneId))
     .some((pane) => Boolean(pane && needsHudTopologyRecreate(pane, leaderPane)))
-    && (!leaderPane || shouldCreateFullWidthHud(leaderPane));
+    && !leaderPane;
 
   if (!resolvedSessionId) {
     return {
