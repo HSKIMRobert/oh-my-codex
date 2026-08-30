@@ -9,8 +9,12 @@ import {
   type ActivateOrResumeRalplanAdvisoryInput,
   type AdvisoryActivationCheckpoint,
 } from '../advisory-activation.js';
-import { listTransitionActiveSkills } from '../../state/skill-active.js';
-import { commitPreparedRalplanAdvisoryActivationInternal } from '../advisory.js';
+import { listActiveSkills, listTransitionActiveSkills, writeSkillActiveStateCopiesForStateDir } from '../../state/skill-active.js';
+import {
+  administrativelyAbandonRalplanAdvisory,
+  commitPreparedRalplanAdvisoryActivationInternal,
+  prepareAdvisoryCloseout,
+} from '../advisory.js';
 
 const roots: string[] = [];
 const activateOrResumeRalplanAdvisory = (
@@ -36,6 +40,7 @@ describe('central Ralplan Advisory activation owner', () => {
   it('keeps one generation recoverable across every publication checkpoint', async () => {
     const checkpoints: AdvisoryActivationCheckpoint[] = [
       'after_intent', 'after_mode', 'after_run_state',
+      'before_skill_mirror_commit', 'after_skill_mirror_transaction',
       'after_session_skill', 'after_root_skill', 'before_mode_fsync', 'before_commit',
     ];
     for (const checkpoint of checkpoints) {
@@ -189,9 +194,129 @@ describe('central Ralplan Advisory activation owner', () => {
     const retried = await activateOrResumeRalplanAdvisory(input);
     assert.equal(retried.activation.generation_id, 'generation-a');
     assert.equal(retried.projection.activation.generation_id, 'generation-a');
+    const stateDir = join(cwd, '.omx', 'state');
+    for (const path of [
+      join(stateDir, 'sessions', 'session-a', 'skill-active-state.json'),
+      join(stateDir, 'skill-active-state.json'),
+    ]) {
+      const state = JSON.parse(await readFile(path, 'utf8'));
+      state.active_skills = state.active_skills.map((entry: Record<string, unknown>) => entry.skill === 'ralplan'
+        ? Object.fromEntries(Object.entries(entry).filter(([key]) => !['workflow_variant', 'advisory_generation_id'].includes(key)))
+        : entry);
+      await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+    }
+    const repaired = await activateOrResumeRalplanAdvisory(input);
+    assert.equal(repaired.activation.generation_id, 'generation-a');
+    for (const path of [
+      join(stateDir, 'sessions', 'session-a', 'skill-active-state.json'),
+      join(stateDir, 'skill-active-state.json'),
+    ]) {
+      const entry = listActiveSkills(JSON.parse(await readFile(path, 'utf8')))
+        .find((candidate) => candidate.skill === 'ralplan' && candidate.session_id === 'session-a');
+      assert.equal(entry?.workflow_variant, 'advisory', path);
+      assert.equal(entry?.advisory_generation_id, 'generation-a', path);
+    }
+    const sessionSkillPath = join(stateDir, 'sessions', 'session-a', 'skill-active-state.json');
+    const conflicted = JSON.parse(await readFile(sessionSkillPath, 'utf8'));
+    conflicted.active_skills = conflicted.active_skills.map((entry: Record<string, unknown>) => entry.skill === 'ralplan'
+      ? { ...entry, advisory_generation_id: 'generation-foreign' }
+      : entry);
+    await writeFile(sessionSkillPath, `${JSON.stringify(conflicted, null, 2)}\n`);
+    await assert.rejects(activateOrResumeRalplanAdvisory(input), /session_skill_binding_conflict/);
     await assert.rejects(activateOrResumeRalplanAdvisory({
       ...input, prompt: '$ralplan --advisory different prompt',
     }), /committed_activation_authority_mismatch/);
+  });
+
+  it('rejects an exact-session foreign root generation without mutating root bytes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-root-conflict-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory root conflict', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    const rootPath = join(cwd, '.omx', 'state', 'skill-active-state.json');
+    const root = JSON.parse(await readFile(rootPath, 'utf8'));
+    root.active_skills = root.active_skills.map((entry: Record<string, unknown>) => (
+      entry.skill === 'ralplan' && entry.session_id === 'session-a'
+        ? { ...entry, advisory_generation_id: 'generation-foreign' }
+        : entry
+    ));
+    const foreignBytes = `${JSON.stringify(root, null, 2)}\n`;
+    await writeFile(rootPath, foreignBytes);
+
+    await assert.rejects(activateOrResumeRalplanAdvisory(input), /root_skill_binding_conflict/);
+    assert.equal(await readFile(rootPath, 'utf8'), foreignBytes);
+  });
+
+  it('keeps fast repair atomic when a Standard writer wins immediately after the mirror transaction', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-fast-repair-race-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory repair race', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    const stateDir = join(cwd, '.omx', 'state');
+    for (const path of [
+      join(stateDir, 'sessions', 'session-a', 'skill-active-state.json'),
+      join(stateDir, 'skill-active-state.json'),
+    ]) {
+      const state = JSON.parse(await readFile(path, 'utf8'));
+      state.active_skills = state.active_skills.map((entry: Record<string, unknown>) => entry.skill === 'ralplan'
+        ? Object.fromEntries(Object.entries(entry).filter(([key]) => !['workflow_variant', 'advisory_generation_id'].includes(key)))
+        : entry);
+      await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+    }
+    const standardState = {
+      version: 1, active: true, skill: 'ralplan', phase: 'planning', session_id: 'session-a',
+      active_skills: [{ skill: 'ralplan', active: true, phase: 'planning', session_id: 'session-a' }],
+    };
+    let competitor: Promise<void> | undefined;
+    await assert.rejects(activateOrResumeRalplanAdvisory({
+      ...input,
+      failpoint: async (checkpoint) => {
+        if (checkpoint === 'before_skill_mirror_commit') {
+          competitor = writeSkillActiveStateCopiesForStateDir(stateDir, standardState, 'session-a');
+        }
+        if (checkpoint === 'after_skill_mirror_transaction') await competitor;
+      },
+    }), /projection_mismatch/);
+    for (const path of [
+      join(stateDir, 'sessions', 'session-a', 'skill-active-state.json'),
+      join(stateDir, 'skill-active-state.json'),
+    ]) {
+      const entries = listActiveSkills(JSON.parse(await readFile(path, 'utf8')));
+      const entry = entries.find((candidate) => candidate.skill === 'ralplan' && candidate.session_id === 'session-a');
+      assert.ok(entry, path);
+      assert.equal(entry.workflow_variant, undefined, path);
+      assert.equal(entry.advisory_generation_id, undefined, path);
+    }
+  });
+
+  it('rejects a terminal generation behind a stale active binding without repairing skill mirrors', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-terminal-stale-binding-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory terminal stale binding', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    await prepareAdvisoryCloseout({
+      cwd, sessionId: 'session-a', generationId: 'generation-a', closingTurnId: 'turn-close', iteration: 1,
+    });
+    await administrativelyAbandonRalplanAdvisory({
+      cwd, sessionId: 'session-a', generationId: 'generation-a', rootThreadId: 'root-a', turnId: 'turn-close',
+    });
+    const stateDir = join(cwd, '.omx', 'state');
+    const skillPaths = [
+      join(stateDir, 'sessions', 'session-a', 'skill-active-state.json'),
+      join(stateDir, 'skill-active-state.json'),
+    ];
+    const before = await Promise.all(skillPaths.map((path) => readFile(path, 'utf8')));
+    await assert.rejects(activateOrResumeRalplanAdvisory(input), /not_precloseout/);
+    assert.deepEqual(await Promise.all(skillPaths.map((path) => readFile(path, 'utf8'))), before);
   });
 
   it('rejects direct commit when any required mirror is missing and retains the intent', async () => {

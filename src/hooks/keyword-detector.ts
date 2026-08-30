@@ -532,6 +532,28 @@ function buildActiveSkills(state: SkillActiveState): SkillActiveEntry[] | undefi
   }];
 }
 
+function listPromptVisibleEntries(
+  previous: SkillActiveState | null,
+  sessionId?: string,
+): SkillActiveEntry[] {
+  const entries = listActiveSkills(previous ?? {});
+  const requestedSessionId = safeString(sessionId).trim();
+  const outerSessionId = safeString(previous?.session_id).trim();
+  const visible = requestedSessionId
+    ? entries.filter((entry) => {
+        const entrySessionId = safeString(entry.session_id).trim();
+        return entrySessionId === requestedSessionId
+          || (entrySessionId.length === 0 && outerSessionId === requestedSessionId);
+      })
+    : entries.filter((entry) => safeString(entry.session_id).trim().length === 0);
+  return visible;
+}
+
+function isAdvisoryRalplanEntry(entry: SkillActiveEntry, previous: SkillActiveState | null): boolean {
+  return entry.skill === 'ralplan'
+    && (entry.workflow_variant === 'advisory' || previous?.workflow_variant === 'advisory');
+}
+
 async function readExistingDeepInterviewState(statePath: string): Promise<DeepInterviewModeState | null> {
   try {
     const raw = await readFile(statePath, 'utf-8');
@@ -787,12 +809,18 @@ async function persistStatefulSkillSeedState(
   }
 
   if (baseState.workflow_variant === 'advisory') {
+    const advisoryGenerationId = safeString(baseState.advisory_generation_id);
     return {
       ...nextSkill,
       initialized_mode: config.mode,
       initialized_state_path: relativePath,
       workflow_variant: 'advisory',
-      advisory_generation_id: safeString(baseState.advisory_generation_id),
+      advisory_generation_id: advisoryGenerationId,
+      active_skills: nextSkill.active_skills?.map((entry) => (
+        entry.skill === 'ralplan' && entry.session_id === nextSkill.session_id
+          ? { ...entry, workflow_variant: 'advisory' as const, advisory_generation_id: advisoryGenerationId }
+          : entry
+      )),
     };
   }
 
@@ -4004,14 +4032,9 @@ export async function recordSkillActivation(
   if (classification.reservedInput === 'omx-question-answered' && matchedModeTerminal) return null;
   const preserveActivatedAt = sameSkill && !matchedModeTerminal && (sameKeyword || sameSkillContinuation);
   const previousEntries = listActiveSkills(previous ?? {});
-  const protectedAdvisoryEntries = previousEntries.filter((entry) => entry.skill === 'ralplan'
-    && (entry.workflow_variant === 'advisory' || previous?.workflow_variant === 'advisory'));
-  // `previous` is already the authenticated session-visible projection. Keep
-  // its legacy unscoped entries transition-visible, but never feed Advisory
-  // Ralplan into generic supersession or overlap policy.
-  const transitionEntries = previousEntries.filter((entry) => !(entry.skill === 'ralplan'
-    && (entry.workflow_variant === 'advisory' || previous?.workflow_variant === 'advisory')));
-  const previousWorkflowEntries = transitionEntries.filter((entry) => (
+  const visibleEntries = listPromptVisibleEntries(previous, input.sessionId);
+  const protectedAdvisoryEntries = visibleEntries.filter((entry) => isAdvisoryRalplanEntry(entry, previous));
+  const previousWorkflowEntries = visibleEntries.filter((entry) => !isAdvisoryRalplanEntry(entry, previous)).filter((entry) => (
     isTrackedWorkflowMode(entry.skill)
     && (input.allowSecondaryAutopilot !== false || entry.skill !== 'autopilot' || entry.skill === match.skill)
     && (
@@ -4258,6 +4281,7 @@ export async function recordSkillActivation(
             ...ownedWorkflowState,
             initialized_mode: seeded.initialized_mode,
             initialized_state_path: seeded.initialized_state_path,
+            ...(seeded.active_skills ? { active_skills: seeded.active_skills } : {}),
             ...(seeded.workflow_variant ? { workflow_variant: seeded.workflow_variant } : {}),
             ...(seeded.advisory_generation_id ? { advisory_generation_id: seeded.advisory_generation_id } : {}),
           };

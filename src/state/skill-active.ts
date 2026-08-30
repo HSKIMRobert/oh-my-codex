@@ -15,7 +15,7 @@ const ROOT_SKILL_ACTIVE_LOCK_RETRY_MS = 10;
 const ROOT_SKILL_ACTIVE_LOCK_STALE_MS = 10_000;
 
 export class SkillActiveStateWriteError extends Error {
-  readonly code: 'lock-timeout' | 'lock-lost' | 'malformed-root' | 'atomic-replace-failed';
+  readonly code: 'lock-timeout' | 'lock-lost' | 'malformed-root' | 'malformed-session' | 'atomic-replace-failed';
 
   constructor(code: SkillActiveStateWriteError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -727,6 +727,61 @@ export async function updateRootSkillActiveStateForStateDir(
     const nextRoot = update(currentRoot);
     if (nextRoot === null) return;
     await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+  });
+}
+
+export async function updateSkillActiveStateCopiesForExactSessionTransaction(
+  stateDir: string,
+  sessionId: string,
+  update: (
+    currentRoot: SkillActiveStateLike | null,
+    currentSession: SkillActiveStateLike | null,
+  ) => SkillActiveStateLike | Promise<SkillActiveStateLike>,
+  options: {
+    beforeCommit?: BeforeWritableCommit;
+    projectRoot?: (currentRoot: SkillActiveStateLike | null, nextSession: SkillActiveStateLike) => SkillActiveStateLike;
+  } = {},
+): Promise<SkillActiveStateLike> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  if (!sessionPath) throw new Error('skill-active exact-session transaction requires a session path');
+  return withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
+    const previousSession = existsSync(sessionPath) ? await readFile(sessionPath) : null;
+    const currentRoot = await readRootStateForWrite(rootPath);
+    let currentSession: SkillActiveStateLike | null = null;
+    if (previousSession !== null) {
+      try {
+        currentSession = normalizeSkillActiveState(JSON.parse(previousSession.toString('utf8')));
+      } catch (error) {
+        throw new SkillActiveStateWriteError(
+          'malformed-session', `malformed session skill-active state: ${sessionPath}`, { cause: error },
+        );
+      }
+      if (!currentSession) {
+        throw new SkillActiveStateWriteError('malformed-session', `invalid session skill-active state: ${sessionPath}`);
+      }
+    }
+    const nextSession = { version: 1, ...await update(currentRoot, currentSession) };
+    const nextRoot = options.projectRoot
+      ? options.projectRoot(currentRoot, nextSession)
+      : mergeRootStateForSession(currentRoot, nextSession, sessionId);
+    try {
+      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+      await options.beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
+      await assertRootSkillActiveLockOwner(lock);
+      await writeFile(sessionPath, `${JSON.stringify(nextSession, null, 2)}\n`);
+      return nextSession;
+    } catch (error) {
+      let rollbackError: unknown;
+      try {
+        if (previousSession === null) await unlink(sessionPath).catch(() => undefined);
+        else await writeFile(sessionPath, previousSession);
+        await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
+      } catch (ownershipOrRestoreError) {
+        rollbackError = ownershipOrRestoreError;
+      }
+      throw rollbackError ?? error;
+    }
   });
 }
 

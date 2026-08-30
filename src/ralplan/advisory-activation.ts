@@ -4,7 +4,7 @@ import { open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startMode } from '../modes/base.js';
 import { getBaseStateDir } from '../mcp/state-paths.js';
-import { getSkillActiveStatePathsForStateDir, listActiveSkills, mergeRootSkillStateForExactSession, updateRootSkillActiveStateForStateDir, writeSkillActiveStateCopiesForStateDir } from '../state/skill-active.js';
+import { getSkillActiveStatePathsForStateDir, listActiveSkills, mergeRootSkillStateForExactSession, updateSkillActiveStateCopiesForExactSessionTransaction } from '../state/skill-active.js';
 import { syncExplicitSessionModeState } from '../state/operations.js';
 import {
   commitPreparedRalplanAdvisoryActivationInternal,
@@ -24,6 +24,8 @@ export type AdvisoryActivationCheckpoint =
   | 'after_session_skill'
   | 'after_root_skill'
   | 'before_mode_fsync'
+  | 'before_skill_mirror_commit'
+  | 'after_skill_mirror_transaction'
   | 'before_commit'
   | 'intent_committed';
 
@@ -63,6 +65,73 @@ async function readExistingRecord(path: string): Promise<Record<string, unknown>
   }
 }
 
+function assertRepairableRootSkillBinding(
+  rootState: Record<string, unknown> | null,
+  sessionId: string,
+  generationId: string,
+): void {
+  const rootRalplan = listActiveSkills(rootState ?? {})
+    .filter((entry) => entry.skill === 'ralplan' && entry.session_id === sessionId);
+  if (rootRalplan.length > 1) {
+    throw new Error('ralplan_advisory_activation_root_skill_identity_mismatch');
+  }
+  const rootVariant = rootRalplan[0]?.workflow_variant;
+  const rootGeneration = rootRalplan[0]?.advisory_generation_id;
+  if ((rootVariant && rootVariant !== 'advisory')
+    || (rootGeneration && rootGeneration !== generationId)) {
+    throw new Error('ralplan_advisory_activation_root_skill_binding_conflict');
+  }
+}
+
+function assertRepairableCommittedLifecycle(projection: AdvisoryProjection | null, generationId: string): void {
+  if (!projection || projection.corruption || projection.activation.generation_id !== generationId
+    || projection.fence || projection.journal || projection.admin_event) {
+    throw new Error('ralplan_advisory_committed_activation_not_precloseout');
+  }
+}
+
+async function publishAdvisorySkillMirrors(
+  stateDir: string,
+  sessionId: string,
+  generationId: string,
+  validateRuntime: () => Promise<void>,
+  validateLifecycle: () => Promise<void>,
+  failpoint?: ActivateOrResumeRalplanAdvisoryInput['failpoint'],
+): Promise<void> {
+  const skillPaths = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  if (!skillPaths.sessionPath) throw new Error('ralplan_advisory_activation_session_skill_path_missing');
+  await updateSkillActiveStateCopiesForExactSessionTransaction(
+    stateDir, sessionId,
+    async (currentRoot, currentSession) => {
+      await validateLifecycle();
+      await validateRuntime();
+      const entries = listActiveSkills(currentSession ?? {});
+      const exactRalplan = entries.filter((entry) => entry.skill === 'ralplan' && entry.session_id === sessionId);
+      if (exactRalplan.length !== 1 || exactRalplan[0]?.active === false) {
+        throw new Error('ralplan_advisory_activation_session_skill_identity_mismatch');
+      }
+      const existingVariant = exactRalplan[0]?.workflow_variant;
+      const existingGeneration = exactRalplan[0]?.advisory_generation_id;
+      if ((existingVariant && existingVariant !== 'advisory')
+        || (existingGeneration && existingGeneration !== generationId)) {
+        throw new Error('ralplan_advisory_activation_session_skill_binding_conflict');
+      }
+      assertRepairableRootSkillBinding(currentRoot, sessionId, generationId);
+      await failpoint?.('before_skill_mirror_commit');
+      return {
+        ...currentSession,
+        workflow_variant: 'advisory',
+        advisory_generation_id: generationId,
+        active_skills: entries.map((entry) => entry.skill === 'ralplan' && entry.session_id === sessionId
+          ? { ...entry, workflow_variant: 'advisory' as const, advisory_generation_id: generationId }
+          : entry),
+      };
+    },
+    { projectRoot: (currentRoot, nextSession) => mergeRootSkillStateForExactSession(currentRoot, nextSession, sessionId) },
+  );
+  await failpoint?.('after_skill_mirror_transaction');
+}
+
 /**
  * Single activation owner for Ralplan Advisory. The durable intent remains in
  * place until every canonical runtime projection is present, verified, and
@@ -99,6 +168,25 @@ export async function activateOrResumeRalplanAdvisory(
       ));
       if (sameIdentity && binding?.active === true && binding.workflow_variant === 'advisory'
         && binding.advisory_generation_id === committed.activation.generation_id) {
+        assertRepairableCommittedLifecycle(committed, committed.activation.generation_id);
+        const stateDir = getBaseStateDir(input.cwd);
+        const projections = describeAdvisoryActivationProjections(
+          stateDir, input.sessionId, committed.activation.generation_id,
+        );
+        const verifyRuntime = async () => {
+          await verifyPinnedJsonAndSync(projections.mode.path, projections.mode.predicate);
+          await verifyPinnedJsonAndSync(projections.run.path, projections.run.predicate);
+        };
+        await publishAdvisorySkillMirrors(
+          stateDir, input.sessionId, committed.activation.generation_id,
+          verifyRuntime,
+          async () => assertRepairableCommittedLifecycle(
+            await readCurrentRalplanAdvisory(input.cwd, input.sessionId), committed.activation.generation_id,
+          ),
+          input.failpoint,
+        );
+        await verifyPinnedJsonAndSync(projections.sessionSkill.path, projections.sessionSkill.predicate);
+        await verifyPinnedJsonAndSync(projections.rootSkill.path, projections.rootSkill.predicate);
         return { activation: committed.activation, projection: committed };
       }
       if (binding?.active === true && binding.workflow_variant === 'advisory') {
@@ -127,22 +215,6 @@ export async function activateOrResumeRalplanAdvisory(
   await syncExplicitSessionModeState('ralplan', input.cwd, input.sessionId);
 
   const stateDir = getBaseStateDir(input.cwd);
-  const skillPaths = getSkillActiveStatePathsForStateDir(stateDir, input.sessionId);
-  if (!skillPaths.sessionPath) throw new Error('ralplan_advisory_activation_session_skill_path_missing');
-  const sessionSkill = await verifyPinnedJsonAndSync(skillPaths.sessionPath, () => true);
-  const advisorySkill = {
-    ...sessionSkill,
-    workflow_variant: 'advisory',
-    advisory_generation_id: activation.generation_id,
-    active_skills: listActiveSkills(sessionSkill).map((entry) => entry.skill === 'ralplan'
-      ? { ...entry, workflow_variant: 'advisory' as const, advisory_generation_id: activation!.generation_id }
-      : entry),
-  };
-  await writeSkillActiveStateCopiesForStateDir(stateDir, advisorySkill, input.sessionId, null);
-  await updateRootSkillActiveStateForStateDir(
-    stateDir,
-    (currentRoot) => mergeRootSkillStateForExactSession(currentRoot, advisorySkill, input.sessionId),
-  );
   const projections = describeAdvisoryActivationProjections(stateDir, input.sessionId, activation.generation_id);
   const verifyMode = (beforeSync?: () => void | Promise<void>) => verifyPinnedJsonAndSync(
     projections.mode.path, projections.mode.predicate, beforeSync,
@@ -150,6 +222,13 @@ export async function activateOrResumeRalplanAdvisory(
   const verifyRun = () => verifyPinnedJsonAndSync(projections.run.path, projections.run.predicate);
   const verifySessionSkill = () => verifyPinnedJsonAndSync(projections.sessionSkill.path, projections.sessionSkill.predicate);
   const verifyRootSkill = () => verifyPinnedJsonAndSync(projections.rootSkill.path, projections.rootSkill.predicate);
+
+  await publishAdvisorySkillMirrors(
+    stateDir, input.sessionId, activation.generation_id,
+    async () => { await verifyMode(); await verifyRun(); },
+    async () => undefined,
+    input.failpoint,
+  );
 
   await verifyMode(() => input.failpoint?.('before_mode_fsync'));
   await input.failpoint?.('after_mode');

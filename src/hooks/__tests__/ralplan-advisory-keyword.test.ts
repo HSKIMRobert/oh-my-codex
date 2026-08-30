@@ -77,6 +77,17 @@ describe('ralplan advisory keyword activation', () => {
       const mode = JSON.parse(await readFile(join(stateDir, 'sessions', 'session-a', 'ralplan-state.json'), 'utf8'));
       assert.equal(mode.workflow_variant, 'advisory', text);
       assert.equal(mode.execution_handoff_authorized, false, text);
+      for (const path of [
+        join(stateDir, 'sessions', 'session-a', 'skill-active-state.json'),
+        join(stateDir, 'skill-active-state.json'),
+      ]) {
+        const skill = JSON.parse(await readFile(path, 'utf8'));
+        const entry = skill.active_skills.find((candidate: Record<string, unknown>) => (
+          candidate.skill === 'ralplan' && candidate.session_id === 'session-a'
+        ));
+        assert.equal(entry?.workflow_variant, 'advisory', `${text}:${path}`);
+        assert.equal(entry?.advisory_generation_id, result?.advisory_generation_id, `${text}:${path}`);
+      }
     }
   });
 
