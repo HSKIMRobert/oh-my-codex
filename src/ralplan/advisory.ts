@@ -734,6 +734,7 @@ async function readProjectionForGeneration(cwdInput: string, sessionId: string, 
       }
       // Valid release records are historical and inert in the non-authoritative
       // projection. Keep the terminal predecessor as the planning result.
+      sequence = Number(event.sequence);
       releaseSeen = true;
       break;
     }
@@ -1208,7 +1209,8 @@ async function reconcileRalplanAdvisoryUnlocked(
         const { readModeStateForExplicitSession } = await import('../modes/base.js');
         const state = await readModeStateForExplicitSession('ralplan', sessionId, cwd);
         const history = Array.isArray(state?.review_history) ? state.review_history : [];
-        const item = object(history[fence.iteration - 1]);
+        const item = history.map(object).find((entry) => entry?.iteration === fence.iteration)
+          ?? object(history[fence.iteration - 1]);
         const draft = object(item?.draft);
         const architect = object(item?.architect_review);
         const critic = object(item?.critic_review);

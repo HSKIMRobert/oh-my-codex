@@ -201,7 +201,8 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     const closingTurnId = requiredStateString(current.fence?.closing_turn_id ?? state.advisory_closing_turn_id ?? state.turn_id, 'closing_turn_id');
     const iteration = typeof state.iteration === 'number' && state.iteration > 0 ? state.iteration : 1;
     const history = Array.isArray(state.review_history) ? state.review_history : [];
-    const item = history[iteration - 1] as Record<string, unknown> | undefined;
+    const item = (history.find((entry) => objectState(entry)?.iteration === iteration)
+      ?? history[iteration - 1]) as Record<string, unknown> | undefined;
     const draft = objectState(item?.draft);
     const architect = objectState(item?.architect_review);
     const critic = objectState(item?.critic_review);

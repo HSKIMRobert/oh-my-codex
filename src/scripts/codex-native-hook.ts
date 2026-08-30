@@ -22370,9 +22370,13 @@ export async function dispatchCodexNativeHook(
         });
         if ((advisory.intent === "replan" || advisory.intent === "new_advisory")
           && advisory.projection?.activation) {
+          const predecessorBinding = await readModeStateForSession("ralplan", canonicalSessionId, policyCwd);
+          const activationPrompt = advisory.intent === "replan"
+            ? safeString(predecessorBinding?.task_description).trim() || prompt
+            : prompt;
           const activated = await activateOrResumeRalplanAdvisory({
             cwd: policyCwd, sessionId: canonicalSessionId, rootThreadId: threadId,
-            activationTurnId: turnId, prompt, producer: "native", threadKind: advisoryThreadKind,
+            activationTurnId: turnId, prompt: activationPrompt, producer: "native", threadKind: advisoryThreadKind,
             predecessorGenerationId: advisory.projection.activation.generation_id,
           });
           if (activated) advisory.projection = activated.projection;

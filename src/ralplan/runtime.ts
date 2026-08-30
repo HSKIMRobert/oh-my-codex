@@ -52,6 +52,7 @@ export interface RalplanDraftResult {
   agent_role?: 'planner' | 'architect' | 'critic' | 'executor';
   lane_id?: string;
   tracker_path?: string;
+  review_iteration?: number;
 }
 
 export interface RalplanReviewResult {
@@ -69,6 +70,7 @@ export interface RalplanReviewResult {
   tracker_path?: string;
   new_lane_reason?: string;
   sequence_index?: number;
+  review_iteration?: number;
 }
 
 export interface RalplanConsensusGate {
@@ -188,13 +190,19 @@ function buildReviewHistory(
   criticReviews: RalplanReviewResult[],
 ): Array<Record<string, unknown>> {
   const entries: Array<Record<string, unknown>> = [];
-  const total = Math.max(drafts.length, architectReviews.length, criticReviews.length);
+  const recordedIterations = [...drafts, ...architectReviews, ...criticReviews]
+    .map((entry) => entry.review_iteration)
+    .filter((value): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0);
+  const total = Math.max(drafts.length, architectReviews.length, criticReviews.length, ...recordedIterations);
   for (let index = 0; index < total; index++) {
+    const iteration = index + 1;
     entries.push({
-      iteration: index + 1,
-      draft: drafts[index] ?? null,
-      architect_review: architectReviews[index] ?? null,
-      critic_review: criticReviews[index] ?? null,
+      iteration,
+      draft: drafts.find((entry) => entry.review_iteration === iteration) ?? drafts[index] ?? null,
+      architect_review: architectReviews.find((entry) => entry.review_iteration === iteration) ?? architectReviews[index] ?? null,
+      critic_review: criticReviews.find((entry) => entry.review_iteration === iteration)
+        ?? (criticReviews[index]?.review_iteration === undefined ? criticReviews[index] : null)
+        ?? null,
     });
   }
   return entries;
@@ -603,6 +611,7 @@ export async function runRalplanConsensus(
         review_history: buildReviewHistory(drafts, architectReviews, criticReviews),
       }, runtimeSessionId);
       const draft = await executor.draft(iterationContext);
+      draft.review_iteration = iteration;
       drafts.push(draft);
       if (draft.artifacts) Object.assign(aggregatedArtifacts, draft.artifacts);
       if (draft.planPath) latestPlanPath = draft.planPath;
@@ -635,6 +644,7 @@ export async function runRalplanConsensus(
         ...iterationContext,
         draft,
       }), 'architect', options.requireNativeSubagents === true);
+      architectReview.review_iteration = iteration;
       if (advisory && latestPlanPath
         && (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256 !== advisoryPlanDigestBeforeReviews) {
         throw new Error('ralplan_advisory_plan_changed_during_architect_review');
@@ -738,6 +748,7 @@ export async function runRalplanConsensus(
         draft,
         architectReview,
       }), 'critic', options.requireNativeSubagents === true);
+      criticReview.review_iteration = iteration;
       if (advisory && latestPlanPath
         && (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256 !== advisoryPlanDigestBeforeReviews) {
         throw new Error('ralplan_advisory_plan_changed_during_critic_review');
