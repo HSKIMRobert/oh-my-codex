@@ -9,6 +9,10 @@ import {
   type ActivateOrResumeRalplanAdvisoryInput,
   type AdvisoryActivationCheckpoint,
 } from '../advisory-activation.js';
+import {
+  ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM,
+  verifyPinnedJsonAndSync,
+} from '../advisory-activation-verifier.js';
 import { listActiveSkills, listTransitionActiveSkills, writeSkillActiveStateCopiesForStateDir } from '../../state/skill-active.js';
 import { __setCanonicalModeBindingLeaseTestHooksForTests, resolveValidatedCanonicalModeBinding } from '../../state/mode-binding-lease.js';
 import { executeStateOperation, outsideStateFileWriteTransaction, withStateFileWriteTransaction, writeStateFile } from '../../state/operations.js';
@@ -24,10 +28,23 @@ const activateOrResumeRalplanAdvisory = (
 ) => activateRalplanAdvisoryWithProvenance({ ...input, producer: 'native', threadKind: 'root-or-drift' });
 afterEach(async () => {
   __setCanonicalModeBindingLeaseTestHooksForTests({});
+  ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.fileSync = undefined;
+  ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.directorySync = undefined;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('central Ralplan Advisory activation owner', () => {
+  it('accepts degraded Windows file and directory fsync outcomes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-windows-fsync-'));
+    roots.push(cwd);
+    const path = join(cwd, 'projection.json');
+    await writeFile(path, '{"schema_version":1}\n');
+    ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.fileSync = async () => 'unsupported-windows-eperm';
+    ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.directorySync = async () => 'unsupported-windows-eperm';
+    const value = await verifyPinnedJsonAndSync(path, (record) => record.schema_version === 1);
+    assert.equal(value.schema_version, 1);
+  });
+
   it('fails Advisory closed on unsupported platforms before creating intent or state', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-unsupported-'));
     roots.push(cwd);

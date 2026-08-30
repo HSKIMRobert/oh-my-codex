@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
+import { link, lstat, mkdir, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getBaseStateDir } from '../mcp/state-paths.js';
@@ -13,6 +13,8 @@ interface PinnedLockNamespace {
   handle: FileHandle;
   identity: { dev: number; ino: number };
 }
+
+const PARTIAL_NAMESPACE_MARKER_STALE_MS = 30_000;
 
 export interface CanonicalModeBindingIdentity {
   path: string;
@@ -321,23 +323,72 @@ async function readPinnedNamespaceMarker(path: string): Promise<{ dev: number; i
   } finally { await handle?.close(); }
 }
 
+async function publishNamespaceMarkerAtomically(
+  markerPath: string,
+  identity: { dev: number; ino: number },
+): Promise<void> {
+  const tempPath = `${markerPath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+  let marker: FileHandle | null = null;
+  try {
+    marker = await open(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    await marker.writeFile(`${JSON.stringify(identity)}\n`);
+    await marker.sync();
+    await marker.close(); marker = null;
+    await link(tempPath, markerPath);
+  } finally {
+    await marker?.close();
+    await unlink(tempPath).catch(() => undefined);
+  }
+}
+
+async function recoverPartialNamespaceMarker(
+  markerPath: string,
+  namespacePath: string,
+  identity: { dev: number; ino: number },
+): Promise<boolean> {
+  const beforeNamespace = await readLockNamespaceIdentity(namespacePath);
+  if (beforeNamespace.dev !== identity.dev || beforeNamespace.ino !== identity.ino) return false;
+  let handle: FileHandle | null = null;
+  try {
+    handle = await open(markerPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    const visible = await lstat(markerPath);
+    if (!opened.isFile() || opened.nlink !== 1 || !visible.isFile() || visible.isSymbolicLink()
+      || visible.nlink !== 1 || opened.dev !== visible.dev || opened.ino !== visible.ino
+      || Date.now() - opened.mtimeMs < PARTIAL_NAMESPACE_MARKER_STALE_MS) return false;
+    const quarantinePath = `${markerPath}.stale-${process.pid}-${randomBytes(8).toString('hex')}`;
+    await handle.close(); handle = null;
+    await rename(markerPath, quarantinePath);
+    const quarantined = await lstat(quarantinePath);
+    if (quarantined.dev !== opened.dev || quarantined.ino !== opened.ino
+      || quarantined.size !== opened.size || quarantined.mtimeMs !== opened.mtimeMs) return false;
+    const afterNamespace = await readLockNamespaceIdentity(namespacePath);
+    if (afterNamespace.dev !== identity.dev || afterNamespace.ino !== identity.ino) return false;
+    await unlink(quarantinePath);
+    return true;
+  } catch {
+    return false;
+  } finally { await handle?.close(); }
+}
+
 async function pinCanonicalStateLockNamespace(namespacePath: string): Promise<PinnedLockNamespace> {
   const markerPath = `${namespacePath}.identity.json`;
   try { await mkdir(namespacePath, { mode: 0o700 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
   const identity = await readLockNamespaceIdentity(namespacePath);
-  let recorded = await readPinnedNamespaceMarker(markerPath);
+  let recorded: { dev: number; ino: number } | null = null;
+  try { recorded = await readPinnedNamespaceMarker(markerPath); }
+  catch {
+    if (!await recoverPartialNamespaceMarker(markerPath, namespacePath, identity)) throw new Error('canonical mode binding lease namespace marker malformed');
+  }
   if (!recorded) {
-    let marker: FileHandle | null = null;
     try {
-      marker = await open(markerPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-      await marker.writeFile(`${JSON.stringify(identity)}\n`);
-      await marker.sync();
+      await publishNamespaceMarkerAtomically(markerPath, identity);
       recorded = identity;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       recorded = await readPinnedNamespaceMarker(markerPath);
-    } finally { await marker?.close(); }
+    }
   }
   if (!recorded || recorded.dev !== identity.dev || recorded.ino !== identity.ino) {
     throw new Error('canonical mode binding lease namespace identity mismatch');

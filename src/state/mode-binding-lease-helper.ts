@@ -1,10 +1,14 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, mkdir, open, readdir, stat, type FileHandle, unlink, writeFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { createInterface } from 'node:readline';
+import { readProcessStartIdentity } from './process-identity.js';
 
 const RETRY_MS = 10;
+const PARTIAL_OWNER_STALE_MS = 30_000;
+const LEGACY_OWNER_REUSE_GRACE_MS = 60 * 60 * 1_000;
 type Identity = { dev: number; ino: number };
 type OwnerState = { kind: 'valid'; token: string } | { kind: 'ownerless' } | { kind: 'ambiguous' };
 
@@ -37,11 +41,42 @@ async function readPinnedOwner(): Promise<OwnerState> {
   } finally { await handle?.close(); }
 }
 
-function ownerIsDead(value: string): boolean {
-  const pid = Number.parseInt(value.split('-', 1)[0] ?? '', 10);
+async function ownerIsDead(value: string, lockAgeMs: number): Promise<boolean> {
+  const parts = value.split('-');
+  const versioned = parts[0] === 'v2';
+  const pid = Number.parseInt(versioned ? parts[1] ?? '' : parts[0] ?? '', 10);
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return false; }
+  if (versioned) {
+    const current = await readProcessStartIdentity(pid);
+    if (current) return createHash('sha256').update(current).digest('hex').slice(0, 16) !== parts[2];
+  }
+  try { process.kill(pid, 0); return !versioned && lockAgeMs >= LEGACY_OWNER_REUSE_GRACE_MS; }
   catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+}
+
+async function removeStalePartialOwner(lockIdentity: Identity): Promise<boolean> {
+  const firstLock = await stat('.');
+  const firstEntries = (await readdir('.')).sort();
+  if (!sameIdentity(firstLock, lockIdentity) || Date.now() - firstLock.mtimeMs < PARTIAL_OWNER_STALE_MS) return false;
+  const snapshots: Array<{ name: string; dev: number; ino: number; mtimeMs: number; ctimeMs: number }> = [];
+  for (const name of firstEntries) {
+    if (basename(name) !== name) return false;
+    const value = await lstat(name);
+    if (!value.isFile() || value.isSymbolicLink() || value.nlink !== 1
+      || Date.now() - value.mtimeMs < PARTIAL_OWNER_STALE_MS) return false;
+    snapshots.push({ name, dev: value.dev, ino: value.ino, mtimeMs: value.mtimeMs, ctimeMs: value.ctimeMs });
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, RETRY_MS));
+  const confirmedLock = await stat('.');
+  const confirmedEntries = (await readdir('.')).sort();
+  if (!sameIdentity(confirmedLock, lockIdentity) || JSON.stringify(confirmedEntries) !== JSON.stringify(firstEntries)) return false;
+  for (const snapshot of snapshots) {
+    const value = await lstat(snapshot.name);
+    if (!value.isFile() || value.isSymbolicLink() || value.dev !== snapshot.dev || value.ino !== snapshot.ino
+      || value.mtimeMs !== snapshot.mtimeMs || value.ctimeMs !== snapshot.ctimeMs) return false;
+  }
+  for (const snapshot of snapshots) await unlink(snapshot.name);
+  return true;
 }
 
 async function runPinnedClaimMode(args: string[]): Promise<void> {
@@ -57,8 +92,12 @@ async function runPinnedClaimMode(args: string[]): Promise<void> {
     || !sameIdentity(current, lockIdentity) || !sameIdentity(parent, namespaceIdentity)) {
     respond({ claimed: false }); return;
   }
-  const observed = await readPinnedOwner();
-  if (observed.kind === 'ambiguous' || observed.kind === 'valid' && !ownerIsDead(observed.token)) {
+  let observed = await readPinnedOwner();
+  if (observed.kind === 'ambiguous') {
+    if (!await removeStalePartialOwner(lockIdentity)) { respond({ claimed: false }); return; }
+    observed = { kind: 'ownerless' };
+  }
+  if (observed.kind === 'valid' && !await ownerIsDead(observed.token, Math.max(0, Date.now() - current.mtimeMs))) {
     respond({ claimed: false }); return;
   }
   const confirmed = await readPinnedOwner();
@@ -84,7 +123,9 @@ const [key = '', nonce = '', expectedDev = '', expectedIno = ''] = process.argv.
 if (!key || basename(key) !== key || !nonce || !expectedDev || !expectedIno) {
   throw new Error('invalid canonical state lock helper arguments');
 }
-const token = `${process.pid}-${nonce}`;
+const ownStartIdentity = await readProcessStartIdentity(process.pid);
+const ownStartHash = ownStartIdentity ? createHash('sha256').update(ownStartIdentity).digest('hex').slice(0, 16) : 'unknown';
+const token = `v2-${process.pid}-${ownStartHash}-${nonce}`;
 const lockName = `${key}.lock`;
 const namespaceIdentity = { dev: Number(expectedDev), ino: Number(expectedIno) };
 let lockIdentity: Identity | null = null;

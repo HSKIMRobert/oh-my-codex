@@ -220,8 +220,8 @@ class LinuxPinnedAtomicFile implements PinnedAtomicFile {
       await this.parent.sync();
       const current = await lstat(this.operationPath);
       const published = { dev: current.dev, ino: current.ino, size: current.size, mtimeMs: current.mtimeMs, ctimeMs: current.ctimeMs };
-      await pinnedAtomicFileTestHooks.afterLinuxReplace?.();
       try {
+        await pinnedAtomicFileTestHooks.afterLinuxReplace?.();
         await assertVisibleParent(this.visibleParentPath, this.parentIdentity);
         if (!await this.matches(published, bytes)) throw new Error('pinned Linux replace postcondition failed');
       } catch (error) {

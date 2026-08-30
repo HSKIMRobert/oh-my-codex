@@ -32,6 +32,6 @@ export async function closeoutStepPostcondition(
   }
   const value = await readAdvisoryJson(step === 'session_skill'
     ? join(base, 'sessions', sessionId, 'skill-active-state.json') : join(base, 'skill-active-state.json'));
-  if (expectedSkill !== undefined) return JSON.stringify(value) === JSON.stringify(expectedSkill);
+  if (expectedSkill !== undefined) return value === null || !hasActiveRalplanSkill(value, sessionId);
   return value === null || !hasActiveRalplanSkill(value, sessionId);
 }

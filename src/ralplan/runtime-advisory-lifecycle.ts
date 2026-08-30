@@ -194,12 +194,12 @@ async function terminalizeAdvisory(input: {
         throw new Error(`ralplan_advisory_test_failpoint:${name}`);
       }
     },
-    applyStep: async (step, storedPatch) => {
+    applyStep: async (step, storedPatch, storedTimestamp) => {
       if (!modeWritten && step === 'session_mode') {
         if (!storedPatch) throw new Error('ralplan_advisory_terminal_mode_patch_required');
         await updateModeState(
           'ralplan',
-          storedPatch,
+          { ...storedPatch, updated_at: storedTimestamp },
           input.cwd,
           input.sessionId,
           input.revalidateAuthority

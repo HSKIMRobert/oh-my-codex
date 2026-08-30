@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startMode } from '../../modes/base.js';
@@ -146,6 +146,43 @@ describe('canonical mode binding lease', () => {
     await writeFile(join(lockPath, 'foreign-metadata'), 'do-not-delete');
     await assert.rejects(withStateFileWriteTransaction(path, async () => undefined), /timed out waiting/);
     assert.equal(await readFile(join(lockPath, 'foreign-metadata'), 'utf8'), 'do-not-delete');
+  });
+
+  it('recovers only aged partial owners and legacy live-PID owner records', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-partial-owner-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+    const partial = join(lockPath, 'owner-partial');
+    await writeFile(partial, '');
+    await assert.rejects(withStateFileWriteTransaction(path, async () => undefined), /timed out waiting/);
+    const stalePartial = new Date(Date.now() - 60_000);
+    await utimes(partial, stalePartial, stalePartial);
+    await utimes(lockPath, stalePartial, stalePartial);
+    await withStateFileWriteTransaction(path, async () => undefined);
+
+    const legacyToken = `${process.pid}-legacy-owner`;
+    await writeFile(join(lockPath, `owner-${legacyToken}`), legacyToken);
+    await assert.rejects(withStateFileWriteTransaction(path, async () => undefined), /timed out waiting/);
+    const beyondGrace = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+    await utimes(join(lockPath, `owner-${legacyToken}`), beyondGrace, beyondGrace);
+    await utimes(lockPath, beyondGrace, beyondGrace);
+    await withStateFileWriteTransaction(path, async () => undefined);
+  });
+
+  it('recovers an aged partial namespace identity marker but not a recent one', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-partial-marker-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const markerPath = join(cwd, '.omx-state-locks.identity.json');
+    await writeFile(markerPath, '');
+    await assert.rejects(withStateFileWriteTransaction(path, async () => undefined), /marker malformed/);
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(markerPath, stale, stale);
+    await withStateFileWriteTransaction(path, async () => undefined);
+    assert.deepEqual(Object.keys(JSON.parse(await readFile(markerPath, 'utf8'))).sort(), ['dev', 'ino']);
   });
 
   it('rejects a lock-directory symlink swap without dereferencing or deleting the external owner', async () => {

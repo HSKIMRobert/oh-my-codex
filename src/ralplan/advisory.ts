@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { getBaseStateDir } from '../state/paths.js';
+import { updateSkillActiveStateCopiesForExactSessionTransaction } from '../state/skill-active.js';
 import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
 import {
@@ -457,6 +458,39 @@ function terminalState(outcome: AdvisoryOutcome, integrity: AdvisoryIntegritySta
   return outcome === 'approved' ? 'closed' : 'abandoned';
 }
 
+async function applyTerminalSkillReduction(
+  cwd: string,
+  sessionId: string,
+  terminalModeUpdates: Record<string, unknown>,
+  terminalTimestamp: string,
+  beforeCommit?: () => void | Promise<void>,
+): Promise<void> {
+  const { projectRalplanTerminalSkillMirrors } = await import('../state/operations.js');
+  let projectedRoot: Record<string, unknown> | null = null;
+  await updateSkillActiveStateCopiesForExactSessionTransaction(
+    getBaseStateDir(cwd),
+    sessionId,
+    async (currentRoot, currentSession) => {
+      await beforeCommit?.();
+      const projected = projectRalplanTerminalSkillMirrors({
+        rootSkillState: currentRoot,
+        sessionSkillState: currentSession,
+        terminalState: terminalModeUpdates,
+        sessionId,
+        nowIso: terminalTimestamp,
+      });
+      projectedRoot = projected.root_skill;
+      return projected.session_skill ?? {
+        active: false,
+        skill: 'ralplan',
+        session_id: sessionId,
+        active_skills: [],
+      };
+    },
+    { projectRoot: () => projectedRoot ?? { active: false, skill: 'ralplan', active_skills: [] } },
+  );
+}
+
 function newJournal(
   generationId: string,
   outcome: AdvisoryOutcome,
@@ -557,16 +591,22 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     const expectedSkill = step === 'session_skill' || step === 'root_skill'
       ? journal.terminal_skill_updates?.[step]
       : undefined;
-    if (journal.steps[step] === 'applied'
-      && await closeoutStepPostcondition(fence.canonical_cwd, options.sessionId, step, journal.terminal_mode_updates, expectedSkill)) continue;
+    const postconditionSatisfied = await closeoutStepPostcondition(
+      fence.canonical_cwd, options.sessionId, step, journal.terminal_mode_updates, expectedSkill,
+    );
+    if ((step === 'session_skill' || step === 'root_skill') && postconditionSatisfied) {
+      if (journal.steps[step] !== 'applied') await mark(step);
+      continue;
+    }
+    if (journal.steps[step] === 'applied' && postconditionSatisfied) continue;
     if ((step === 'session_skill' || step === 'root_skill') && expectedSkill !== undefined) {
-      await options.beforeMutation?.(`mirror_${step}`);
-      const base = getBaseStateDir(fence.canonical_cwd);
-      const path = step === 'session_skill'
-        ? join(base, 'sessions', options.sessionId, 'skill-active-state.json')
-        : join(base, 'skill-active-state.json');
-      if (expectedSkill === null) await rm(path, { force: true });
-      else await writeAtomic(path, expectedSkill);
+      await applyTerminalSkillReduction(
+        fence.canonical_cwd,
+        options.sessionId,
+        journal.terminal_mode_updates ?? {},
+        journal.terminal_timestamp,
+        () => options.beforeMutation?.(`mirror_${step}`),
+      );
     } else {
       await options.beforeMutation?.(`mirror_${step}`);
       await options.applyStep?.(step, journal.terminal_mode_updates, journal.terminal_timestamp);
@@ -577,7 +617,9 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     await mark(step);
   }
   if (journal.steps.post_digest !== 'applied') {
-    const digest = await options.revalidateEvidence?.();
+    let digest: string | undefined;
+    try { digest = await options.revalidateEvidence?.(); }
+    catch { digest = undefined; }
     if (options.lifecycle && digest !== options.lifecycle.evidence_bundle_sha256) {
       await options.beforeMutation?.('fence_recovery_required');
       await emitAdvisoryEvent(fence.canonical_cwd, {
@@ -589,6 +631,14 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
         state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
         outcome: journal.outcome, integrity_status: 'unproven', updated_at: journal.terminal_timestamp,
       });
+      journal.integrity_status = 'unproven';
+      journal.steps.post_digest = 'applied';
+      journal.steps.journal_commit = 'applied';
+      journal.steps.fence_terminal = 'applied';
+      journal.phase = 'committed';
+      journal.updated_at = new Date().toISOString();
+      await options.beforeMutation?.('journal_recovery_commit');
+      await writeAtomic(journalPath, journal);
       return readProjectionForGeneration(fence.canonical_cwd, options.sessionId, options.generationId);
     }
     await mark('post_digest');
@@ -665,7 +715,19 @@ async function reconcileRalplanAdvisoryUnlocked(
   const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
   if (!projection || projection.corruption || !projection.fence || !projection.journal) return projection;
   const { fence, journal } = projection;
-  if (fence.state === 'recovery_required') return projection;
+  if (fence.state === 'recovery_required') {
+    if (journal.phase !== 'committed') {
+      journal.integrity_status = 'unproven';
+      journal.steps.post_digest = 'applied';
+      journal.steps.journal_commit = 'applied';
+      journal.steps.fence_terminal = 'applied';
+      journal.phase = 'committed';
+      journal.updated_at = new Date().toISOString();
+      await writeAtomic(join(generationDir(cwd, sessionId, fence.generation_id), 'closeout-journal.json'), journal);
+      return readCurrentRalplanAdvisory(cwd, sessionId);
+    }
+    return projection;
+  }
   const guardReplay = async (checkpoint: string): Promise<void> => {
     await beforeReplayCheck?.(checkpoint);
     const conflict = await liveAdvisoryBindingConflict(cwd, sessionId, fence.generation_id);
@@ -701,7 +763,7 @@ async function reconcileRalplanAdvisoryUnlocked(
       const { updateModeState } = await import('../modes/base.js');
       await updateModeState(
         'ralplan',
-        journal.terminal_mode_updates!,
+        { ...journal.terminal_mode_updates!, updated_at: journal.terminal_timestamp },
         cwd,
         sessionId,
         (site) => guardReplay(`mode_commit_${site}`),
@@ -714,13 +776,13 @@ async function reconcileRalplanAdvisoryUnlocked(
       if (!await closeoutStepPostcondition(cwd, sessionId, step, journal.terminal_mode_updates, expectedSkill)) {
         reconciled = true;
         if ((step === 'session_skill' || step === 'root_skill') && expectedSkill !== undefined) {
-          const base = getBaseStateDir(cwd);
-          const path = step === 'session_skill'
-            ? join(base, 'sessions', sessionId, 'skill-active-state.json')
-            : join(base, 'skill-active-state.json');
-          await guardReplay(`mirror_${step}`);
-          if (expectedSkill === null) await rm(path, { force: true });
-          else await writeAtomic(path, expectedSkill);
+          await applyTerminalSkillReduction(
+            cwd,
+            sessionId,
+            journal.terminal_mode_updates ?? {},
+            journal.terminal_timestamp,
+            () => guardReplay(`mirror_${step}`),
+          );
         } else {
           await guardReplay(`mirror_${step}`);
           await canonicalPatch();
@@ -740,36 +802,47 @@ async function reconcileRalplanAdvisoryUnlocked(
         const { readModeStateForExplicitSession } = await import('../modes/base.js');
         const state = await readModeStateForExplicitSession('ralplan', sessionId, cwd);
         const history = Array.isArray(state?.review_history) ? state.review_history : [];
-        const item = object(history[fence.iteration - 1]);
+        const item = history.map(object).find((entry) => entry?.iteration === fence.iteration)
+          ?? object(history[fence.iteration - 1]);
         const draft = object(item?.draft);
         const architect = object(item?.architect_review);
         const critic = object(item?.critic_review);
-        const lifecycle = await projectAdvisoryReviewLifecycle({
-          cwd, sessionId, generationId: fence.generation_id,
-          activationTurnId: fence.activation_turn_id, activationCreatedAt: fence.created_at,
-          rootThreadId: fence.root_thread_id, iteration: fence.iteration,
-          planPaths: [String(draft?.planPath ?? state?.latest_plan_path ?? '')],
-          architect: {
-            threadId: String(architect?.thread_id ?? ''), artifactPath: String(architect?.artifact_path ?? ''),
-            verdict: String(architect?.verdict ?? ''), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
-          },
-          critic: {
-            threadId: String(critic?.thread_id ?? ''), artifactPath: String(critic?.artifact_path ?? ''),
-            verdict: String(critic?.verdict ?? ''), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
-          },
-        });
-        if (lifecycle.evidence_bundle_sha256 !== fence.evidence_bundle_sha256) {
+        let lifecycleDigest: string | undefined;
+        try {
+          lifecycleDigest = (await projectAdvisoryReviewLifecycle({
+            cwd, sessionId, generationId: fence.generation_id,
+            activationTurnId: fence.activation_turn_id, activationCreatedAt: fence.created_at,
+            rootThreadId: fence.root_thread_id, iteration: fence.iteration,
+            planPaths: [String(draft?.planPath ?? state?.latest_plan_path ?? '')],
+            architect: {
+              threadId: String(architect?.thread_id ?? ''), artifactPath: String(architect?.artifact_path ?? ''),
+              verdict: String(architect?.verdict ?? ''), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
+            },
+            critic: {
+              threadId: String(critic?.thread_id ?? ''), artifactPath: String(critic?.artifact_path ?? ''),
+              verdict: String(critic?.verdict ?? ''), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
+            },
+          })).evidence_bundle_sha256;
+        } catch { lifecycleDigest = undefined; }
+        if (lifecycleDigest !== fence.evidence_bundle_sha256) {
           await guardReplay('emit_digest_mismatch');
           await emitAdvisoryEvent(fence.canonical_cwd, {
             type: 'ralplan_advisory_digest_mismatch', generationId: fence.generation_id, iteration: fence.iteration,
             transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'reconcile_evidence_digest_changed',
-            path: journalPath, digest: lifecycle.evidence_bundle_sha256,
+            path: journalPath, digest: lifecycleDigest ?? fence.evidence_bundle_sha256,
           });
           await guardReplay('fence_recovery_required');
           await appendFenceEvent(fence.canonical_cwd, fence, {
             state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
             outcome: journal.outcome, integrity_status: 'unproven', updated_at: new Date().toISOString(),
           });
+          journal.integrity_status = 'unproven';
+          journal.steps.post_digest = 'applied';
+          journal.steps.journal_commit = 'applied';
+          journal.steps.fence_terminal = 'applied';
+          journal.phase = 'committed';
+          journal.updated_at = new Date().toISOString();
+          await writeAtomic(journalPath, journal);
           return readCurrentRalplanAdvisory(cwd, sessionId);
         }
       }
@@ -839,7 +912,8 @@ export async function reconcileRalplanAdvisory(
   const initialConflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
   if (initialConflict) return { ...projection, corruption: initialConflict };
   if (projection.corruption) return projection;
-  return withGenerationLock(cwd, sessionId, projection.activation.generation_id, async () => {
+  return withRalplanAdvisoryCurrentLock(cwdCanonical, sessionId, () =>
+    withGenerationLock(cwd, sessionId, projection.activation.generation_id, async () => {
     const conflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
     if (conflict) return { ...projection, corruption: conflict };
     try {
@@ -851,7 +925,7 @@ export async function reconcileRalplanAdvisory(
       }
       throw error;
     }
-  });
+    }));
 }
 
 export async function observeRalplanAdvisoryPrompt(input: {

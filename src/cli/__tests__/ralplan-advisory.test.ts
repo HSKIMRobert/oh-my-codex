@@ -1,6 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -35,6 +35,30 @@ async function commitActivation(cwd: string, sessionId: string, activation: Awai
 }
 
 describe('ralplan advisory CLI', () => {
+  it('preserves an active Advisory in production dispatch without an injected executor', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-production-run-'));
+    roots.push(cwd);
+    const sessionId = 'session-production-run';
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionDir = join(stateDir, 'sessions', sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateDir }));
+    await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
+      active: true, mode: 'ralplan', workflow_variant: 'advisory', advisory_generation_id: 'generation-production',
+      session_id: sessionId, task_description: 'review only', current_phase: 'architect-review',
+    }));
+    const output: string[] = [];
+    await ralplanCommand(['run', '--task', 'review only', '--session', sessionId], {
+      cwd: () => cwd,
+      stdout: (line) => output.push(line),
+    });
+    assert.match(output.at(-1) ?? '', /non-authorizing Ralplan Advisory lifecycle/);
+    assert.doesNotMatch(output.at(-1) ?? '', /ralplan_execution_handoff/);
+    const state = JSON.parse(await readFile(join(sessionDir, 'ralplan-state.json'), 'utf8'));
+    assert.equal(state.workflow_variant, 'advisory');
+    assert.equal(state.advisory_generation_id, 'generation-production');
+  });
+
   it('accepts no caller evidence and reconstructs a closed non-authorizing result', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-'));
     roots.push(cwd);

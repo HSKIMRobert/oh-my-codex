@@ -1493,7 +1493,7 @@ describe('CLI session-scoped state parity', () => {
       }, 'cancel');
       assert.notEqual(result.status, 0);
       assert.doesNotMatch(result.stdout, /Cancelled: ralplan/);
-      assert.match(result.stderr, /canonical (?:terminal payload|writer)/i);
+      assert.match(result.stderr, /canonical (?:terminal payload|writer)|detached protected state changed/i);
       assert.equal(existsSync(mutationMarker), true);
       const projection = await readCurrentRalplanAdvisory(runDir, sessionId);
       assert.notEqual(projection?.fence?.state, 'closed');
@@ -1543,7 +1543,7 @@ describe('CLI session-scoped state parity', () => {
         }, 'cancel');
         assert.notEqual(result.status, 0, fieldClass);
         assert.doesNotMatch(result.stdout, /Cancelled: ralplan/, fieldClass);
-        assert.match(result.stderr, /canonical terminal payload/i, fieldClass);
+        assert.match(result.stderr, /canonical terminal payload|detached protected state changed/i, fieldClass);
         assert.equal(existsSync(mutationMarker), true, fieldClass);
         const projection = await readCurrentRalplanAdvisory(runDir, sessionId);
         assert.notEqual(projection?.fence?.state, 'closed', fieldClass);

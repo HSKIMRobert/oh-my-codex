@@ -142,17 +142,28 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
           : `Ralplan ${result.status}: ${result.error ?? result.phase}`);
         return;
       }
-      await startMode('ralplan', task.trim(), 5, cwd, sessionId);
+      const existing = sessionId
+        ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
+        : await readModeState('ralplan', cwd);
+      if (!(existing?.active === true && existing.workflow_variant === 'advisory')) {
+        await startMode('ralplan', task.trim(), 5, cwd, sessionId);
+      }
     }
     const state = sessionId
       ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
       : await readModeState('ralplan', cwd);
     if (!state) throw new Error('No Ralplan state found.');
-    const instruction = [
-      `Run the Ralplan consensus runtime for ${JSON.stringify(String(state.task_description ?? ''))}.`,
-      'Execute Planner first, await Architect approval second, then await Critic approval third.',
-      'Persist the execution-ready plan, sequential review evidence, and bound ralplan_execution_handoff in this exact session.',
-    ].join('\n');
+    const instruction = state.workflow_variant === 'advisory'
+      ? [
+        `Resume the non-authorizing Ralplan Advisory lifecycle for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'Complete Planner, Architect, and Critic review in order, close the Advisory lifecycle, and return control to the caller.',
+        'Do not create an execution handoff or authorize execution.',
+      ].join('\n')
+      : [
+        `Run the Ralplan consensus runtime for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'Execute Planner first, await Architect approval second, then await Critic approval third.',
+        'Persist the execution-ready plan, sequential review evidence, and bound ralplan_execution_handoff in this exact session.',
+      ].join('\n');
     if (json) stdout(JSON.stringify({ ok: true, state, instruction }));
     else stdout(instruction);
     return;
