@@ -1,5 +1,5 @@
 import { constants as fsConstants, existsSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
@@ -106,15 +106,6 @@ async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promis
 }
 
 /**
- * The sole writer primitive for `.omx/state/` session-scoped workflow state.
- * Every module that persists `{mode}-state.json` MUST route through this function
- * so that the single-writer invariant is preserved.
- */
-export async function writeStateFile(path: string, data: string): Promise<void> {
-  await writeAtomicFile(path, data);
-}
-
-/**
  * Durably pin a mode projection already published by the canonical workflow
  * writer. Keeping the path resolution and descriptor validation in the state
  * owner prevents callers from becoming undeclared mode-state writers merely
@@ -166,10 +157,115 @@ async function writeAtomicFile(path: string, data: string): Promise<void> {
   await writeFile(tmpPath, data, 'utf-8');
   try {
     await rename(tmpPath, path);
+    if (process.platform !== 'win32') {
+      const directory = await open(dirname(path), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
   } catch (error) {
     await unlink(tmpPath).catch(() => {});
     throw error;
   }
+}
+
+export interface StateFileWriteTransactionOptions {
+  requireCurrentRecord?: boolean;
+  validateCurrent?: (current: Record<string, unknown> | null) => void | Promise<void>;
+  afterWrite?: () => void | Promise<void>;
+}
+
+async function readStateFileRecord(path: string, requireCurrentRecord: boolean): Promise<Record<string, unknown> | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    if (requireCurrentRecord) throw new Error('state_file_write_current_unreadable');
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    if (requireCurrentRecord) throw new Error('state_file_write_current_unreadable');
+    return null;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+async function acquireStateFileWriteLock(path: string): Promise<Awaited<ReturnType<typeof open>>> {
+  const lockPath = `${path}.write-lock`;
+  await mkdir(dirname(path), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(
+        lockPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      await handle.writeFile(`${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`);
+      await handle.sync();
+      return handle;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      let owner: Record<string, unknown> | null = null;
+      try {
+        const parsed = JSON.parse(await readFile(lockPath, 'utf8')) as unknown;
+        owner = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : null;
+      } catch {
+        throw new Error('state_file_write_lock_held');
+      }
+      const pid = owner?.schema_version === 1 && Number.isSafeInteger(owner.pid) && Number(owner.pid) > 0
+        ? Number(owner.pid)
+        : null;
+      if (attempt > 0 || pid === null) throw new Error('state_file_write_lock_held');
+      try {
+        process.kill(pid, 0);
+        throw new Error('state_file_write_lock_held');
+      } catch (probeError) {
+        if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
+      }
+      await rm(lockPath, { force: false });
+    }
+  }
+  throw new Error('state_file_write_lock_held');
+}
+
+export async function writeStateFileTransaction(
+  path: string,
+  data: string,
+  options: StateFileWriteTransactionOptions = {},
+): Promise<void> {
+  await withStateFileWriteLock(path, async () => {
+    const current = await readStateFileRecord(path, options.requireCurrentRecord === true);
+    await options.validateCurrent?.(current);
+    await writeAtomicFile(path, data);
+    await options.afterWrite?.();
+  });
+}
+
+export async function withStateFileWriteLock<T>(path: string, work: () => Promise<T>): Promise<T> {
+  const lockPath = `${path}.write-lock`;
+  const lock = await acquireStateFileWriteLock(path);
+  try {
+    return await work();
+  } finally {
+    await lock.close().catch(() => {});
+    await rm(lockPath, { force: true });
+  }
+}
+
+/**
+ * The sole writer primitive for `.omx/state/` session-scoped workflow state.
+ * Every module that persists `{mode}-state.json` MUST route through this function
+ * so that Advisory binding reservations serialize with ordinary mode writes.
+ */
+export async function writeStateFile(path: string, data: string): Promise<void> {
+  await writeStateFileTransaction(path, data);
 }
 
 async function writeClearedSessionScopedModeState(
@@ -189,7 +285,7 @@ async function writeClearedSessionScopedModeState(
   });
   const payload = JSON.stringify(clearedState, null, 2);
   await beforeCommit?.({ site: 'state-clear.primary', kind: 'write', path });
-  await writeAtomicFile(path, payload);
+  await writeStateFile(path, payload);
 }
 
 async function clearSessionNativeStopState(
@@ -809,7 +905,7 @@ export async function executeStateOperation(
         let ensureRalphArtifacts = false;
         let skillActivePrimaryCommitted = false;
 
-        await withStateWriteLock(path, async () => {
+        await withStateWriteLock(path, async () => withStateFileWriteLock(path, async () => {
           let existing: Record<string, unknown> = {};
           if (existsSync(path)) {
             try {
@@ -996,7 +1092,7 @@ export async function executeStateOperation(
             await beforeCommit({ site: 'mode.primary', kind: 'write', path });
             await writeAtomicFile(path, payload);
           }
-        });
+        }));
 
         if (validationError) {
           return {
@@ -1062,7 +1158,7 @@ export async function executeStateOperation(
           const paths = await getAllScopedStatePaths(mode, cwd);
           for (const path of paths) {
             if (!existsSync(path)) continue;
-            await unlink(path);
+            await withStateFileWriteLock(path, () => unlink(path));
             removedPaths.push(path);
           }
           const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
@@ -1110,7 +1206,7 @@ export async function executeStateOperation(
           await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
         } else if (existsSync(path)) {
           await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
-          await unlink(path);
+          await withStateFileWriteLock(path, () => unlink(path));
         }
         const nativeStopCleared = effectiveSessionId
           ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)

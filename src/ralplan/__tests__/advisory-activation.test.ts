@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -248,6 +248,53 @@ describe('central Ralplan Advisory activation owner', () => {
 
     await assert.rejects(activateOrResumeRalplanAdvisory(input), /root_skill_binding_conflict/);
     assert.equal(await readFile(rootPath, 'utf8'), foreignBytes);
+  });
+
+  it('rejects a contradictory same-session top-level root binding', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-root-top-level-conflict-'));
+    roots.push(cwd);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory root top-level conflict', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    const rootPath = join(cwd, '.omx', 'state', 'skill-active-state.json');
+    const root = JSON.parse(await readFile(rootPath, 'utf8'));
+    const foreignBytes = `${JSON.stringify({
+      ...root,
+      session_id: 'session-a',
+      workflow_variant: 'advisory',
+      advisory_generation_id: 'generation-foreign',
+    }, null, 2)}\n`;
+    await writeFile(rootPath, foreignBytes);
+
+    await assert.rejects(activateOrResumeRalplanAdvisory(input), /root_skill_binding_conflict/);
+    assert.equal(await readFile(rootPath, 'utf8'), foreignBytes);
+  });
+
+  it('rejects a symlinked session mirror without modifying its target or root mirror', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-session-symlink-'));
+    roots.push(cwd);
+    const outside = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-session-symlink-target-'));
+    roots.push(outside);
+    const input = {
+      cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+      prompt: '$ralplan --advisory session symlink', generationId: 'generation-a',
+    };
+    await activateOrResumeRalplanAdvisory(input);
+    const stateDir = join(cwd, '.omx', 'state');
+    const rootPath = join(stateDir, 'skill-active-state.json');
+    const sessionPath = join(stateDir, 'sessions', 'session-a', 'skill-active-state.json');
+    const targetPath = join(outside, 'target.json');
+    const targetBytes = '{"sentinel":"unchanged"}\n';
+    const rootBytes = await readFile(rootPath, 'utf8');
+    await writeFile(targetPath, targetBytes);
+    await rm(sessionPath);
+    await symlink(targetPath, sessionPath);
+
+    await assert.rejects(activateOrResumeRalplanAdvisory(input), /malformed-session|unreadable session/);
+    assert.equal(await readFile(targetPath, 'utf8'), targetBytes);
+    assert.equal(await readFile(rootPath, 'utf8'), rootBytes);
   });
 
   it('keeps fast repair atomic when a Standard writer wins immediately after the mirror transaction', async () => {

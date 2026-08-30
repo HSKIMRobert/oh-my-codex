@@ -30,7 +30,7 @@ import {
   getStateFilename,
   resolveWritableStateScope,
 } from '../mcp/state-paths.js';
-import { completeRalplanSession, writeStateFile } from '../state/operations.js';
+import { completeRalplanSession, writeStateFile, writeStateFileTransaction } from '../state/operations.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
 import {
   readAuthorizedPendingRalplanActivation,
@@ -66,26 +66,18 @@ export interface RalplanAdvisoryStartProfile {
   kind: 'ralplan-advisory';
   sessionId: string;
   generationId: string;
+  predecessorGenerationId?: string;
   rootThreadId: string;
   activationTurnId: string;
   activationPrompt: string;
+  afterBindingWrite?: () => void | Promise<void>;
 }
 
-async function assertRalplanAdvisoryStartBindingAllowed(
-  path: string,
+function assertRalplanAdvisoryStartBindingAllowed(
+  binding: Record<string, unknown> | null,
   profile: RalplanAdvisoryStartProfile,
-): Promise<void> {
-  if (!existsSync(path)) return;
-  let binding: Record<string, unknown>;
-  try {
-    const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('invalid binding');
-    }
-    binding = parsed as Record<string, unknown>;
-  } catch {
-    throw new Error('ralplan_advisory_start_binding_unreadable');
-  }
+): void {
+  if (!binding) return;
   if (binding.active !== true) return;
   const sameAdvisoryBinding = binding.workflow_variant === 'advisory'
     && binding.session_id === profile.sessionId
@@ -209,7 +201,17 @@ export async function startMode(
     if (!pending || pending.generation_id !== startProfile.generationId) {
       throw new Error('ralplan_advisory_start_profile_intent_mismatch');
     }
-    await assertRalplanAdvisoryStartBindingAllowed(primaryStatePath, startProfile);
+    let binding: Record<string, unknown> | null = null;
+    if (existsSync(primaryStatePath)) {
+      try {
+        const parsed = JSON.parse(await readFile(primaryStatePath, 'utf-8')) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid binding');
+        binding = parsed as Record<string, unknown>;
+      } catch {
+        throw new Error('ralplan_advisory_start_binding_unreadable');
+      }
+    }
+    assertRalplanAdvisoryStartBindingAllowed(binding, startProfile);
   }
   const dir = stateDir(projectRoot);
   await mkdir(dir, { recursive: true });
@@ -269,24 +271,35 @@ export async function startMode(
     if (!pending || pending.generation_id !== startProfile.generationId) {
       throw new Error('ralplan_advisory_start_profile_intent_changed');
     }
-    await assertRalplanAdvisoryStartBindingAllowed(path, startProfile);
   }
-  await writeStateFile(path, payload);
-  await syncRunStateFromModeState(state, projectRoot, scope.sessionId, {
-    beforeCommit,
-    targetPath: join(scope.stateDir, 'run-state.json'),
-  });
-  if (isTrackedWorkflowMode(mode)) {
-    await syncCanonicalSkillStateForMode({
-      cwd: projectRoot ?? process.cwd(),
-      baseStateDir,
-      mode,
-      active: true,
-      currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
-      sessionId: scope.sessionId,
-      source: 'startMode',
+  const publishDerivedState = async (): Promise<void> => {
+    await syncRunStateFromModeState(state, projectRoot, scope.sessionId, {
       beforeCommit,
+      targetPath: join(scope.stateDir, 'run-state.json'),
     });
+    if (isTrackedWorkflowMode(mode)) {
+      await syncCanonicalSkillStateForMode({
+        cwd: projectRoot ?? process.cwd(),
+        baseStateDir,
+        mode,
+        active: true,
+        currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
+        sessionId: scope.sessionId,
+        source: 'startMode',
+        beforeCommit,
+      });
+    }
+    await startProfile?.afterBindingWrite?.();
+  };
+  if (startProfile) {
+    await writeStateFileTransaction(path, payload, {
+      requireCurrentRecord: true,
+      validateCurrent: (current) => assertRalplanAdvisoryStartBindingAllowed(current, startProfile),
+      afterWrite: publishDerivedState,
+    });
+  } else {
+    await writeStateFile(path, payload);
+    await publishDerivedState();
   }
   return state;
 }

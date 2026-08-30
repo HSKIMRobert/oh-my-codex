@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto';
-import { existsSync } from 'fs';
-import { mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'fs/promises';
+import { constants as fsConstants, existsSync } from 'fs';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'fs/promises';
 import { basename, dirname, join } from 'path';
 import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.js';
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
@@ -687,6 +687,63 @@ async function restoreRootSkillActiveStateBytesIfOwned(
   }
 }
 
+interface SessionMirrorSnapshot {
+  bytes: Buffer | null;
+  identity: { dev: number; ino: number } | null;
+}
+
+async function readSessionMirrorSnapshot(sessionPath: string): Promise<SessionMirrorSnapshot> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(sessionPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { bytes: null, identity: null };
+    throw new SkillActiveStateWriteError('malformed-session', `unreadable session skill-active state: ${sessionPath}`, { cause: error });
+  }
+  try {
+    const opened = await handle.stat();
+    const current = await lstat(sessionPath);
+    if (!opened.isFile() || opened.nlink !== 1 || !current.isFile() || current.isSymbolicLink()
+      || current.nlink !== 1 || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new SkillActiveStateWriteError('malformed-session', `unsafe session skill-active state: ${sessionPath}`);
+    }
+    return { bytes: await handle.readFile(), identity: { dev: opened.dev, ino: opened.ino } };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function replaceSessionMirrorAtomically(
+  sessionPath: string,
+  payload: string | Buffer,
+  expected: SessionMirrorSnapshot,
+  lock: RootSkillActiveLock,
+  beforeCommit?: BeforeWritableCommit,
+): Promise<void> {
+  const tempPath = `${sessionPath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
+  await beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
+  try {
+    await assertRootSkillActiveLockOwner(lock);
+    const current = await readSessionMirrorSnapshot(sessionPath);
+    if (current.identity?.dev !== expected.identity?.dev || current.identity?.ino !== expected.identity?.ino
+      || (current.identity === null) !== (expected.identity === null)) {
+      throw new SkillActiveStateWriteError('malformed-session', `session skill-active state changed: ${sessionPath}`);
+    }
+    const temp = await open(
+      tempPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    try { await temp.writeFile(payload); await temp.sync(); } finally { await temp.close(); }
+    await assertRootSkillActiveLockOwner(lock);
+    await rename(tempPath, sessionPath);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    if (error instanceof SkillActiveStateWriteError) throw error;
+    throw new SkillActiveStateWriteError('atomic-replace-failed', `failed to atomically replace session skill-active state: ${sessionPath}`, { cause: error });
+  }
+}
+
 export async function writeSkillActiveStateCopies(
   cwd: string,
   state: SkillActiveStateLike,
@@ -745,8 +802,8 @@ export async function updateSkillActiveStateCopiesForExactSessionTransaction(
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
   if (!sessionPath) throw new Error('skill-active exact-session transaction requires a session path');
   return withRootSkillActiveStateLock(rootPath, async (lock) => {
-    const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
-    const previousSession = existsSync(sessionPath) ? await readFile(sessionPath) : null;
+    const previousSessionSnapshot = await readSessionMirrorSnapshot(sessionPath);
+    const previousSession = previousSessionSnapshot.bytes;
     const currentRoot = await readRootStateForWrite(rootPath);
     let currentSession: SkillActiveStateLike | null = null;
     if (previousSession !== null) {
@@ -765,20 +822,38 @@ export async function updateSkillActiveStateCopiesForExactSessionTransaction(
     const nextRoot = options.projectRoot
       ? options.projectRoot(currentRoot, nextSession)
       : mergeRootStateForSession(currentRoot, nextSession, sessionId);
+    let sessionCommitted = false;
     try {
+      await replaceSessionMirrorAtomically(
+        sessionPath,
+        `${JSON.stringify(nextSession, null, 2)}\n`,
+        previousSessionSnapshot,
+        lock,
+        options.beforeCommit,
+      );
+      sessionCommitted = true;
       await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
-      await options.beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
-      await assertRootSkillActiveLockOwner(lock);
-      await writeFile(sessionPath, `${JSON.stringify(nextSession, null, 2)}\n`);
       return nextSession;
     } catch (error) {
       let rollbackError: unknown;
-      try {
-        if (previousSession === null) await unlink(sessionPath).catch(() => undefined);
-        else await writeFile(sessionPath, previousSession);
-        await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
-      } catch (ownershipOrRestoreError) {
-        rollbackError = ownershipOrRestoreError;
+      if (sessionCommitted) {
+        try {
+          if (previousSession === null) {
+            await assertRootSkillActiveLockOwner(lock);
+            await unlink(sessionPath).catch((unlinkError: unknown) => {
+              if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkError;
+            });
+          } else {
+            await replaceSessionMirrorAtomically(
+              sessionPath,
+              previousSession,
+              await readSessionMirrorSnapshot(sessionPath),
+              lock,
+            );
+          }
+        } catch (ownershipOrRestoreError) {
+          rollbackError = ownershipOrRestoreError;
+        }
       }
       throw rollbackError ?? error;
     }

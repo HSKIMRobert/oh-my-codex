@@ -23,6 +23,7 @@ import {
   validateAdvisoryInactiveState,
 } from '../advisory.js';
 import { updateModeState } from '../../modes/base.js';
+import { executeStateOperation } from '../../state/operations.js';
 import {
   activateOrResumeRalplanAdvisory as activateRalplanAdvisoryWithProvenance,
   type ActivateOrResumeRalplanAdvisoryInput,
@@ -901,6 +902,40 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(rebound.workflow_variant, 'advisory');
     assert.equal(rebound.advisory_generation_id, intent.generation_id);
     await assert.rejects(readFile(join(root, 'rollover-intent.json')), /ENOENT/);
+  });
+
+  it('holds the mode binding CAS until G+1 lifecycle publication commits', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
+    });
+    await ensureTerminalInactiveBinding(cwd, sessionId);
+    const prompt = 'replanificá el plan';
+    const observed = await observeRalplanAdvisoryPrompt({
+      cwd, sessionId, turnId: 'turn-locked-race', threadId: 'root-a', prompt,
+      producer: 'native', threadKind: 'root-or-drift', isSubagentPromptSubmit: false,
+    });
+    const activated = await activateOrResumeRalplanAdvisory({
+      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-locked-race', prompt,
+      predecessorGenerationId: observed.projection!.activation.generation_id,
+      failpoint: async (checkpoint) => {
+        if (checkpoint !== 'after_mode') return;
+        const takeover = await executeStateOperation('state_write', {
+          workingDirectory: cwd,
+          session_id: sessionId,
+          mode: 'ralplan',
+          state: { active: true, workflow_variant: 'standard', current_phase: 'draft' },
+        });
+        assert.equal(takeover.isError, true);
+        assert.match(String((takeover.payload as { error?: string }).error), /state_file_write_lock_held/);
+      },
+    });
+
+    assert.equal(activated.projection.corruption, null);
+    const current = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.equal(current?.activation.generation_id, activated.activation.generation_id);
   });
 
   it('persists generation-one activation intent before publication without granting authority', async () => {

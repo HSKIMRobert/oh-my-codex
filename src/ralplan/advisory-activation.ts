@@ -70,6 +70,14 @@ function assertRepairableRootSkillBinding(
   sessionId: string,
   generationId: string,
 ): void {
+  if (rootState?.session_id === sessionId) {
+    const topLevelVariant = rootState.workflow_variant;
+    const topLevelGeneration = rootState.advisory_generation_id;
+    if ((topLevelVariant && topLevelVariant !== 'advisory')
+      || (topLevelGeneration && topLevelGeneration !== generationId)) {
+      throw new Error('ralplan_advisory_activation_root_skill_binding_conflict');
+    }
+  }
   const rootRalplan = listActiveSkills(rootState ?? {})
     .filter((entry) => entry.skill === 'ralplan' && entry.session_id === sessionId);
   if (rootRalplan.length > 1) {
@@ -207,49 +215,52 @@ export async function activateOrResumeRalplanAdvisory(
     await input.failpoint?.('after_intent');
   }
 
+  const preparedActivation = activation;
+  let committedProjection: AdvisoryProjection | null = null;
   await startMode('ralplan', input.prompt, input.maxIterations ?? 50, input.cwd, input.sessionId, {
-    kind: 'ralplan-advisory', sessionId: input.sessionId, generationId: activation.generation_id,
+    kind: 'ralplan-advisory', sessionId: input.sessionId, generationId: preparedActivation.generation_id,
     rootThreadId: input.rootThreadId, activationTurnId: input.activationTurnId,
     activationPrompt: input.prompt,
+    afterBindingWrite: async () => {
+      await syncExplicitSessionModeState('ralplan', input.cwd, input.sessionId);
+      const stateDir = getBaseStateDir(input.cwd);
+      const projections = describeAdvisoryActivationProjections(stateDir, input.sessionId, preparedActivation.generation_id);
+      const verifyMode = (beforeSync?: () => void | Promise<void>) => verifyPinnedJsonAndSync(
+        projections.mode.path, projections.mode.predicate, beforeSync,
+      );
+      const verifyRun = () => verifyPinnedJsonAndSync(projections.run.path, projections.run.predicate);
+      const verifySessionSkill = () => verifyPinnedJsonAndSync(projections.sessionSkill.path, projections.sessionSkill.predicate);
+      const verifyRootSkill = () => verifyPinnedJsonAndSync(projections.rootSkill.path, projections.rootSkill.predicate);
+
+      await publishAdvisorySkillMirrors(
+        stateDir, input.sessionId, preparedActivation.generation_id,
+        async () => { await verifyMode(); await verifyRun(); },
+        async () => undefined,
+        input.failpoint,
+      );
+
+      await verifyMode(() => input.failpoint?.('before_mode_fsync'));
+      await input.failpoint?.('after_mode');
+      await verifyRun();
+      await input.failpoint?.('after_run_state');
+      await verifySessionSkill();
+      await input.failpoint?.('after_session_skill');
+      await verifyRootSkill();
+      await input.failpoint?.('after_root_skill');
+      await input.failpoint?.('before_commit');
+
+      await commitPreparedRalplanAdvisoryActivationInternal({
+        cwd: input.cwd, sessionId: input.sessionId,
+        producer: input.producer, threadKind: input.threadKind, rootThreadId: input.rootThreadId,
+        activationTurnId: input.activationTurnId,
+        failpoint: (name) => name === 'intent_committed' ? input.failpoint?.('intent_committed') : undefined,
+      });
+      committedProjection = await reconcileRalplanAdvisory(input.cwd, input.sessionId);
+      if (!committedProjection || committedProjection.corruption) {
+        throw new Error(`ralplan_advisory_activation_commit_failed:${committedProjection?.corruption ?? 'missing'}`);
+      }
+    },
   });
-  await syncExplicitSessionModeState('ralplan', input.cwd, input.sessionId);
-
-  const stateDir = getBaseStateDir(input.cwd);
-  const projections = describeAdvisoryActivationProjections(stateDir, input.sessionId, activation.generation_id);
-  const verifyMode = (beforeSync?: () => void | Promise<void>) => verifyPinnedJsonAndSync(
-    projections.mode.path, projections.mode.predicate, beforeSync,
-  );
-  const verifyRun = () => verifyPinnedJsonAndSync(projections.run.path, projections.run.predicate);
-  const verifySessionSkill = () => verifyPinnedJsonAndSync(projections.sessionSkill.path, projections.sessionSkill.predicate);
-  const verifyRootSkill = () => verifyPinnedJsonAndSync(projections.rootSkill.path, projections.rootSkill.predicate);
-
-  await publishAdvisorySkillMirrors(
-    stateDir, input.sessionId, activation.generation_id,
-    async () => { await verifyMode(); await verifyRun(); },
-    async () => undefined,
-    input.failpoint,
-  );
-
-  await verifyMode(() => input.failpoint?.('before_mode_fsync'));
-  await input.failpoint?.('after_mode');
-  await verifyRun();
-  await input.failpoint?.('after_run_state');
-
-  await verifySessionSkill();
-  await input.failpoint?.('after_session_skill');
-  await verifyRootSkill();
-  await input.failpoint?.('after_root_skill');
-  await input.failpoint?.('before_commit');
-
-  await commitPreparedRalplanAdvisoryActivationInternal({
-    cwd: input.cwd, sessionId: input.sessionId,
-    producer: input.producer, threadKind: input.threadKind, rootThreadId: input.rootThreadId,
-    activationTurnId: input.activationTurnId,
-    failpoint: (name) => name === 'intent_committed' ? input.failpoint?.('intent_committed') : undefined,
-  });
-  const projection = await reconcileRalplanAdvisory(input.cwd, input.sessionId);
-  if (!projection || projection.corruption) {
-    throw new Error(`ralplan_advisory_activation_commit_failed:${projection?.corruption ?? 'missing'}`);
-  }
-  return { activation, projection };
+  if (!committedProjection) throw new Error('ralplan_advisory_activation_commit_failed:missing');
+  return { activation: preparedActivation, projection: committedProjection };
 }
