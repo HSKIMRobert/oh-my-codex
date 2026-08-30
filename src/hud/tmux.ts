@@ -769,18 +769,16 @@ function hudHookIdentityOption(hookSlot: string): string {
   return `@omx_hook_identity_${match[1].replaceAll('-', '_')}_${match[2]}`;
 }
 
-function hudHookIdentityToken(context: HudResizeHookContext, hookSlot: string): string {
+function hudHookIdentityToken(hookName: string, hookSlot: string): string {
   let hash = 2166136261;
-  for (const char of `${context.hookName}:${context.leaderPanePid}:${context.hudPanePid}:${hookSlot}`) {
-    hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
-  }
+  for (const char of `${hookName}:${hookSlot}`) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
   return `omx-${(hash >>> 0).toString(16)}`;
 }
 
 function buildHudHookRegistrationSuffix(context: HudResizeHookContext, hookSlot: string): string[] {
   return [
     ';', 'set-option', '-t', context.sessionId,
-    hudHookIdentityOption(hookSlot), hudHookIdentityToken(context, hookSlot),
+    hudHookIdentityOption(hookSlot), hudHookIdentityToken(context.hookName, hookSlot),
   ];
 }
 
@@ -794,7 +792,7 @@ function buildGuardedHudHookUnregisterArgs(context: HudResizeHookContext, hookSl
   const identityOption = hudHookIdentityOption(hookSlot);
   return [
     'if-shell', '-F', '-t', context.sessionId,
-    `#{==:${identityOption},${hudHookIdentityToken(context, hookSlot)}}`,
+    `#{==:${identityOption},${hudHookIdentityToken(context.hookName, hookSlot)}}`,
     `${buildHudHookUnsetCommand(context, hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`,
     '',
   ];
@@ -918,7 +916,7 @@ function deferTmuxHookFormatExpansion(command: string): string {
 
 function buildHudHookSelfUnregister(context: HudResizeHookContext): string {
   const identityOption = hudHookIdentityOption(context.hookSlot);
-  return `if-shell -F -t ${context.sessionId} ${quoteHudHookShellArgument(`#{==:${identityOption},${hudHookIdentityToken(context, context.hookSlot)}}`)} ${quoteHudHookShellArgument(`${buildHudHookUnsetCommand(context, context.hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`)} ''`;
+  return `if-shell -F -t ${context.sessionId} ${quoteHudHookShellArgument(`#{==:${identityOption},${hudHookIdentityToken(context.hookName, context.hookSlot)}}`)} ${quoteHudHookShellArgument(`${buildHudHookUnsetCommand(context, context.hookSlot)} ; set-option -u -t ${context.sessionId} ${identityOption}`)} ''`;
 }
 
 function buildAtomicHudHookCommand(

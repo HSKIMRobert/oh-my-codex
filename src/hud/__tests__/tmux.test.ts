@@ -203,7 +203,7 @@ describe('HUD resize hook helpers', () => {
       assert.ok(match);
       const option = `@omx_hook_identity_${match[1]!.replaceAll('-', '_')}_${match[2]}`;
       let hash = 2166136261;
-      for (const character of `omx_hud_resize_7_3_1:1:1:${hookSlot}`) {
+      for (const character of `omx_hud_resize_7_3_1:${hookSlot}`) {
         hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
       }
       return { option, predicate: `#{==:${option},omx-${(hash >>> 0).toString(16)}}` };
@@ -223,6 +223,32 @@ describe('HUD resize hook helpers', () => {
           : `set-hook -u -t $7 ${hookSlot} ; set-option -u -t $7 ${identity.option}`,
       );
       assert.equal(guarded[index]?.[6], '');
+    }
+  });
+
+  it('reuses registered hook identities during cleanup without live pane PIDs', () => {
+    const registrationCalls: string[][] = [];
+    assert.equal(registerHudResizeHook('%9', '%1', 3, (args) => {
+      registrationCalls.push(args);
+      return hookAuthority(args) ?? '';
+    }), true);
+
+    const identitiesBySlot = new Map<string, string>();
+    for (const args of registrationCalls.filter((call) => call[0] === 'set-hook')) {
+      const slotIndex = args[1] === '-w' ? 4 : 3;
+      identitiesBySlot.set(args[slotIndex]!, args.at(-1)!);
+    }
+
+    const cleanupCalls: string[][] = [];
+    assert.equal(unregisterHudResizeHook('%1', (args) => {
+      cleanupCalls.push(args);
+      return hookAuthority(args) ?? '';
+    }), true);
+
+    for (const args of cleanupCalls.filter((call) => call[0] === 'if-shell')) {
+      const hookSlot = [...identitiesBySlot.keys()].find((slot) => args[5]?.includes(slot));
+      assert.ok(hookSlot);
+      assert.match(args[4] ?? '', new RegExp(`${identitiesBySlot.get(hookSlot)}\\}$`));
     }
   });
 
@@ -263,8 +289,8 @@ describe('HUD resize hook helpers', () => {
     assert.equal(registerHudResizeHook('%10', '%1', 3, sameLeader), true);
     const recreatedResizeSlots = recreated.filter((args) => args[3]?.startsWith('client-resized['));
     assert.equal(recreatedResizeSlots[0]?.[3], recreatedResizeSlots[1]?.[3]);
-    assert.notEqual(recreated[0]?.at(-1), recreated[2]?.at(-1));
-    assert.notEqual(recreated[1]?.at(-1), recreated[3]?.at(-1));
+    assert.equal(recreated[0]?.at(-1), recreated[2]?.at(-1));
+    assert.equal(recreated[1]?.at(-1), recreated[3]?.at(-1));
   });
 });
 
