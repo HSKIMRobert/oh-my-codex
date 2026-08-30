@@ -1023,6 +1023,17 @@ export async function runRalplanConsensus(
           executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
         };
       }
+      if (recovered?.corruption === null && recovered.fence?.state === 'recovery_required'
+        && recovered.journal?.outcome === 'approved') {
+        return {
+          status: 'failed', iteration, phase: 'failed', planningComplete: false,
+          drafts, architectReviews, criticReviews,
+          ralplanConsensusGate: buildRalplanConsensusGate(architectReviews, criticReviews, gateOptions),
+          latestPlanPath, artifacts: aggregatedArtifacts,
+          error: `ralplan_advisory_evidence_recovery_required:${message}`,
+          workflowVariant: 'advisory', executionHandoffAuthorized: false, hostVerified: false, returnToCaller: true,
+        };
+      }
       await terminalizeRuntimeAdvisory({
         cwd, sessionId: advisorySessionId, generationId: advisoryGenerationId,
         closingTurnId: advisoryClosingTurnId, iteration, outcome: 'failed',
