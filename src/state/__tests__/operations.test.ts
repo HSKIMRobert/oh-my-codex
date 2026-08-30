@@ -1,11 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { completeRalplanSession, executeStateOperation } from '../operations.js';
+import { completeRalplanSession, executeStateOperation, withStateFileWriteLock } from '../operations.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { startMode, updateModeState } from '../../modes/base.js';
 import {
@@ -19,6 +19,26 @@ import {
   __resetSessionPointerTransactionDependenciesForTests,
   __setSessionPointerTransactionDependenciesForTests,
 } from '../../hooks/session.js';
+
+describe('state write-lock crash recovery', () => {
+  it('recovers only safely aged malformed lock remnants', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-state-write-lock-recovery-'));
+    try {
+      const path = join(cwd, 'state.json');
+      const lockPath = `${path}.write-lock`;
+      await writeFile(lockPath, '');
+      await assert.rejects(withStateFileWriteLock(path, async () => undefined), /state_file_write_lock_held/);
+      const stale = new Date(Date.now() - 60_000);
+      await utimes(lockPath, stale, stale);
+      let entered = false;
+      await withStateFileWriteLock(path, async () => { entered = true; });
+      assert.equal(entered, true);
+      assert.equal(existsSync(lockPath), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
 
 
 async function withAmbientTmuxEnv<T>(env: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> {

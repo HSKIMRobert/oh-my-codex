@@ -7,7 +7,7 @@ import { resolveInstalledRoleName } from '../subagents/tracker.js';
 import { readModeState, readModeStateForExplicitSession, startMode, updateModeState } from '../modes/base.js';
 import { runRalplanConsensus, type RalplanConsensusExecutor } from '../ralplan/runtime.js';
 import { resolveWritableStateScope } from '../mcp/state-paths.js';
-import { projectAdvisoryReviewLifecycle } from '../ralplan/advisory-evidence.js';
+import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle } from '../ralplan/advisory-evidence.js';
 import { readCurrentRalplanAdvisory, terminalizeRalplanAdvisory } from '../ralplan/advisory.js';
 
 export const RALPLAN_HELP = `omx ralplan - consensus planning runtime and adapted-authority diagnostics
@@ -153,11 +153,17 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
       ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
       : await readModeState('ralplan', cwd);
     if (!state) throw new Error('No Ralplan state found.');
-    const instruction = [
-      `Run the Ralplan consensus runtime for ${JSON.stringify(String(state.task_description ?? ''))}.`,
-      'Execute Planner first, await Architect approval second, then await Critic approval third.',
-      'Persist the execution-ready plan, sequential review evidence, and bound ralplan_execution_handoff in this exact session.',
-    ].join('\n');
+    const instruction = state.workflow_variant === 'advisory'
+      ? [
+        `Resume the non-authorizing Ralplan Advisory lifecycle for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'Complete Planner, Architect, and Critic review in order and preserve their immutable evidence baselines.',
+        'Close the Advisory lifecycle and return control to the caller; do not create an execution handoff or authorize execution.',
+      ].join('\n')
+      : [
+        `Run the Ralplan consensus runtime for ${JSON.stringify(String(state.task_description ?? ''))}.`,
+        'Execute Planner first, await Architect approval second, then await Critic approval third.',
+        'Persist the execution-ready plan, sequential review evidence, and bound ralplan_execution_handoff in this exact session.',
+      ].join('\n');
     if (json) stdout(JSON.stringify({ ok: true, state, instruction }));
     else stdout(instruction);
     return;
@@ -199,19 +205,37 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     const draft = objectState(item?.draft);
     const architect = objectState(item?.architect_review);
     const critic = objectState(item?.critic_review);
+    const planPath = requiredStateString(draft?.planPath ?? state.latest_plan_path, 'plan_path');
+    const architectArtifactPath = requiredStateString(architect?.artifact_path, 'architect_artifact_path');
+    const criticArtifactPath = requiredStateString(critic?.artifact_path, 'critic_artifact_path');
+    const planBaseline = requiredStateString(draft?.advisory_plan_manifest_sha256, 'advisory_plan_manifest_sha256');
+    const architectBaseline = requiredStateString(architect?.advisory_artifact_manifest_sha256, 'architect_artifact_manifest_sha256');
+    const criticBaseline = requiredStateString(critic?.advisory_artifact_manifest_sha256, 'critic_artifact_manifest_sha256');
+    const assertReviewBaselines = async (): Promise<void> => {
+      const [currentPlan, currentArchitect, currentCritic] = await Promise.all([
+        digestAdvisoryArtifacts(cwd, [planPath]),
+        digestAdvisoryArtifacts(cwd, [architectArtifactPath]),
+        digestAdvisoryArtifacts(cwd, [criticArtifactPath]),
+      ]);
+      if (currentPlan.sha256 !== planBaseline || currentArchitect.sha256 !== architectBaseline
+        || currentCritic.sha256 !== criticBaseline) {
+        throw new Error('ralplan_advisory_review_artifact_baseline_mismatch');
+      }
+    };
+    await assertReviewBaselines();
     const lifecycle = await projectAdvisoryReviewLifecycle({
       cwd, sessionId, generationId,
       activationTurnId, activationCreatedAt: current.activation.created_at, rootThreadId: current.activation.root_thread_id, iteration,
-      planPaths: [requiredStateString(draft?.planPath ?? state.latest_plan_path, 'plan_path')],
+      planPaths: [planPath],
       architect: {
         threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'),
-        artifactPath: requiredStateString(architect?.artifact_path, 'architect_artifact_path'),
+        artifactPath: architectArtifactPath,
         verdict: requiredStateString(architect?.verdict, 'architect_verdict'),
         sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
       },
       critic: {
         threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'),
-        artifactPath: requiredStateString(critic?.artifact_path, 'critic_artifact_path'),
+        artifactPath: criticArtifactPath,
         verdict: requiredStateString(critic?.verdict, 'critic_verdict'),
         sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
       },
@@ -226,19 +250,21 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     const result = await terminalizeRalplanAdvisory({
       cwd, sessionId, generationId, closingTurnId, iteration, outcome: 'approved', integrityStatus: 'proven', lifecycle,
       terminalModeUpdates,
-      revalidateEvidence: async () => (await projectAdvisoryReviewLifecycle({
-        cwd, sessionId, generationId, activationTurnId, activationCreatedAt: current.activation.created_at,
-        rootThreadId: current.activation.root_thread_id, iteration,
-        planPaths: [requiredStateString(draft?.planPath ?? state.latest_plan_path, 'plan_path')],
-        architect: {
-          threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'), artifactPath: requiredStateString(architect?.artifact_path, 'architect_artifact_path'),
-          verdict: requiredStateString(architect?.verdict, 'architect_verdict'), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
-        },
-        critic: {
-          threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'), artifactPath: requiredStateString(critic?.artifact_path, 'critic_artifact_path'),
-          verdict: requiredStateString(critic?.verdict, 'critic_verdict'), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
-        },
-      })).evidence_bundle_sha256,
+      revalidateEvidence: async () => {
+        await assertReviewBaselines();
+        return (await projectAdvisoryReviewLifecycle({
+          cwd, sessionId, generationId, activationTurnId, activationCreatedAt: current.activation.created_at,
+          rootThreadId: current.activation.root_thread_id, iteration, planPaths: [planPath],
+          architect: {
+            threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'), artifactPath: architectArtifactPath,
+            verdict: requiredStateString(architect?.verdict, 'architect_verdict'), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,
+          },
+          critic: {
+            threadId: requiredStateString(critic?.thread_id, 'critic_thread_id'), artifactPath: criticArtifactPath,
+            verdict: requiredStateString(critic?.verdict, 'critic_verdict'), sessionId: typeof critic?.session_id === 'string' ? critic.session_id : undefined,
+          },
+        })).evidence_bundle_sha256;
+      },
       applyStep: async (step, storedPatch) => {
         if (step === 'session_mode' && !updated) {
           await updateModeState('ralplan', storedPatch ?? terminalModeUpdates, cwd, sessionId);

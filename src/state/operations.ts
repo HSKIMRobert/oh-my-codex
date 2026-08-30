@@ -1,6 +1,7 @@
 import { constants as fsConstants, existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
 import { withModeRuntimeContext } from './mode-state-context.js';
@@ -61,6 +62,7 @@ import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js'
 import { readCurrentRalplanAdvisory, validateAdvisoryInactiveState, validateAdvisoryPreparedInactiveWrite } from '../ralplan/advisory.js';
 import {
   createPinnedFileExclusive,
+  quarantinePinnedFile,
   removePinnedFile,
   replacePinnedFile,
   snapshotPinnedFile,
@@ -211,6 +213,25 @@ interface StateFileLockLease {
   parent: PinnedDirectoryIdentity;
 }
 
+const INCOMPLETE_STATE_WRITE_LOCK_STALE_MS = 30_000;
+
+async function reclaimStateFileWriteLock(
+  lockPath: string,
+  parent: PinnedDirectoryIdentity,
+  minimumAgeMs: number,
+): Promise<boolean> {
+  const expected = await snapshotPinnedFile(lockPath).catch(() => null);
+  if (!expected || Date.now() - expected.mtimeMs < minimumAgeMs) return false;
+  const quarantineName = `${basename(lockPath)}.stale-${process.pid}-${Date.now()}-${randomUUID()}`;
+  try {
+    const quarantinePath = await quarantinePinnedFile(lockPath, quarantineName, expected, parent);
+    await removePinnedFile(quarantinePath, expected, parent);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function acquireStateFileWriteLock(path: string): Promise<StateFileLockLease> {
   const lockPath = `${path}.write-lock`;
   await mkdir(dirname(path), { recursive: true });
@@ -230,21 +251,25 @@ async function acquireStateFileWriteLock(path: string): Promise<StateFileLockLea
           ? parsed as Record<string, unknown>
           : null;
       } catch {
-        throw new Error('state_file_write_lock_held');
+        owner = null;
       }
       const pid = owner?.schema_version === 1 && Number.isSafeInteger(owner.pid) && Number(owner.pid) > 0
         ? Number(owner.pid)
         : null;
-      if (attempt > 0 || pid === null) throw new Error('state_file_write_lock_held');
+      if (pid === null) {
+        if (attempt > 0 || !await reclaimStateFileWriteLock(lockPath, parent, INCOMPLETE_STATE_WRITE_LOCK_STALE_MS)) {
+          throw new Error('state_file_write_lock_held');
+        }
+        continue;
+      }
+      if (attempt > 0) throw new Error('state_file_write_lock_held');
       try {
         process.kill(pid, 0);
         throw new Error('state_file_write_lock_held');
       } catch (probeError) {
         if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
       }
-      const snapshot = await snapshotPinnedFile(lockPath);
-      if (!snapshot) throw new Error('state_file_write_lock_held');
-      await removePinnedFile(lockPath, snapshot, parent);
+      if (!await reclaimStateFileWriteLock(lockPath, parent, 0)) throw new Error('state_file_write_lock_held');
     }
   }
   throw new Error('state_file_write_lock_held');

@@ -190,6 +190,17 @@ describe('ralplan advisory evidence', () => {
     }), /sequence/);
   });
 
+  it('rejects pairwise path reuse in the shared lifecycle projector', async () => {
+    const { cwd, sessionId } = await fixture();
+    await assert.rejects(projectAdvisoryReviewLifecycle({
+      cwd, sessionId, generationId: 'generation-a', activationTurnId: 'turn-a',
+      activationCreatedAt: '2026-08-27T23:59:59.000Z', rootThreadId: 'root-a', iteration: 1,
+      planPaths: ['.omx/plans/plan.md'],
+      architect: { threadId: 'architect', artifactPath: '.omx/artifacts/architect.md', verdict: 'approve', sessionId },
+      critic: { threadId: 'critic', artifactPath: '.omx/plans/plan.md', verdict: 'approve', sessionId },
+    }), /review_artifact_path_reused/);
+  });
+
   it('requires strict native direct-child evidence bound to root, session, activation, and generation', async () => {
     const { cwd, sessionId } = await fixture();
     const trackerPath = join(cwd, '.omx', 'state', 'subagent-tracking.json');
@@ -1092,6 +1103,25 @@ describe('ralplan advisory fence and journal', () => {
     } finally {
       PINNED_FILE_TEST_HOOKS.beforeQuarantineRename = undefined;
     }
+  });
+
+  it('recovers only aged or dead-owner reclaim guards', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-reclaim-guard-recovery-'));
+    roots.push(cwd);
+    const sessionId = 'session-a';
+    const root = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory');
+    await mkdir(root, { recursive: true });
+    const lockPath = join(root, 'current.lock');
+    const guardPath = `${lockPath}.reclaim`;
+    await writeFile(lockPath, '');
+    await writeFile(guardPath, '');
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(lockPath, stale, stale);
+    await assert.rejects(withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => undefined), /current_lock_held/);
+    await utimes(guardPath, stale, stale);
+    await withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => undefined);
+    assert.equal(existsSync(lockPath), false);
+    assert.equal(existsSync(guardPath), false);
   });
 });
 

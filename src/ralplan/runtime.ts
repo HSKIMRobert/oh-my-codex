@@ -609,6 +609,7 @@ export async function runRalplanConsensus(
       if (advisory) {
         if (!latestPlanPath) throw new Error('ralplan_advisory_plan_artifact_required');
         advisoryPlanDigestBeforeReviews = (await digestAdvisoryArtifacts(cwd, [latestPlanPath])).sha256;
+        (draft as unknown as Record<string, unknown>).advisory_plan_manifest_sha256 = advisoryPlanDigestBeforeReviews;
       }
       await recordRalplanSubagentTurn(cwd, runtimeSessionId, {
         threadId: draft.thread_id,
@@ -642,6 +643,7 @@ export async function runRalplanConsensus(
         architectArtifactManifest = await digestAdvisoryArtifacts(cwd, [
           requiredAdvisoryIdentity(architectReview.artifact_path, 'architect_artifact_path'),
         ]);
+        (architectReview as unknown as Record<string, unknown>).advisory_artifact_manifest_sha256 = architectArtifactManifest.sha256;
         if (architectArtifactManifest.entries[0]?.path
           === (await digestAdvisoryArtifacts(cwd, [latestPlanPath!])).entries[0]?.path) {
           throw new Error('ralplan_advisory_architect_artifact_reuses_plan_path');
@@ -748,6 +750,7 @@ export async function runRalplanConsensus(
         criticArtifactManifest = await digestAdvisoryArtifacts(cwd, [
           requiredAdvisoryIdentity(criticReview.artifact_path, 'critic_artifact_path'),
         ]);
+        (criticReview as unknown as Record<string, unknown>).advisory_artifact_manifest_sha256 = criticArtifactManifest.sha256;
         if (criticArtifactManifest.entries[0]?.path === architectArtifactManifest?.entries[0]?.path) {
           throw new Error('ralplan_advisory_review_artifact_path_reused');
         }

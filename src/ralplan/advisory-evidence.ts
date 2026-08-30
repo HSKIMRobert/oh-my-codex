@@ -417,6 +417,14 @@ export async function projectAdvisoryReviewLifecycle(input: {
     digestAdvisoryArtifacts(input.cwd, [input.architect.artifactPath]),
     digestAdvisoryArtifacts(input.cwd, [input.critic.artifactPath]),
   ]);
+  const evidencePaths = [
+    ...planManifest.entries.map((entry) => entry.path),
+    architectManifest.entries[0]!.path,
+    criticManifest.entries[0]!.path,
+  ];
+  if (new Set(evidencePaths).size !== evidencePaths.length) {
+    throw new Error('ralplan_advisory_review_artifact_path_reused');
+  }
   const iterationId = advisoryIterationId({
     generationId: input.generationId,
     sessionId: input.sessionId,

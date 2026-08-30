@@ -376,11 +376,44 @@ async function reclaimAdvisoryLockByIdentity(
 ): Promise<boolean> {
   const reclaimPath = `${lockPath}.reclaim`;
   const parent = await snapshotPinnedParent(lockPath);
-  try {
-    await createPinnedFileExclusive(reclaimPath, `${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`, parent);
-  } catch {
-    return false;
+  let reclaimLease: NonNullable<Awaited<ReturnType<typeof snapshotPinnedFile>>> | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await createPinnedFileExclusive(reclaimPath, `${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`, parent);
+      reclaimLease = await snapshotPinnedFile(reclaimPath);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt > 0) return false;
+      const guard = await snapshotPinnedFile(reclaimPath).catch(() => null);
+      if (!guard) continue;
+      const owner = await readStrictJson(reclaimPath).catch(() => null);
+      const pid = owner?.schema_version === 1 && Number.isSafeInteger(owner.pid) && Number(owner.pid) > 0
+        ? Number(owner.pid)
+        : null;
+      if (pid !== null) {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch (probeError) {
+          if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') return false;
+        }
+      } else if (Date.now() - guard.mtimeMs < INCOMPLETE_ADVISORY_LOCK_STALE_MS) {
+        return false;
+      }
+      try {
+        const guardQuarantine = await quarantinePinnedFile(
+          reclaimPath,
+          `${basename(reclaimPath)}.stale-${process.pid}-${Date.now()}-${randomUUID()}`,
+          guard,
+          parent,
+        );
+        await removePinnedFile(guardQuarantine, guard, parent);
+      } catch {
+        return false;
+      }
+    }
   }
+  if (!reclaimLease) return false;
   try {
     const expected = await snapshotPinnedFile(lockPath).catch(() => null);
     if (!expected || Date.now() - expected.mtimeMs < minimumAgeMs) return false;
@@ -393,8 +426,7 @@ async function reclaimAdvisoryLockByIdentity(
       return false;
     }
   } finally {
-    const reclaim = await snapshotPinnedFile(reclaimPath).catch(() => null);
-    if (reclaim) await removePinnedFile(reclaimPath, reclaim, parent).catch(() => {});
+    await removePinnedFile(reclaimPath, reclaimLease, parent).catch(() => {});
   }
 }
 
