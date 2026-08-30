@@ -85,7 +85,7 @@ export class JsonChildClient {
     this.reportPending();
   }
 
-  private waitForResponse(id: number): Promise<Record<string, unknown>> {
+  private waitForResponse(id: number, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Record<string, unknown>> {
     if (this.terminalError) return Promise.reject(this.terminalError);
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const waiter: PendingRequest = {
@@ -98,14 +98,14 @@ export class JsonChildClient {
           this.reportPending();
           this.finish(error);
           this.child.kill('SIGKILL');
-        }, REQUEST_TIMEOUT_MS),
+        }, timeoutMs),
       };
       this.pending.set(id, waiter);
       this.reportPending();
     });
   }
 
-  async initialize(): Promise<Record<string, unknown>> {
+  async initialize(options: { timeoutMs?: number } = {}): Promise<Record<string, unknown>> {
     if (this.initialResponse) {
       const response = this.initialResponse;
       this.initialResponse = null;
@@ -113,14 +113,14 @@ export class JsonChildClient {
       if (response.ready !== true) throw new Error(`${this.label} initialization failed`);
       return response;
     }
-    const response = await this.waitForResponse(0);
+    const response = await this.waitForResponse(0, options.timeoutMs);
     if (response.ready !== true) throw new Error(`${this.label} initialization failed`);
     return response;
   }
 
-  request(value: Record<string, unknown>): Promise<Record<string, unknown>> {
+  request(value: Record<string, unknown>, options: { timeoutMs?: number } = {}): Promise<Record<string, unknown>> {
     const id = this.nextRequestId++;
-    const response = this.waitForResponse(id);
+    const response = this.waitForResponse(id, options.timeoutMs);
     if (this.terminalError) return response;
     this.child.stdin.write(`${JSON.stringify({ id, ...value })}\n`, (error) => {
       if (error) this.finish(new Error(`${this.label} request write failed`, { cause: error }));

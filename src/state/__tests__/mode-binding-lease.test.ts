@@ -1,21 +1,95 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startMode } from '../../modes/base.js';
 import { __setStateOperationTestHooksForTests, executeStateOperation, withStateFileWriteTransaction, writeStateFile } from '../operations.js';
 import { __setCanonicalModeBindingLeaseTestHooksForTests, resolveValidatedCanonicalModeBinding } from '../mode-binding-lease.js';
+import { JsonChildClient } from '../pinned-atomic-file-darwin-client.js';
 
 const roots: string[] = [];
+const operationsModuleUrl = new URL('../operations.js', import.meta.url).href;
+
+async function runTransactionProcess(path: string): Promise<void> {
+  const source = [
+    `import { withStateFileWriteTransaction } from ${JSON.stringify(operationsModuleUrl)};`,
+    'await withStateFileWriteTransaction(process.argv[1], async () => undefined);',
+  ].join('\n');
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', source, path], {
+    stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+    child.once('exit', (code, signal) => resolveExit({ code, signal }));
+  });
+  assert.deepEqual(result, { code: 0, signal: null }, stderr);
+}
+
 afterEach(async () => {
   __setStateOperationTestHooksForTests({});
   __setCanonicalModeBindingLeaseTestHooksForTests({});
+  delete process.env.OMX_TEST_MODE_BINDING_RECLAIM_CRASH_PHASE;
+  delete process.env.OMX_TEST_MODE_BINDING_RECLAIM_CRASH_SENTINEL;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe('canonical mode binding lease', () => {
+  it('uses a longer initialization timeout without weakening later request timeouts', async () => {
+    const source = [
+      "process.stdin.resume();",
+      "setTimeout(() => process.stdout.write(JSON.stringify({ id: 0, ok: true, ready: true }) + '\\n'), 60);",
+    ].join('\n');
+    const child = spawn(process.execPath, ['--eval', source], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const client = new JsonChildClient(child, 'timeout-scope-test');
+    await client.initialize({ timeoutMs: 250 });
+    const started = Date.now();
+    await assert.rejects(client.request({ op: 'ignored' }, { timeoutMs: 40 }), /request timed out/);
+    assert.ok(Date.now() - started < 500);
+    await client.close();
+  });
+
+  it('clean release is ownerless and the next acquire does not depend on the prior PID', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-clean-release-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+    assert.deepEqual(await readdir(lockPath), []);
+
+    let ran = false;
+    await withStateFileWriteTransaction(path, async () => { ran = true; });
+
+    assert.equal(ran, true);
+    assert.deepEqual(await readdir(lockPath), []);
+  });
+
+  it('does not steal a valid owner whose foreign PID is still live', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-live-foreign-owner-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+    const liveToken = `${process.pid}-${Date.now()}-${'9'.repeat(24)}`;
+    const liveOwner = join(lockPath, `owner-${liveToken}`);
+    await writeFile(liveOwner, liveToken);
+    let ran = false;
+    const contender = withStateFileWriteTransaction(path, async () => { ran = true; });
+
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 150));
+    assert.equal(ran, false);
+    assert.equal(await readFile(liveOwner, 'utf8'), liveToken);
+    await unlink(liveOwner);
+    await contender;
+
+    assert.equal(ran, true);
+    assert.deepEqual(await readdir(lockPath), []);
+  });
+
   it('keeps persistent namespace identity evidence out of git worktree status', async () => {
     const ignore = await readFile(join(process.cwd(), '.gitignore'), 'utf8');
     assert.match(ignore, /^\.omx-state-locks\/\s*$/mu);
@@ -144,8 +218,163 @@ describe('canonical mode binding lease', () => {
     await withStateFileWriteTransaction(path, async () => undefined);
     const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
     await writeFile(join(lockPath, 'foreign-metadata'), 'do-not-delete');
-    await assert.rejects(withStateFileWriteTransaction(path, async () => undefined), /timed out waiting/);
+    await assert.rejects(withStateFileWriteTransaction(path, async () => undefined), /owner ambiguous/);
     assert.equal(await readFile(join(lockPath, 'foreign-metadata'), 'utf8'), 'do-not-delete');
+  });
+
+  it('recovers an old malformed partial owner only after pinning its inode', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-partial-owner-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+    const deadToken = `99999999-${Date.now() - 10_000}-${'a'.repeat(24)}`;
+    const ownerPath = join(lockPath, `owner-${deadToken}`);
+    await writeFile(ownerPath, deadToken.slice(0, 12));
+    const stale = new Date(Date.now() - 10_000);
+    await utimes(ownerPath, stale, stale);
+
+    let ran = false;
+    await withStateFileWriteTransaction(path, async () => { ran = true; });
+
+    assert.equal(ran, true);
+    assert.deepEqual(await readdir(lockPath), []);
+  });
+
+  it('fails closed on old owner bytes that are not a published token prefix', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-tampered-owner-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+    const deadToken = `99999999-${Date.now() - 10_000}-${'c'.repeat(24)}`;
+    const ownerPath = join(lockPath, `owner-${deadToken}`);
+    await writeFile(ownerPath, 'tampered');
+    const stale = new Date(Date.now() - 10_000);
+    await utimes(ownerPath, stale, stale);
+
+    let ran = false;
+    await assert.rejects(
+      withStateFileWriteTransaction(path, async () => { ran = true; }),
+      /owner ambiguous/,
+    );
+    assert.equal(ran, false);
+    assert.equal(await readFile(ownerPath, 'utf8'), 'tampered');
+  });
+
+  for (const phase of ['after-quarantine', 'after-successor-publish', 'before-cleanup']) {
+    it(`converges without stealing a live successor after SIGKILL ${phase}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-mode-lease-reclaim-${phase}-`));
+      roots.push(cwd);
+      const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+      await withStateFileWriteTransaction(path, async () => undefined);
+      const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+      const deadToken = `99999999-${Date.now() - 10_000}-${'b'.repeat(24)}`;
+      const ownerPath = join(lockPath, `owner-${deadToken}`);
+      await writeFile(ownerPath, deadToken.slice(0, 7));
+      const stale = new Date(Date.now() - 10_000);
+      await utimes(ownerPath, stale, stale);
+      const sentinel = join(cwd, `${phase}.sentinel`);
+      process.env.OMX_TEST_MODE_BINDING_RECLAIM_CRASH_PHASE = phase;
+      process.env.OMX_TEST_MODE_BINDING_RECLAIM_CRASH_SENTINEL = sentinel;
+
+      await withStateFileWriteTransaction(path, async () => {
+        const entries = await readdir(lockPath);
+        assert.equal(entries.length, 1);
+        assert.match(entries[0], /^owner-\d+-\d+-[0-9a-f]{24}$/u);
+        const token = entries[0].slice('owner-'.length);
+        assert.equal(await readFile(join(lockPath, entries[0]), 'utf8'), token);
+        assert.doesNotThrow(() => process.kill(Number.parseInt(token.split('-', 1)[0], 10), 0));
+      });
+
+      assert.equal(await readFile(sentinel, 'utf8'), phase);
+      assert.deepEqual(await readdir(lockPath), []);
+    });
+  }
+
+  it('converges quarantine-only state across repeated 20, 32, and 64 process stress', async () => {
+    for (const count of [20, 32, 64]) {
+      for (let round = 0; round < 2; round += 1) {
+        const cwd = await mkdtemp(join(tmpdir(), `omx-mode-lease-quarantine-${count}-${round}-`));
+        roots.push(cwd);
+        const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+        await withStateFileWriteTransaction(path, async () => undefined);
+        const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+        const deadToken = `99999999-${Date.now() - 10_000}-${'d'.repeat(24)}`;
+        const ownerPath = join(lockPath, `owner-${deadToken}`);
+        await writeFile(ownerPath, deadToken);
+        await rename(ownerPath, join(lockPath, `.owner-reclaim-${deadToken}`));
+
+        await Promise.all(Array.from({ length: count }, () => runTransactionProcess(path)));
+
+        assert.deepEqual(await readdir(lockPath), []);
+      }
+    }
+  });
+
+  it('recovers quarantine plus an aged dead partial successor', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-partial-successor-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    await withStateFileWriteTransaction(path, async () => undefined);
+    const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
+    const displacedToken = `99999999-${Date.now() - 10_000}-${'e'.repeat(24)}`;
+    const successorToken = `99999998-${Date.now() - 10_000}-${'f'.repeat(24)}`;
+    await writeFile(join(lockPath, `.owner-reclaim-${displacedToken}`), displacedToken);
+    const partialPath = join(lockPath, `owner-${successorToken}`);
+    await writeFile(partialPath, successorToken.slice(0, 10));
+    const stale = new Date(Date.now() - 10_000);
+    await utimes(partialPath, stale, stale);
+
+    await withStateFileWriteTransaction(path, async () => undefined);
+
+    assert.deepEqual(await readdir(lockPath), []);
+  });
+
+  it('atomically repairs a partial namespace marker against the pinned namespace identity', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-partial-marker-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    const binding = await resolveValidatedCanonicalModeBinding(path);
+    await mkdir(binding.namespacePath);
+    const markerPath = `${binding.namespacePath}.identity.json`;
+    await writeFile(markerPath, '{"dev":');
+
+    await withStateFileWriteTransaction(path, async () => undefined);
+
+    const namespace = await stat(binding.namespacePath);
+    const marker = JSON.parse(await readFile(markerPath, 'utf8')) as { dev: number; ino: number };
+    assert.deepEqual(marker, { dev: namespace.dev, ino: namespace.ino });
+  });
+
+  it('fails closed without mutating an arbitrary malformed namespace marker', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-tampered-marker-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    const binding = await resolveValidatedCanonicalModeBinding(path);
+    await mkdir(binding.namespacePath);
+    const markerPath = `${binding.namespacePath}.identity.json`;
+    const tampered = '{"dev":"not-a-published-partial"';
+    await writeFile(markerPath, tampered);
+
+    await assert.rejects(
+      withStateFileWriteTransaction(path, async () => undefined),
+      /namespace marker malformed/,
+    );
+    assert.equal(await readFile(markerPath, 'utf8'), tampered);
+  });
+
+  it('initializes one canonical namespace marker across twenty processes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-marker-contenders-'));
+    roots.push(cwd);
+    const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
+    const binding = await resolveValidatedCanonicalModeBinding(path);
+
+    await Promise.all(Array.from({ length: 20 }, () => runTransactionProcess(path)));
+
+    const namespace = await stat(binding.namespacePath);
+    const marker = await readFile(`${binding.namespacePath}.identity.json`, 'utf8');
+    assert.equal(marker, `${JSON.stringify({ dev: namespace.dev, ino: namespace.ino })}\n`);
   });
 
   it('rejects a lock-directory symlink swap without dereferencing or deleting the external owner', async () => {
@@ -175,7 +404,7 @@ describe('canonical mode binding lease', () => {
     await writeFile(join(external, 'owner-external'), 'external');
     await symlink(external, lockPath);
     let ran = false;
-    await assert.rejects(withStateFileWriteTransaction(path, async () => { ran = true; }), /timed out waiting/);
+    await assert.rejects(withStateFileWriteTransaction(path, async () => { ran = true; }), /lock invalid/);
     assert.equal(ran, false);
     assert.equal(await readFile(join(external, 'owner-external'), 'utf8'), 'external');
   });

@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath } from 'node:url';
 import { getBaseStateDir } from '../mcp/state-paths.js';
 import { JsonChildClient } from './pinned-atomic-file-darwin-client.js';
+import { pinAtomicFile } from './pinned-atomic-file.js';
 
 interface PinnedLockNamespace {
   path: string;
@@ -139,7 +140,7 @@ export async function withCanonicalModeBindingLease<T>(
   const client = new JsonChildClient(child, 'canonical mode binding lease helper');
   let primaryError: unknown;
   try {
-    await client.initialize();
+    await client.initialize({ timeoutMs: 35_000 });
     await assertPinnedLockNamespace(namespace);
     await client.request({ op: 'assert' });
     await canonicalModeBindingLeaseTestHooks.afterAcquire?.(namespace.path);
@@ -300,25 +301,15 @@ async function assertPinnedLockNamespace(namespace: PinnedLockNamespace): Promis
   }
 }
 
-async function readPinnedNamespaceMarker(path: string): Promise<{ dev: number; ino: number } | null> {
-  let handle: FileHandle | null = null;
+function parseNamespaceMarker(bytes: Buffer): { dev: number; ino: number } | null {
   try {
-    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const before = await handle.stat();
-    const visible = await lstat(path);
-    if (!before.isFile() || before.nlink !== 1 || !visible.isFile() || visible.isSymbolicLink()
-      || visible.nlink !== 1 || before.dev !== visible.dev || before.ino !== visible.ino) {
-      throw new Error('canonical mode binding lease namespace marker invalid');
-    }
-    const parsed = JSON.parse(await handle.readFile('utf8')) as Record<string, unknown>;
-    if (typeof parsed.dev !== 'number' || typeof parsed.ino !== 'number') {
-      throw new Error('canonical mode binding lease namespace marker malformed');
-    }
-    return { dev: parsed.dev, ino: parsed.ino };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  } finally { await handle?.close(); }
+    const parsed = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+    return typeof parsed.dev === 'number' && typeof parsed.ino === 'number'
+      ? { dev: parsed.dev, ino: parsed.ino }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 async function pinCanonicalStateLockNamespace(namespacePath: string): Promise<PinnedLockNamespace> {
@@ -326,26 +317,78 @@ async function pinCanonicalStateLockNamespace(namespacePath: string): Promise<Pi
   try { await mkdir(namespacePath, { mode: 0o700 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
   const identity = await readLockNamespaceIdentity(namespacePath);
-  let recorded = await readPinnedNamespaceMarker(markerPath);
-  if (!recorded) {
-    let marker: FileHandle | null = null;
-    try {
-      marker = await open(markerPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-      await marker.writeFile(`${JSON.stringify(identity)}\n`);
-      await marker.sync();
-      recorded = identity;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      recorded = await readPinnedNamespaceMarker(markerPath);
-    } finally { await marker?.close(); }
-  }
-  if (!recorded || recorded.dev !== identity.dev || recorded.ino !== identity.ino) {
-    throw new Error('canonical mode binding lease namespace identity mismatch');
-  }
   const handle = await open(namespacePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
   const namespace = { path: namespacePath, handle, identity };
-  try { await assertPinnedLockNamespace(namespace); return namespace; }
-  catch (error) { await handle.close(); throw error; }
+  try {
+    await assertPinnedLockNamespace(namespace);
+    const canonical = Buffer.from(`${JSON.stringify(identity)}\n`);
+    const recorded = await pinCanonicalNamespaceMarker(markerPath, canonical, identity, namespace);
+    if (recorded.dev !== identity.dev || recorded.ino !== identity.ino) {
+      throw new Error('canonical mode binding lease namespace identity mismatch');
+    }
+    await assertPinnedLockNamespace(namespace);
+    return namespace;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function pinCanonicalNamespaceMarker(
+  markerPath: string,
+  canonical: Buffer,
+  identity: { dev: number; ino: number },
+  namespace: PinnedLockNamespace,
+): Promise<{ dev: number; ino: number }> {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    await assertPinnedLockNamespace(namespace);
+    let marker: Awaited<ReturnType<typeof pinAtomicFile>>;
+    try {
+      marker = await pinAtomicFile(markerPath);
+    } catch (error) {
+      if (!isConcurrentMarkerPublication(error) || attempt === 31) throw error;
+      await new Promise<void>((resolveRetry) => setTimeout(resolveRetry, 5));
+      continue;
+    }
+    try {
+      const bytes = marker.bytes;
+      if (bytes !== null && bytes.equals(canonical)) return identity;
+      const repairable = bytes === null
+        || bytes.length < canonical.length && canonical.subarray(0, bytes.length).equals(bytes);
+      if (!repairable) {
+        const recorded = parseNamespaceMarker(bytes!);
+        const normalized = recorded ? Buffer.from(`${JSON.stringify(recorded)}\n`) : null;
+        if (!recorded || !normalized?.equals(bytes!)) {
+          throw new Error('canonical mode binding lease namespace marker malformed');
+        }
+        return recorded;
+      }
+      try {
+        await assertPinnedLockNamespace(namespace);
+        await marker.replace(canonical);
+        await assertPinnedLockNamespace(namespace);
+        return identity;
+      } catch (error) {
+        // Replacement failures are reconciled by reopening the marker. A
+        // winner is accepted only if the next pinned read is byte-exact;
+        // tamper remains terminal, and persistent I/O failure is bounded.
+        if (attempt === 31) throw error;
+      }
+    } finally {
+      await marker.close();
+    }
+    await new Promise<void>((resolveRetry) => setTimeout(resolveRetry, 5));
+  }
+  throw new Error('canonical mode binding lease namespace marker retry exhausted');
+}
+
+function isConcurrentMarkerPublication(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('pinned atomic file appeared:') || message.includes('pinned atomic file changed')
+    || message === 'pinned Darwin replace recovery is ambiguous'
+    || message === 'supervisor completion mismatch'
+    || message === 'file-invalid' || message === 'file-changed'
+    || message === 'file-appeared' || message === 'recovered-file-changed';
 }
 
 const canonicalModeBindingLeaseTestHooks: {
