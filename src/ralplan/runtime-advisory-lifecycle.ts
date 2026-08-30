@@ -40,8 +40,8 @@ interface RuntimeLifecycleBase {
   readonly kind: 'standard' | 'advisory';
   readonly sessionId: string | undefined;
   reviewScope(task: string): string;
-  postDraft(planPath: string | undefined): Promise<void>;
-  postReview(planPath: string | undefined, role: 'architect' | 'critic'): Promise<void>;
+  postDraft(planPath: string | undefined): Promise<string | undefined>;
+  postReview(planPath: string | undefined, role: 'architect' | 'critic', artifactPath?: string): Promise<string | undefined>;
   completeApproved(input: RalplanRuntimeSnapshot & {
     architectReview: RalplanReviewResult;
     criticReview: RalplanReviewResult;
@@ -223,8 +223,8 @@ class StandardLifecycleHandler implements RuntimeLifecycleBase {
   readonly kind = 'standard' as const;
   constructor(readonly sessionId: string | undefined) {}
   reviewScope(task: string): string { return task; }
-  async postDraft(): Promise<void> {}
-  async postReview(): Promise<void> {}
+  async postDraft(): Promise<undefined> { return undefined; }
+  async postReview(): Promise<undefined> { return undefined; }
   async completeApproved(): Promise<null> { return null; }
   async terminalFailure(): Promise<null> { return null; }
   async recoverFailure(): Promise<null> { return null; }
@@ -302,15 +302,18 @@ class AdvisoryLifecycleHandler implements RuntimeLifecycleBase {
 
   reviewScope(): string { return `ralplan-advisory:${this.generationId}`; }
 
-  async postDraft(planPath: string | undefined): Promise<void> {
+  async postDraft(planPath: string | undefined): Promise<string> {
     if (!planPath) throw new Error('ralplan_advisory_plan_artifact_required');
     this.planDigestBeforeReviews = (await digestAdvisoryArtifacts(this.cwd, [planPath])).sha256;
+    return this.planDigestBeforeReviews;
   }
 
-  async postReview(planPath: string | undefined, role: 'architect' | 'critic'): Promise<void> {
+  async postReview(planPath: string | undefined, role: 'architect' | 'critic', artifactPath?: string): Promise<string> {
     if (planPath && (await digestAdvisoryArtifacts(this.cwd, [planPath])).sha256 !== this.planDigestBeforeReviews) {
       throw new Error(`ralplan_advisory_plan_changed_during_${role}_review`);
     }
+    if (!artifactPath) throw new Error(`ralplan_advisory_${role}_artifact_path_required`);
+    return (await digestAdvisoryArtifacts(this.cwd, [artifactPath])).sha256;
   }
 
   private async projectLifecycle(input: RalplanRuntimeSnapshot & {

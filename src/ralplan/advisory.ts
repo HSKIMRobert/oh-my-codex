@@ -656,7 +656,7 @@ async function liveAdvisoryBindingConflict(
   } catch {
     return 'live_session_binding_unreadable';
   }
-  return binding?.active === true
+  return binding
     && (binding.workflow_variant !== 'advisory' || binding.advisory_generation_id !== generationId)
     ? 'live_session_binding_conflict'
     : null;

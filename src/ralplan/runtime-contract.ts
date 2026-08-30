@@ -26,6 +26,8 @@ export interface RalplanDraftResult {
   agent_role?: 'planner' | 'architect' | 'critic' | 'executor';
   lane_id?: string;
   tracker_path?: string;
+  review_iteration?: number;
+  advisory_plan_manifest_sha256?: string;
 }
 
 export interface RalplanReviewResult {
@@ -42,6 +44,8 @@ export interface RalplanReviewResult {
   tracker_path?: string;
   new_lane_reason?: string;
   sequence_index?: number;
+  review_iteration?: number;
+  advisory_artifact_manifest_sha256?: string;
 }
 
 export interface RalplanConsensusGate {

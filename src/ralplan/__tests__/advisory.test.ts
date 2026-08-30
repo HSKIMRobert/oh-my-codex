@@ -187,6 +187,17 @@ describe('ralplan advisory evidence', () => {
     }), /sequence/);
   });
 
+  it('rejects pairwise path reuse in the shared lifecycle projector', async () => {
+    const { cwd, sessionId } = await fixture();
+    await assert.rejects(projectAdvisoryReviewLifecycle({
+      cwd, sessionId, generationId: 'generation-a', activationTurnId: 'turn-a',
+      activationCreatedAt: '2026-08-27T23:59:59.000Z', rootThreadId: 'root-a', iteration: 1,
+      planPaths: ['.omx/plans/plan.md'],
+      architect: { threadId: 'architect', artifactPath: '.omx/artifacts/architect.md', verdict: 'approve', sessionId },
+      critic: { threadId: 'critic', artifactPath: '.omx/plans/plan.md', verdict: 'approve', sessionId },
+    }), /review_artifact_path_reused/);
+  });
+
   it('requires strict native direct-child evidence bound to root, session, activation, and generation', async () => {
     const { cwd, sessionId } = await fixture();
     const trackerPath = join(cwd, '.omx', 'state', 'subagent-tracking.json');
@@ -564,6 +575,14 @@ describe('ralplan advisory fence and journal', () => {
     const skipped = await reconcileRalplanAdvisory(stable.cwd, stable.sessionId);
     assert.equal(skipped?.corruption, 'live_session_binding_conflict');
     assert.deepEqual(await snapshotBytes(join(stable.cwd, '.omx')), stableBefore);
+
+    const inactive = await prepare();
+    const inactiveModePath = join(inactive.cwd, '.omx', 'state', 'sessions', inactive.sessionId, 'ralplan-state.json');
+    await writeFile(inactiveModePath, JSON.stringify({ ...standardMode, active: false, current_phase: 'complete' }));
+    const inactiveBefore = await snapshotBytes(join(inactive.cwd, '.omx'));
+    const inactiveSkipped = await reconcileRalplanAdvisory(inactive.cwd, inactive.sessionId);
+    assert.equal(inactiveSkipped?.corruption, 'live_session_binding_conflict');
+    assert.deepEqual(await snapshotBytes(join(inactive.cwd, '.omx')), inactiveBefore);
 
     const raced = await prepare();
     const racedModePath = join(raced.cwd, '.omx', 'state', 'sessions', raced.sessionId, 'ralplan-state.json');

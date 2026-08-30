@@ -133,15 +133,20 @@ describe('ralplan advisory CLI', () => {
     }));
     const activation = await activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a', nowIso: '2026-08-27T23:59:59.000Z' });
     await commitActivation(cwd, sessionId, activation);
+    const { digestAdvisoryArtifacts } = await import('../../ralplan/advisory-evidence.js');
+    const planBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/plans/plan.md'])).sha256;
+    const architectBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/artifacts/architect.md'])).sha256;
+    const criticBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/artifacts/critic.md'])).sha256;
     await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
       active: true, mode: 'ralplan', current_phase: 'critic-review', iteration: 1, max_iterations: 1,
       started_at: '2026-08-28T00:00:00.000Z', session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-a',
       workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
       latest_plan_path: join(cwd, '.omx', 'plans', 'plan.md'),
       review_history: [{
-        draft: { planPath: join(cwd, '.omx', 'plans', 'plan.md') },
-        architect_review: { verdict: 'approve', thread_id: 'architect', artifact_path: '.omx/artifacts/architect.md', session_id: sessionId },
-        critic_review: { verdict: 'approve', thread_id: 'critic', artifact_path: '.omx/artifacts/critic.md', session_id: sessionId },
+        iteration: 1,
+        draft: { planPath: join(cwd, '.omx', 'plans', 'plan.md'), advisory_plan_manifest_sha256: planBaseline },
+        architect_review: { verdict: 'approve', thread_id: 'architect', artifact_path: '.omx/artifacts/architect.md', session_id: sessionId, advisory_artifact_manifest_sha256: architectBaseline },
+        critic_review: { verdict: 'approve', thread_id: 'critic', artifact_path: '.omx/artifacts/critic.md', session_id: sessionId, advisory_artifact_manifest_sha256: criticBaseline },
       }],
     }));
     const lifecycle = await (await import('../../ralplan/advisory-evidence.js')).projectAdvisoryReviewLifecycle({
@@ -166,6 +171,12 @@ describe('ralplan advisory CLI', () => {
     });
     assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.fence?.state, 'closed');
     assert.equal((await readCurrentRalplanAdvisory(cwd, sessionId))?.fence?.closing_turn_id, 'turn-closeout-original');
+    await writeFile(join(cwd, '.omx', 'plans', 'plan.md'), '# mutated after review\n');
+    await assert.rejects(
+      ralplanCommand(['advisory', 'complete'], { cwd: () => cwd, stdout: (line) => output.push(line) }),
+      /review_artifact_baseline_mismatch/,
+    );
+    await writeFile(join(cwd, '.omx', 'plans', 'plan.md'), '# plan\n');
     output.length = 0;
     await ralplanCommand(['advisory', 'complete'], { cwd: () => cwd, stdout: (line) => output.push(line) });
     assert.equal(output.at(-1), 'Ralplan Advisory complete. Control returned to the caller without an automatic execution handoff; later user instructions follow normal host rules.');
