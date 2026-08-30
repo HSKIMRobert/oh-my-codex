@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { readAllState, readHudConfig } from './state.js';
 import { getHudRenderMaxLines } from './render.js';
 import { HUD_TMUX_HEIGHT_LINES, isTmuxWindowTooCrampedForHudSplit } from './constants.js';
@@ -189,6 +190,10 @@ function needsHudTopologyRecreate(pane: TmuxPaneSnapshot, leaderPane?: TmuxPaneS
   const expectedLeft = typeof leaderPane?.paneLeft === 'number' ? leaderPane.paneLeft : 0;
   const expectedWidth = typeof leaderPane?.paneWidth === 'number' ? leaderPane.paneWidth : pane.windowWidth;
   const spansExpectedWidth = pane.paneLeft === expectedLeft && pane.paneWidth === expectedWidth;
+  if (typeof pane.paneTop === 'number' && typeof leaderPane?.paneBottom === 'number') {
+    const sitsImmediatelyBelowLeader = pane.paneTop === leaderPane.paneBottom + 2;
+    return !spansExpectedWidth || !sitsImmediatelyBelowLeader;
+  }
   const touchesWindowBottom = pane.paneBottom === (pane.windowHeight ?? 0) - 1;
   return !spansExpectedWidth || !touchesWindowBottom;
 }
@@ -229,6 +234,8 @@ function planOwnedHudPaneDedupe(
 }
 
 const HUD_RECONCILE_LOCK_STALE_MS = 10_000;
+const HUD_RECONCILE_LOCK_RETRY_MS = 50;
+const HUD_RECONCILE_LOCK_WAIT_MS = 2_000;
 
 interface HudReconcileLock {
   path: string;
@@ -339,6 +346,36 @@ async function acquireHudReconcileLock(
   return tryCreateHudReconcileLock(lockPath, nowMs);
 }
 
+async function isFreshHudReconcileLock(
+  lockPath: string,
+  nowMs: number,
+  staleMs: number,
+): Promise<boolean> {
+  const owner = await readHudReconcileLockOwner(lockPath);
+  const lockStat = await stat(lockPath).catch(() => null);
+  if (!lockStat) return true;
+  const acquiredMs = parseIsoMs(owner?.acquired_at);
+  const ageMs = acquiredMs === null ? nowMs - lockStat.mtimeMs : nowMs - acquiredMs;
+  return ageMs <= staleMs;
+}
+
+async function waitForHudReconcileLock(
+  lockPath: string,
+  nowMs: () => number,
+  staleMs: number,
+  isProcessLive: (pid: number) => boolean | null,
+): Promise<HudReconcileLock | null> {
+  const attempts = Math.ceil(HUD_RECONCILE_LOCK_WAIT_MS / HUD_RECONCILE_LOCK_RETRY_MS) + 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const observedNow = nowMs();
+    const lock = await acquireHudReconcileLock(lockPath, observedNow, staleMs, isProcessLive);
+    if (lock) return lock;
+    if (!(await isFreshHudReconcileLock(lockPath, observedNow, staleMs))) return null;
+    if (attempt < attempts - 1) await sleep(HUD_RECONCILE_LOCK_RETRY_MS);
+  }
+  return null;
+}
+
 async function releaseHudReconcileLock(lock: HudReconcileLock): Promise<void> {
   const releasePath = `${lock.path}.release.${process.pid}.${Date.now()}.${lock.token}`;
   try {
@@ -396,12 +433,15 @@ export async function reconcileHudForPromptSubmit(
   const killPane = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
   const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
 
+  // Layout-change hooks for every OMX pane in a window may fire together. Keep
+  // tmux layout mutations serialized, but wait briefly for a fresh holder so a
+  // neighboring leader's one-shot hook does not get dropped as concurrent.
   const lockPath = join(cwd, '.omx', 'state', 'hud-reconcile.lock');
   const lockDirReady = await mkdir(dirname(lockPath), { recursive: true }).then(() => true).catch(() => false);
   const lock = lockDirReady
-    ? await acquireHudReconcileLock(
+    ? await waitForHudReconcileLock(
       lockPath,
-      deps.nowMs?.() ?? Date.now(),
+      deps.nowMs ?? Date.now,
       HUD_RECONCILE_LOCK_STALE_MS,
       deps.isProcessLive ?? defaultIsProcessLive,
     )
