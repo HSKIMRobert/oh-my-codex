@@ -9,6 +9,10 @@ import {
   type ActivateOrResumeRalplanAdvisoryInput,
   type AdvisoryActivationCheckpoint,
 } from '../advisory-activation.js';
+import {
+  ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM,
+  verifyPinnedJsonAndSync,
+} from '../advisory-activation-verifier.js';
 import { listActiveSkills, listTransitionActiveSkills, writeSkillActiveStateCopiesForStateDir } from '../../state/skill-active.js';
 import {
   administrativelyAbandonRalplanAdvisory,
@@ -23,6 +27,20 @@ const activateOrResumeRalplanAdvisory = (
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe('central Ralplan Advisory activation owner', () => {
+  it('accepts the repository-supported degraded Windows directory fsync outcome', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-windows-sync-'));
+    roots.push(cwd);
+    const path = join(cwd, 'projection.json');
+    await writeFile(path, '{"schema_version":1}\n');
+    ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.directorySync = async () => 'unsupported-windows-eperm';
+    try {
+      const value = await verifyPinnedJsonAndSync(path, (record) => record.schema_version === 1);
+      assert.equal(value.schema_version, 1);
+    } finally {
+      ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.directorySync = undefined;
+    }
+  });
+
   it('keeps activation preparation and commit imports behind the central owner boundary', async () => {
     const advisorySource = await readFile(join(process.cwd(), 'src', 'ralplan', 'advisory.ts'), 'utf8');
     assert.doesNotMatch(advisorySource, /export async function activateRalplanAdvisory\b/);

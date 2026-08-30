@@ -4,6 +4,11 @@ import { dirname, join } from 'node:path';
 import { listActiveSkills } from '../state/skill-active.js';
 import { syncDirectory, syncRegularFile } from '../utils/file-durability.js';
 
+/** @internal Durability seam for deterministic Windows tests. */
+export const ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM: {
+  directorySync?: typeof syncDirectory;
+} = {};
+
 export type AdvisoryProjectionPredicate = (value: Record<string, unknown>) => boolean;
 
 export interface AdvisoryActivationProjectionDescriptor {
@@ -50,7 +55,8 @@ export async function verifyPinnedJsonAndSync(
     }
     const parent = await open(dirname(path), fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
     try {
-      if (await syncDirectory(parent) !== 'synced') {
+      const syncOutcome = await (ADVISORY_ACTIVATION_VERIFIER_TEST_SEAM.directorySync ?? syncDirectory)(parent);
+      if (syncOutcome !== 'synced' && syncOutcome !== 'unsupported-windows-eperm') {
         throw new Error(`ralplan_advisory_activation_directory_fsync_unsupported:${dirname(path)}`);
       }
     } finally { await parent.close(); }

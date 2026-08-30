@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   advisoryIterationId,
+  ADVISORY_EVIDENCE_TEST_SEAM,
   digestAdvisoryArtifacts,
   pinDirectory,
   projectAdvisoryReviewLifecycle,
@@ -176,6 +177,18 @@ describe('ralplan advisory evidence', () => {
     finally { await pinned.close(); }
   });
 
+  it('uses bounded identity-revalidated artifact reads on Windows', async () => {
+    const { cwd } = await fixture();
+    ADVISORY_EVIDENCE_TEST_SEAM.platform = 'win32';
+    const pinned = await pinDirectory(join(cwd, '.omx', 'plans'));
+    try {
+      assert.equal((await pinned.readFile('plan.md')).toString('utf8'), '# exact plan\n');
+    } finally {
+      await pinned.close();
+      ADVISORY_EVIDENCE_TEST_SEAM.platform = undefined;
+    }
+  });
+
   it('rejects tracker role, ordering, and artifact changes', async () => {
     const { cwd, sessionId } = await fixture();
     const trackerPath = join(cwd, '.omx', 'state', 'subagent-tracking.json');
@@ -254,14 +267,18 @@ describe('ralplan advisory fence and journal', () => {
   });
 
   it('moves to recovery_required when the post-write bundle digest changes', async () => {
-    const { cwd, sessionId, lifecycle } = await fixture();
-    const result = await terminalizeRalplanAdvisory({
-      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
-      outcome: 'approved', integrityStatus: 'proven', lifecycle,
-      revalidateEvidence: async () => '0'.repeat(64),
-    });
-    assert.equal(result.fence?.state, 'recovery_required');
-    assert.equal(result.journal?.phase, 'prepared');
+    for (const failure of ['changed', 'unreadable'] as const) {
+      const { cwd, sessionId, lifecycle } = await fixture();
+      const result = await terminalizeRalplanAdvisory({
+        cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+        outcome: 'approved', integrityStatus: 'proven', lifecycle,
+        revalidateEvidence: failure === 'changed'
+          ? async () => '0'.repeat(64)
+          : async () => { throw new Error('artifact unreadable'); },
+      });
+      assert.equal(result.fence?.state, 'recovery_required');
+      assert.equal(result.journal?.phase, 'prepared');
+    }
   });
 
   it('rejects approved+proven without complete lifecycle digests and revalidation, while approved+unproven recovers', async () => {
@@ -542,6 +559,14 @@ describe('ralplan advisory fence and journal', () => {
     const skipped = await reconcileRalplanAdvisory(stable.cwd, stable.sessionId);
     assert.equal(skipped?.corruption, 'live_session_binding_conflict');
     assert.deepEqual(await snapshotBytes(join(stable.cwd, '.omx')), stableBefore);
+
+    const inactive = await prepare();
+    const inactiveModePath = join(inactive.cwd, '.omx', 'state', 'sessions', inactive.sessionId, 'ralplan-state.json');
+    await writeFile(inactiveModePath, JSON.stringify({ ...standardMode, active: false, current_phase: 'complete' }));
+    const inactiveBefore = await snapshotBytes(join(inactive.cwd, '.omx'));
+    const inactiveSkipped = await reconcileRalplanAdvisory(inactive.cwd, inactive.sessionId);
+    assert.equal(inactiveSkipped?.corruption, 'live_session_binding_conflict');
+    assert.deepEqual(await snapshotBytes(join(inactive.cwd, '.omx')), inactiveBefore);
 
     const raced = await prepare();
     const racedModePath = join(raced.cwd, '.omx', 'state', 'sessions', raced.sessionId, 'ralplan-state.json');

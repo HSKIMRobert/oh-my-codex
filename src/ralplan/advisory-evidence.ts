@@ -11,6 +11,9 @@ import { pinDirectory as pinPlatformDirectory } from './documented-leader-prefli
 const MAX_ARTIFACT_BYTES = process.platform === 'darwin' ? 128 * 1024 : 8 * 1024 * 1024;
 const ALLOWED_ROOTS = ['.omx/plans', '.omx/specs', '.omx/artifacts', '.omx/context'] as const;
 
+/** @internal Platform seam for deterministic portability tests. */
+export const ADVISORY_EVIDENCE_TEST_SEAM: { platform?: NodeJS.Platform } = {};
+
 export interface PinnedDirectory {
   readonly canonicalPath: string;
   readonly identity: { dev: number; ino: number };
@@ -65,6 +68,7 @@ function sameArtifactFileIdentity(left: ArtifactFileIdentity, right: ArtifactFil
  * platforms without /proc/self/fd, every read revalidates the pinned directory
  * identity before and after the child fstat/read/fstat sequence. */
 export async function pinDirectory(path: string): Promise<PinnedDirectory> {
+  const platform = ADVISORY_EVIDENCE_TEST_SEAM.platform ?? process.platform;
   const canonicalPath = await realpath(path);
   const before = await lstat(canonicalPath);
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error('ralplan_advisory_directory_invalid');
@@ -74,7 +78,7 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
     await handle.close();
     throw new Error('ralplan_advisory_directory_identity_changed');
   }
-  if (process.platform === 'darwin') {
+  if (platform === 'darwin') {
     await handle.close();
     const pinned = await pinPlatformDirectory(canonicalPath);
     if (!pinned) throw new Error('ralplan_advisory_directory_pin_failed');
@@ -95,7 +99,7 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
       close: () => pinned.close(),
     };
   }
-  const descriptorPath = process.platform === 'linux' ? `/proc/self/fd/${handle.fd}` : null;
+  const descriptorPath = platform === 'linux' ? `/proc/self/fd/${handle.fd}` : canonicalPath;
   let closed = false;
   return {
     canonicalPath,
@@ -107,9 +111,14 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
       if (closed || !safeBasename(name)) {
         throw new Error('ralplan_advisory_artifact_name_invalid');
       }
-      if (!descriptorPath) throw new Error('ralplan_advisory_descriptor_relative_open_unsupported');
       const directoryBefore = await handle.stat();
       if (!sameIdentity(opened, directoryBefore)) throw new Error('ralplan_advisory_directory_identity_changed');
+      if (platform !== 'linux') {
+        const visibleBefore = await lstat(canonicalPath);
+        if (!visibleBefore.isDirectory() || visibleBefore.isSymbolicLink() || !sameIdentity(opened, visibleBefore)) {
+          throw new Error('ralplan_advisory_directory_identity_changed');
+        }
+      }
       const file = await open(join(descriptorPath, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const first = await file.stat({ bigint: true });
@@ -124,6 +133,12 @@ export async function pinDirectory(path: string): Promise<PinnedDirectory> {
         }
         const directoryAfter = await handle.stat();
         if (!sameIdentity(opened, directoryAfter)) throw new Error('ralplan_advisory_directory_identity_changed');
+        if (platform !== 'linux') {
+          const visibleAfter = await lstat(canonicalPath);
+          if (!visibleAfter.isDirectory() || visibleAfter.isSymbolicLink() || !sameIdentity(opened, visibleAfter)) {
+            throw new Error('ralplan_advisory_directory_identity_changed');
+          }
+        }
         return bytes;
       } finally {
         await file.close();

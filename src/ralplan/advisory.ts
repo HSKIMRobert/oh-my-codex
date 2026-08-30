@@ -1046,7 +1046,9 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
     await mark(step);
   }
   if (journal.steps.post_digest !== 'applied') {
-    const digest = await options.revalidateEvidence?.();
+    let digest: string | undefined;
+    try { digest = await options.revalidateEvidence?.(); }
+    catch { digest = undefined; }
     if (options.lifecycle && digest !== options.lifecycle.evidence_bundle_sha256) {
       await options.beforeMutation?.('fence_recovery_required');
       await emitAdvisoryEvent(fence.canonical_cwd, {
@@ -1120,7 +1122,7 @@ async function liveAdvisoryBindingConflict(
   } catch {
     return 'live_session_binding_unreadable';
   }
-  return binding?.active === true
+  return binding
     && (binding.workflow_variant !== 'advisory' || binding.advisory_generation_id !== generationId)
     ? 'live_session_binding_conflict'
     : null;
