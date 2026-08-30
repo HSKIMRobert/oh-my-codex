@@ -1,5 +1,5 @@
 import { constants as fsConstants, existsSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
@@ -198,7 +198,8 @@ async function readStateFileRecord(path: string, requireCurrentRecord: boolean):
 async function acquireStateFileWriteLock(path: string): Promise<Awaited<ReturnType<typeof open>>> {
   const lockPath = `${path}.write-lock`;
   await mkdir(dirname(path), { recursive: true });
-  if (await realpath(dirname(path)) !== dirname(path)) {
+  const parent = await lstat(dirname(path));
+  if (!parent.isDirectory() || parent.isSymbolicLink()) {
     throw new Error('state_file_write_parent_unsafe');
   }
   for (let attempt = 0; attempt < 2; attempt += 1) {

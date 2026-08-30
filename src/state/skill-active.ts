@@ -1,6 +1,6 @@
 import { randomBytes } from 'crypto';
 import { constants as fsConstants, existsSync } from 'fs';
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'fs/promises';
 import { basename, dirname, join } from 'path';
 import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.js';
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
@@ -726,12 +726,16 @@ async function replaceSessionMirrorAtomically(
   beforeCommit?: BeforeWritableCommit,
 ): Promise<void> {
   const parentPath = dirname(sessionPath);
-  const canonicalParent = await realpath(parentPath);
-  if (canonicalParent !== parentPath) {
+  const parentIdentity = await lstat(parentPath);
+  if (!parentIdentity.isDirectory() || parentIdentity.isSymbolicLink()) {
     throw new SkillActiveStateWriteError('malformed-session', `unsafe session skill-active parent: ${parentPath}`);
   }
   const parent = await open(parentPath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-  const descriptorParent = process.platform === 'linux' ? `/proc/self/fd/${parent.fd}` : parentPath;
+  const descriptorParent = process.platform === 'linux'
+    ? `/proc/self/fd/${parent.fd}`
+    : process.platform === 'darwin'
+      ? `/dev/fd/${parent.fd}`
+      : parentPath;
   const pinnedSessionPath = join(descriptorParent, basename(sessionPath));
   const tempPath = join(descriptorParent, `${basename(sessionPath)}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`);
   let commitStarted = false;

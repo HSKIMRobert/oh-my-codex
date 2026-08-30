@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { mkdir, open, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startMode } from '../modes/base.js';
 import { getBaseStateDir } from '../mcp/state-paths.js';
@@ -161,8 +161,12 @@ export async function activateOrResumeRalplanAdvisory(
   const authorityStateDir = getBaseStateDir(input.cwd);
   const authoritySessionDir = join(authorityStateDir, 'sessions', input.sessionId);
   await mkdir(authoritySessionDir, { recursive: true });
-  if (await realpath(authorityStateDir) !== authorityStateDir
-    || await realpath(authoritySessionDir) !== authoritySessionDir) {
+  const [stateIdentity, sessionIdentity] = await Promise.all([
+    lstat(authorityStateDir),
+    lstat(authoritySessionDir),
+  ]);
+  if (!stateIdentity.isDirectory() || stateIdentity.isSymbolicLink()
+    || !sessionIdentity.isDirectory() || sessionIdentity.isSymbolicLink()) {
     throw new Error('ralplan_advisory_activation_state_authority_unsafe');
   }
   const authority = {
