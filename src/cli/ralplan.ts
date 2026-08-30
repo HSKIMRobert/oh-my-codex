@@ -7,7 +7,10 @@ import { resolveInstalledRoleName } from '../subagents/tracker.js';
 import { readModeState, readModeStateForExplicitSession, startMode, updateModeState } from '../modes/base.js';
 import { runRalplanConsensus, type RalplanConsensusExecutor } from '../ralplan/runtime.js';
 import { resolveWritableStateScope } from '../mcp/state-paths.js';
-import { digestAdvisoryArtifacts, projectAdvisoryReviewLifecycle } from '../ralplan/advisory-evidence.js';
+import {
+  projectAdvisoryReviewLifecycle,
+  type AdvisoryArtifactBaselines,
+} from '../ralplan/advisory-evidence.js';
 import { readCurrentRalplanAdvisory, terminalizeRalplanAdvisory } from '../ralplan/advisory.js';
 
 export const RALPLAN_HELP = `omx ralplan - consensus planning runtime and adapted-authority diagnostics
@@ -47,6 +50,7 @@ export interface RalplanCommandDependencies {
   resolveInstalledRoleName?: typeof resolveInstalledRoleName;
   probeCodexVersionDetailed?: () => CodexVersionProbeResult | null | undefined;
   consensusExecutor?: RalplanConsensusExecutor;
+  beforeAdvisoryProjection?: (phase: 'initial' | 'revalidation') => void | Promise<void>;
 }
 
 const REVIEWED_ROOT_IDENTITY_ABSENT_VERSIONS = new Set([
@@ -228,22 +232,16 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
     const planBaseline = requiredStateString(draft?.advisory_plan_manifest_sha256, 'advisory_plan_manifest_sha256');
     const architectBaseline = requiredStateString(architect?.advisory_artifact_manifest_sha256, 'architect_artifact_manifest_sha256');
     const criticBaseline = requiredStateString(critic?.advisory_artifact_manifest_sha256, 'critic_artifact_manifest_sha256');
-    const assertReviewBaselines = async (): Promise<void> => {
-      const [currentPlan, currentArchitect, currentCritic] = await Promise.all([
-        digestAdvisoryArtifacts(cwd, [planPath]),
-        digestAdvisoryArtifacts(cwd, [architectArtifactPath]),
-        digestAdvisoryArtifacts(cwd, [criticArtifactPath]),
-      ]);
-      if (currentPlan.sha256 !== planBaseline || currentArchitect.sha256 !== architectBaseline
-        || currentCritic.sha256 !== criticBaseline) {
-        throw new Error('ralplan_advisory_review_artifact_baseline_mismatch');
-      }
+    const artifactBaselines: AdvisoryArtifactBaselines = {
+      planManifestSha256: planBaseline,
+      architectArtifactManifestSha256: architectBaseline,
+      criticArtifactManifestSha256: criticBaseline,
     };
-    await assertReviewBaselines();
+    await deps.beforeAdvisoryProjection?.('initial');
     const lifecycle = await projectAdvisoryReviewLifecycle({
       cwd, sessionId, generationId,
       activationTurnId, activationCreatedAt: current.activation.created_at, rootThreadId: current.activation.root_thread_id, iteration,
-      planPaths: [planPath],
+      planPaths: [planPath], artifactBaselines,
       architect: {
         threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'),
         artifactPath: architectArtifactPath,
@@ -268,10 +266,10 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
       cwd, sessionId, generationId, closingTurnId, iteration, outcome: 'approved', integrityStatus: 'proven', lifecycle,
       terminalModeUpdates,
       revalidateEvidence: async () => {
-        await assertReviewBaselines();
+        await deps.beforeAdvisoryProjection?.('revalidation');
         return (await projectAdvisoryReviewLifecycle({
           cwd, sessionId, generationId, activationTurnId, activationCreatedAt: current.activation.created_at,
-          rootThreadId: current.activation.root_thread_id, iteration, planPaths: [planPath],
+          rootThreadId: current.activation.root_thread_id, iteration, planPaths: [planPath], artifactBaselines,
           architect: {
             threadId: requiredStateString(architect?.thread_id, 'architect_thread_id'), artifactPath: architectArtifactPath,
             verdict: requiredStateString(architect?.verdict, 'architect_verdict'), sessionId: typeof architect?.session_id === 'string' ? architect.session_id : undefined,

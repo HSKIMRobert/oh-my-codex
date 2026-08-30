@@ -34,6 +34,47 @@ async function commitActivation(cwd: string, sessionId: string, activation: Awai
   assert.equal(committed?.corruption, null);
 }
 
+async function prepareStandaloneCloseoutFixture(prefix = 'omx-advisory-cli-') {
+  const cwd = await mkdtemp(join(tmpdir(), prefix));
+  roots.push(cwd);
+  const sessionId = 'session-a';
+  const stateDir = join(cwd, '.omx', 'state');
+  const sessionDir = join(stateDir, 'sessions', sessionId);
+  await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+  await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(join(cwd, '.omx', 'plans', 'plan.md'), '# plan\n');
+  await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+  await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+  await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateDir }));
+  await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+    schemaVersion: 1,
+    sessions: { [sessionId]: { session_id: sessionId, leader_thread_id: 'root-a', updated_at: '2026-08-28T00:00:03.000Z', threads: {
+      architect: { thread_id: 'architect', kind: 'subagent', role: 'architect', provenance_kind: 'native_subagent', direct_child_root_id: 'root-a', direct_child_parent_id: 'root-a', scope: 'ralplan-advisory:generation-a', first_seen_at: '2026-08-28T00:00:00.000Z', last_seen_at: '2026-08-28T00:00:01.000Z', completed_at: '2026-08-28T00:00:01.000Z', turn_count: 1 },
+      critic: { thread_id: 'critic', kind: 'subagent', role: 'critic', provenance_kind: 'native_subagent', direct_child_root_id: 'root-a', direct_child_parent_id: 'root-a', scope: 'ralplan-advisory:generation-a', first_seen_at: '2026-08-28T00:00:02.000Z', last_seen_at: '2026-08-28T00:00:03.000Z', completed_at: '2026-08-28T00:00:03.000Z', turn_count: 1 },
+    } } },
+  }));
+  const activation = await activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a', nowIso: '2026-08-27T23:59:59.000Z' });
+  await commitActivation(cwd, sessionId, activation);
+  const { digestAdvisoryArtifacts } = await import('../../ralplan/advisory-evidence.js');
+  const planBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/plans/plan.md'])).sha256;
+  const architectBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/artifacts/architect.md'])).sha256;
+  const criticBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/artifacts/critic.md'])).sha256;
+  await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
+    active: true, mode: 'ralplan', current_phase: 'critic-review', iteration: 1, max_iterations: 1,
+    started_at: '2026-08-28T00:00:00.000Z', session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-a',
+    workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
+    latest_plan_path: join(cwd, '.omx', 'plans', 'plan.md'),
+    review_history: [{
+      iteration: 1,
+      draft: { planPath: join(cwd, '.omx', 'plans', 'plan.md'), advisory_plan_manifest_sha256: planBaseline },
+      architect_review: { verdict: 'approve', thread_id: 'architect', artifact_path: '.omx/artifacts/architect.md', session_id: sessionId, advisory_artifact_manifest_sha256: architectBaseline },
+      critic_review: { verdict: 'approve', thread_id: 'critic', artifact_path: '.omx/artifacts/critic.md', session_id: sessionId, advisory_artifact_manifest_sha256: criticBaseline },
+    }],
+  }));
+  return { cwd, sessionId, sessionDir, activation };
+}
+
 describe('ralplan advisory CLI', () => {
   it('preserves an active Advisory in production dispatch without an injected executor', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-production-run-'));
@@ -111,44 +152,33 @@ describe('ralplan advisory CLI', () => {
     });
   }
 
+  for (const mutationPhase of ['initial', 'revalidation'] as const) {
+    it(`fails closed when evidence changes before ${mutationPhase} lifecycle projection`, async () => {
+      const { cwd, sessionId } = await prepareStandaloneCloseoutFixture(`omx-advisory-cli-${mutationPhase}-race-`);
+      await assert.rejects(
+        ralplanCommand(['advisory', 'complete'], {
+          cwd: () => cwd,
+          beforeAdvisoryProjection: async (phase) => {
+            if (phase === mutationPhase) {
+              await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'MUTATED\n');
+            }
+          },
+        }),
+        /review_artifact_baseline_mismatch|closeout_failed/,
+      );
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      if (mutationPhase === 'initial') {
+        assert.equal(projection?.fence, null);
+        assert.equal(projection?.journal, null);
+      } else {
+        assert.notEqual(projection?.fence?.state, 'closed');
+        assert.notEqual(projection?.journal?.integrity_status, 'proven');
+      }
+    });
+  }
+
   it('accepts no caller evidence and reconstructs a closed non-authorizing result', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-'));
-    roots.push(cwd);
-    const sessionId = 'session-a';
-    const stateDir = join(cwd, '.omx', 'state');
-    const sessionDir = join(stateDir, 'sessions', sessionId);
-    await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
-    await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
-    await mkdir(sessionDir, { recursive: true });
-    await writeFile(join(cwd, '.omx', 'plans', 'plan.md'), '# plan\n');
-    await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
-    await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
-    await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateDir }));
-    await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
-      schemaVersion: 1,
-      sessions: { [sessionId]: { session_id: sessionId, leader_thread_id: 'root-a', updated_at: '2026-08-28T00:00:03.000Z', threads: {
-        architect: { thread_id: 'architect', kind: 'subagent', role: 'architect', provenance_kind: 'native_subagent', direct_child_root_id: 'root-a', direct_child_parent_id: 'root-a', scope: 'ralplan-advisory:generation-a', first_seen_at: '2026-08-28T00:00:00.000Z', last_seen_at: '2026-08-28T00:00:01.000Z', completed_at: '2026-08-28T00:00:01.000Z', turn_count: 1 },
-        critic: { thread_id: 'critic', kind: 'subagent', role: 'critic', provenance_kind: 'native_subagent', direct_child_root_id: 'root-a', direct_child_parent_id: 'root-a', scope: 'ralplan-advisory:generation-a', first_seen_at: '2026-08-28T00:00:02.000Z', last_seen_at: '2026-08-28T00:00:03.000Z', completed_at: '2026-08-28T00:00:03.000Z', turn_count: 1 },
-      } } },
-    }));
-    const activation = await activateRalplanAdvisory({ cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-a', nowIso: '2026-08-27T23:59:59.000Z' });
-    await commitActivation(cwd, sessionId, activation);
-    const { digestAdvisoryArtifacts } = await import('../../ralplan/advisory-evidence.js');
-    const planBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/plans/plan.md'])).sha256;
-    const architectBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/artifacts/architect.md'])).sha256;
-    const criticBaseline = (await digestAdvisoryArtifacts(cwd, ['.omx/artifacts/critic.md'])).sha256;
-    await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({
-      active: true, mode: 'ralplan', current_phase: 'critic-review', iteration: 1, max_iterations: 1,
-      started_at: '2026-08-28T00:00:00.000Z', session_id: sessionId, thread_id: 'root-a', turn_id: 'turn-a',
-      workflow_variant: 'advisory', advisory_generation_id: activation.generation_id,
-      latest_plan_path: join(cwd, '.omx', 'plans', 'plan.md'),
-      review_history: [{
-        iteration: 1,
-        draft: { planPath: join(cwd, '.omx', 'plans', 'plan.md'), advisory_plan_manifest_sha256: planBaseline },
-        architect_review: { verdict: 'approve', thread_id: 'architect', artifact_path: '.omx/artifacts/architect.md', session_id: sessionId, advisory_artifact_manifest_sha256: architectBaseline },
-        critic_review: { verdict: 'approve', thread_id: 'critic', artifact_path: '.omx/artifacts/critic.md', session_id: sessionId, advisory_artifact_manifest_sha256: criticBaseline },
-      }],
-    }));
+    const { cwd, sessionId, sessionDir, activation } = await prepareStandaloneCloseoutFixture();
     const lifecycle = await (await import('../../ralplan/advisory-evidence.js')).projectAdvisoryReviewLifecycle({
       cwd, sessionId, generationId: activation.generation_id, activationTurnId: activation.activation_turn_id,
       activationCreatedAt: activation.created_at, rootThreadId: activation.root_thread_id, iteration: 1,
