@@ -627,10 +627,6 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
         transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'evidence_digest_changed',
         path: journalPath, digest: digest ?? options.lifecycle.evidence_bundle_sha256,
       });
-      fence = await appendFenceEvent(fence.canonical_cwd, fence, {
-        state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
-        outcome: journal.outcome, integrity_status: 'unproven', updated_at: journal.terminal_timestamp,
-      });
       journal.integrity_status = 'unproven';
       journal.steps.post_digest = 'applied';
       journal.steps.journal_commit = 'applied';
@@ -639,6 +635,10 @@ async function terminalizeRalplanAdvisoryUnlocked(options: TerminalizeAdvisoryOp
       journal.updated_at = new Date().toISOString();
       await options.beforeMutation?.('journal_recovery_commit');
       await writeAtomic(journalPath, journal);
+      fence = await appendFenceEvent(fence.canonical_cwd, fence, {
+        state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
+        outcome: journal.outcome, integrity_status: 'unproven', updated_at: journal.terminal_timestamp,
+      });
       return readProjectionForGeneration(fence.canonical_cwd, options.sessionId, options.generationId);
     }
     await mark('post_digest');
@@ -831,11 +831,6 @@ async function reconcileRalplanAdvisoryUnlocked(
             transition: `${fence.state}->recovery_required`, checkpoint: 'post_digest', reason: 'reconcile_evidence_digest_changed',
             path: journalPath, digest: lifecycleDigest ?? fence.evidence_bundle_sha256,
           });
-          await guardReplay('fence_recovery_required');
-          await appendFenceEvent(fence.canonical_cwd, fence, {
-            state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
-            outcome: journal.outcome, integrity_status: 'unproven', updated_at: new Date().toISOString(),
-          });
           journal.integrity_status = 'unproven';
           journal.steps.post_digest = 'applied';
           journal.steps.journal_commit = 'applied';
@@ -843,6 +838,11 @@ async function reconcileRalplanAdvisoryUnlocked(
           journal.phase = 'committed';
           journal.updated_at = new Date().toISOString();
           await writeAtomic(journalPath, journal);
+          await guardReplay('fence_recovery_required');
+          await appendFenceEvent(fence.canonical_cwd, fence, {
+            state: 'recovery_required', closing_turn_id: fence.closing_turn_id, iteration: fence.iteration,
+            outcome: journal.outcome, integrity_status: 'unproven', updated_at: journal.updated_at,
+          });
           return readCurrentRalplanAdvisory(cwd, sessionId);
         }
       }
@@ -911,7 +911,9 @@ export async function reconcileRalplanAdvisory(
   if (!projection?.activation?.generation_id) return projection;
   const initialConflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);
   if (initialConflict) return { ...projection, corruption: initialConflict };
-  if (projection.corruption) return projection;
+  const repairableRecoveryJournal = projection.corruption === 'inactive_journal_not_committed'
+    && projection.fence?.state === 'recovery_required' && projection.journal?.phase === 'prepared';
+  if (projection.corruption && !repairableRecoveryJournal) return projection;
   return withRalplanAdvisoryCurrentLock(cwdCanonical, sessionId, () =>
     withGenerationLock(cwd, sessionId, projection.activation.generation_id, async () => {
     const conflict = await liveAdvisoryBindingConflict(cwdCanonical, sessionId, projection.activation.generation_id);

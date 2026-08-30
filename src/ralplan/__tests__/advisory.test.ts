@@ -254,6 +254,28 @@ describe('ralplan advisory fence and journal', () => {
     }
   });
 
+  it('never publishes a recovery fence before its committed journal', async () => {
+    const { cwd, sessionId, lifecycle } = await fixture();
+    await assert.rejects(terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => '0'.repeat(64),
+      beforeMutation: (checkpoint) => {
+        if (checkpoint === 'journal_recovery_commit') throw new Error('crash-before-recovery-journal');
+      },
+    }), /crash-before-recovery-journal/);
+    const interrupted = await readCurrentRalplanAdvisory(cwd, sessionId);
+    assert.equal(interrupted?.fence?.state, 'pending_closeout');
+    assert.equal(interrupted?.journal?.phase, 'prepared');
+    const recovered = await terminalizeRalplanAdvisory({
+      cwd, sessionId, generationId: 'generation-a', closingTurnId: 'turn-a', iteration: 1,
+      outcome: 'approved', integrityStatus: 'proven', lifecycle,
+      revalidateEvidence: async () => '0'.repeat(64),
+    });
+    assert.equal(recovered?.fence?.state, 'recovery_required');
+    assert.equal(recovered?.journal?.phase, 'committed');
+  });
+
   it('rejects approved+proven without complete lifecycle digests and revalidation, while approved+unproven recovers', async () => {
     const first = await fixture();
     await assert.rejects(terminalizeRalplanAdvisory({

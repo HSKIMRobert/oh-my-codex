@@ -59,6 +59,32 @@ describe('ralplan advisory CLI', () => {
     assert.equal(state.advisory_generation_id, 'generation-production');
   });
 
+  it('preserves an inactive Advisory whose closeout is unfinished', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-inactive-closeout-'));
+    roots.push(cwd);
+    const sessionId = 'session-inactive-closeout';
+    const activation = await activateRalplanAdvisory({
+      cwd, sessionId, rootThreadId: 'root-a', activationTurnId: 'turn-a', generationId: 'generation-inactive',
+    });
+    await commitActivation(cwd, sessionId, activation);
+    await prepareAdvisoryCloseout({
+      cwd, sessionId, generationId: activation.generation_id, closingTurnId: 'turn-close', iteration: 1,
+    });
+    const modePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-state.json');
+    const mode = JSON.parse(await readFile(modePath, 'utf8'));
+    await writeFile(modePath, JSON.stringify({ ...mode, active: false }));
+    const output: string[] = [];
+    await ralplanCommand(['run', '--task', 'replacement task', '--session', sessionId], {
+      cwd: () => cwd,
+      stdout: (line) => output.push(line),
+    });
+    const preserved = JSON.parse(await readFile(modePath, 'utf8'));
+    assert.equal(preserved.workflow_variant, 'advisory');
+    assert.equal(preserved.advisory_generation_id, activation.generation_id);
+    assert.match(output.at(-1) ?? '', /non-authorizing Ralplan Advisory lifecycle/);
+  });
+
+
   it('accepts no caller evidence and reconstructs a closed non-authorizing result', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-cli-'));
     roots.push(cwd);

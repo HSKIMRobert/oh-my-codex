@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { link, lstat, mkdir, open, realpath, rename, unlink, type FileHandle } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, realpath, rename, unlink, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getBaseStateDir } from '../mcp/state-paths.js';
@@ -371,6 +371,32 @@ async function recoverPartialNamespaceMarker(
   } finally { await handle?.close(); }
 }
 
+async function collapseAgedNamespaceMarkerTempLink(markerPath: string): Promise<boolean> {
+  let handle: FileHandle | null = null;
+  try {
+    handle = await open(markerPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 2
+      || Date.now() - opened.mtimeMs < PARTIAL_NAMESPACE_MARKER_STALE_MS) return false;
+    const prefix = `${basename(markerPath)}.tmp-`;
+    const matches: string[] = [];
+    for (const entry of await readdir(dirname(markerPath))) {
+      if (!entry.startsWith(prefix)) continue;
+      const candidate = join(dirname(markerPath), entry);
+      const value = await lstat(candidate);
+      if (value.isFile() && !value.isSymbolicLink() && value.dev === opened.dev && value.ino === opened.ino
+        && value.nlink === 2 && Date.now() - value.mtimeMs >= PARTIAL_NAMESPACE_MARKER_STALE_MS) matches.push(candidate);
+    }
+    if (matches.length !== 1) return false;
+    const visible = await lstat(markerPath);
+    if (visible.dev !== opened.dev || visible.ino !== opened.ino || visible.nlink !== 2) return false;
+    await unlink(matches[0]);
+    return true;
+  } catch {
+    return false;
+  } finally { await handle?.close(); }
+}
+
 async function pinCanonicalStateLockNamespace(namespacePath: string): Promise<PinnedLockNamespace> {
   const markerPath = `${namespacePath}.identity.json`;
   try { await mkdir(namespacePath, { mode: 0o700 }); }
@@ -379,7 +405,11 @@ async function pinCanonicalStateLockNamespace(namespacePath: string): Promise<Pi
   let recorded: { dev: number; ino: number } | null = null;
   try { recorded = await readPinnedNamespaceMarker(markerPath); }
   catch {
-    if (!await recoverPartialNamespaceMarker(markerPath, namespacePath, identity)) throw new Error('canonical mode binding lease namespace marker malformed');
+    if (await collapseAgedNamespaceMarkerTempLink(markerPath)) {
+      recorded = await readPinnedNamespaceMarker(markerPath);
+    } else if (!await recoverPartialNamespaceMarker(markerPath, namespacePath, identity)) {
+      throw new Error('canonical mode binding lease namespace marker malformed');
+    }
   }
   if (!recorded) {
     try {

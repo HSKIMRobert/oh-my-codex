@@ -145,7 +145,13 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
       const existing = sessionId
         ? await readModeStateForExplicitSession('ralplan', sessionId, cwd)
         : await readModeState('ralplan', cwd);
-      if (!(existing?.active === true && existing.workflow_variant === 'advisory')) {
+      const advisoryProjection = sessionId ? await readCurrentRalplanAdvisory(cwd, sessionId) : null;
+      const unfinishedAdvisory = Boolean(advisoryProjection?.activation && (
+        !advisoryProjection.fence
+        || ['pending_closeout', 'recovery_required'].includes(advisoryProjection.fence.state)
+        || advisoryProjection.journal?.phase === 'prepared'
+      ));
+      if (!(existing?.active === true && existing.workflow_variant === 'advisory') && !unfinishedAdvisory) {
         await startMode('ralplan', task.trim(), 5, cwd, sessionId);
       }
     }

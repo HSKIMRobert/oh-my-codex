@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startMode } from '../../modes/base.js';
@@ -183,6 +183,11 @@ describe('canonical mode binding lease', () => {
     await utimes(markerPath, stale, stale);
     await withStateFileWriteTransaction(path, async () => undefined);
     assert.deepEqual(Object.keys(JSON.parse(await readFile(markerPath, 'utf8'))).sort(), ['dev', 'ino']);
+    const tempResidue = `${markerPath}.tmp-${process.pid}-residue`;
+    await link(markerPath, tempResidue);
+    await utimes(markerPath, stale, stale);
+    await withStateFileWriteTransaction(path, async () => undefined);
+    assert.equal(existsSync(tempResidue), false);
   });
 
   it('rejects a lock-directory symlink swap without dereferencing or deleting the external owner', async () => {
