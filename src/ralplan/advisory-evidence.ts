@@ -361,6 +361,23 @@ export interface AdvisoryReviewLifecycle {
   host_verified: false;
 }
 
+export interface AdvisoryArtifactBaselines {
+  planManifestSha256: string;
+  architectArtifactManifestSha256: string;
+  criticArtifactManifestSha256: string;
+}
+
+function assertAdvisoryArtifactBaselines(
+  expected: AdvisoryArtifactBaselines,
+  current: AdvisoryArtifactBaselines,
+): void {
+  if (current.planManifestSha256 !== expected.planManifestSha256
+    || current.architectArtifactManifestSha256 !== expected.architectArtifactManifestSha256
+    || current.criticArtifactManifestSha256 !== expected.criticArtifactManifestSha256) {
+    throw new Error('ralplan_advisory_review_artifact_baseline_mismatch');
+  }
+}
+
 export async function projectAdvisoryReviewLifecycle(input: {
   cwd: string;
   sessionId: string;
@@ -372,6 +389,7 @@ export async function projectAdvisoryReviewLifecycle(input: {
   planPaths: readonly string[];
   architect: { threadId: string; artifactPath: string; verdict: string; sessionId?: string };
   critic: { threadId: string; artifactPath: string; verdict: string; sessionId?: string };
+  artifactBaselines?: AdvisoryArtifactBaselines;
 }): Promise<AdvisoryReviewLifecycle> {
   if (input.architect.verdict !== 'approve' || input.critic.verdict !== 'approve') {
     throw new Error('ralplan_advisory_reviews_not_approved');
@@ -417,6 +435,13 @@ export async function projectAdvisoryReviewLifecycle(input: {
     digestAdvisoryArtifacts(input.cwd, [input.architect.artifactPath]),
     digestAdvisoryArtifacts(input.cwd, [input.critic.artifactPath]),
   ]);
+  if (input.artifactBaselines) {
+    assertAdvisoryArtifactBaselines(input.artifactBaselines, {
+      planManifestSha256: planManifest.sha256,
+      architectArtifactManifestSha256: architectManifest.sha256,
+      criticArtifactManifestSha256: criticManifest.sha256,
+    });
+  }
   const evidencePaths = [
     ...planManifest.entries.map((entry) => entry.path),
     architectManifest.entries[0]!.path,

@@ -60,11 +60,13 @@ export type RalplanRuntimeLifecycle = RuntimeLifecycleBase;
 const hooks: {
   reconcile?: (cwd: string, sessionId: string) => Promise<AdvisoryProjection | null>;
   readBinding?: (cwd: string, sessionId: string) => Promise<Binding>;
+  beforeProjectLifecycle?: () => void | Promise<void>;
 } = {};
 
-export function __setRalplanAdvisoryRecoveryHooksForTests(next: typeof hooks): void {
+export function __setRalplanAdvisoryLifecycleHooksForTests(next: typeof hooks): void {
   hooks.reconcile = next.reconcile;
   hooks.readBinding = next.readBinding;
+  hooks.beforeProjectLifecycle = next.beforeProjectLifecycle;
 }
 
 function required(value: string | undefined, name: string): string {
@@ -320,6 +322,7 @@ class AdvisoryLifecycleHandler implements RuntimeLifecycleBase {
     architectReview: RalplanReviewResult;
     criticReview: RalplanReviewResult;
   }): Promise<AdvisoryReviewLifecycle> {
+    await hooks.beforeProjectLifecycle?.();
     const current = await readCurrentRalplanAdvisory(this.cwd, this.sessionId);
     if (!current?.activation || current.activation.generation_id !== this.generationId) {
       throw new Error('ralplan_advisory_activation_projection_unavailable');
@@ -333,6 +336,20 @@ class AdvisoryLifecycleHandler implements RuntimeLifecycleBase {
       rootThreadId: this.rootThreadId,
       iteration: input.iteration,
       planPaths: [requiredValue(input.latestPlanPath, 'plan_path')],
+      artifactBaselines: {
+        planManifestSha256: requiredValue(
+          input.drafts.find((draft) => draft.review_iteration === input.iteration)?.advisory_plan_manifest_sha256,
+          'plan_artifact_baseline',
+        ),
+        architectArtifactManifestSha256: requiredValue(
+          input.architectReview.advisory_artifact_manifest_sha256,
+          'architect_artifact_baseline',
+        ),
+        criticArtifactManifestSha256: requiredValue(
+          input.criticReview.advisory_artifact_manifest_sha256,
+          'critic_artifact_baseline',
+        ),
+      },
       architect: {
         threadId: required(input.architectReview.thread_id, 'architect_thread_id'),
         artifactPath: requiredValue(input.architectReview.artifact_path, 'architect_artifact_path'),

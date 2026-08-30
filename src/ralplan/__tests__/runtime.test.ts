@@ -11,7 +11,7 @@ import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { cancelRalplanConsensus, isCompletedAdvisoryCatchRecovery, runRalplanConsensus } from '../runtime.js';
 import { readCurrentRalplanAdvisory } from '../advisory.js';
 import {
-  __setRalplanAdvisoryRecoveryHooksForTests,
+  __setRalplanAdvisoryLifecycleHooksForTests,
   verifyAdvisoryCatchRecovery,
 } from '../runtime-advisory-lifecycle.js';
 
@@ -123,6 +123,43 @@ async function writeAdaptedSubagentTracking(cwd: string, sessionId: string): Pro
   });
 }
 
+async function runApprovedAdvisoryFixture(
+  cwd: string,
+  sessionId: string,
+  duringCriticReview?: () => void | Promise<void>,
+) {
+  await writeSessionPointer(cwd, sessionId);
+  await writeNativeSubagentTracking(cwd, sessionId, true);
+  await mkdir(join(cwd, '.omx', 'artifacts'), { recursive: true });
+  await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'APPROVE\n');
+  await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'APPROVE\n');
+  return runRalplanConsensus({
+    async draft() {
+      await mkdir(join(cwd, '.omx', 'plans'), { recursive: true });
+      const planPath = join(cwd, '.omx', 'plans', 'advisory.md');
+      await writeFile(planPath, '# approved plan\n');
+      return { planPath, summary: 'draft' };
+    },
+    async architectReview() {
+      return {
+        verdict: 'approve' as const, agent_role: 'architect' as const, provenance_kind: 'native_subagent' as const,
+        session_id: sessionId, thread_id: 'thread-architect', artifact_path: '.omx/artifacts/architect.md',
+      };
+    },
+    async criticReview() {
+      await duringCriticReview?.();
+      return {
+        verdict: 'approve' as const, agent_role: 'critic' as const, provenance_kind: 'native_subagent' as const,
+        session_id: sessionId, thread_id: 'thread-critic', artifact_path: '.omx/artifacts/critic.md',
+      };
+    },
+  }, {
+    task: 'produce advisory only', cwd, sessionId, maxIterations: 1, requireNativeSubagents: true,
+    workflowVariant: 'advisory', advisoryProducer: 'native', advisoryThreadKind: 'root-or-drift',
+    rootThreadId: 'thread-leader', activationTurnId: 'turn-a', closingTurnId: 'turn-a',
+  });
+}
+
 describe('ralplan runtime', () => {
   let savedOmxEnv: Pick<NodeJS.ProcessEnv, 'OMX_ROOT' | 'OMX_STATE_ROOT' | 'OMX_TEAM_STATE_ROOT' | 'OMX_SESSION_ID'>;
 
@@ -140,7 +177,7 @@ describe('ralplan runtime', () => {
   });
 
   afterEach(() => {
-    __setRalplanAdvisoryRecoveryHooksForTests({});
+    __setRalplanAdvisoryLifecycleHooksForTests({});
     for (const key of ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const) {
       const value = savedOmxEnv[key];
       if (value === undefined) delete process.env[key];
@@ -151,7 +188,7 @@ describe('ralplan runtime', () => {
   it('preserves the primary failure when Advisory reconciliation verification throws', async () => {
     const primary = new Error('primary');
     const recovery = new Error('reconcile failed');
-    __setRalplanAdvisoryRecoveryHooksForTests({ reconcile: async () => { throw recovery; } });
+    __setRalplanAdvisoryLifecycleHooksForTests({ reconcile: async () => { throw recovery; } });
     await assert.rejects(
       verifyAdvisoryCatchRecovery({ cwd: '/tmp', sessionId: 'session-a', generationId: 'generation-a', primaryError: primary }),
       (error: unknown) => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === recovery,
@@ -161,7 +198,7 @@ describe('ralplan runtime', () => {
   it('preserves the primary failure when Advisory binding verification throws', async () => {
     const primary = new Error('primary');
     const bindingError = new Error('binding read failed');
-    __setRalplanAdvisoryRecoveryHooksForTests({
+    __setRalplanAdvisoryLifecycleHooksForTests({
       reconcile: async () => ({ corruption: null, fence: { state: 'closed' }, journal: { outcome: 'approved' } } as never),
       readBinding: async () => { throw bindingError; },
     });
@@ -173,12 +210,12 @@ describe('ralplan runtime', () => {
 
   it('distinguishes valid approved catch recovery from explicit absence', async () => {
     const input = { cwd: '/tmp', sessionId: 'session-a', generationId: 'generation-a', primaryError: new Error('primary') };
-    __setRalplanAdvisoryRecoveryHooksForTests({
+    __setRalplanAdvisoryLifecycleHooksForTests({
       reconcile: async () => ({ corruption: null, fence: { state: 'closed' }, journal: { outcome: 'approved' } } as never),
       readBinding: async () => ({ mode: 'ralplan', session_id: 'session-a', workflow_variant: 'advisory', advisory_generation_id: 'generation-a', active: false }),
     });
     assert.equal(await verifyAdvisoryCatchRecovery(input), true);
-    __setRalplanAdvisoryRecoveryHooksForTests({ reconcile: async () => null, readBinding: async () => null });
+    __setRalplanAdvisoryLifecycleHooksForTests({ reconcile: async () => null, readBinding: async () => null });
     assert.equal(await verifyAdvisoryCatchRecovery(input), false);
   });
 
@@ -501,6 +538,49 @@ describe('ralplan advisory runtime', () => {
       assert.equal(state.execution_handoff_authorized, false);
       assert.equal(state.status_message, 'Status: advisory complete — local review lifecycle approved; control returned to the caller without an automatic execution handoff. Later user instructions follow normal host rules.');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when the Architect artifact changes after Architect review', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-architect-baseline-'));
+    const sessionId = 'sess-advisory-architect-baseline';
+    try {
+      const result = await runApprovedAdvisoryFixture(cwd, sessionId, async () => {
+        await writeFile(join(cwd, '.omx', 'artifacts', 'architect.md'), 'MUTATED\n');
+      });
+      assert.equal(result.status, 'failed');
+      assert.match(result.error ?? '', /review_artifact_baseline_mismatch/);
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.notEqual(projection?.journal?.outcome, 'approved');
+      assert.equal(projection?.journal?.integrity_status, 'proven');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closeout revalidation when the Critic artifact changes after lifecycle projection', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-advisory-critic-baseline-'));
+    const sessionId = 'sess-advisory-critic-baseline';
+    let projections = 0;
+    try {
+      __setRalplanAdvisoryLifecycleHooksForTests({
+        beforeProjectLifecycle: async () => {
+          projections += 1;
+          if (projections === 2) {
+            await writeFile(join(cwd, '.omx', 'artifacts', 'critic.md'), 'MUTATED\n');
+          }
+        },
+      });
+      await assert.rejects(
+        runApprovedAdvisoryFixture(cwd, sessionId),
+        /closeout_binding_mismatch/,
+      );
+      const projection = await readCurrentRalplanAdvisory(cwd, sessionId);
+      assert.notEqual(projection?.fence?.state, 'closed');
+      assert.notEqual(projection?.journal?.integrity_status, 'proven');
+    } finally {
+      __setRalplanAdvisoryLifecycleHooksForTests({});
       await rm(cwd, { recursive: true, force: true });
     }
   });
