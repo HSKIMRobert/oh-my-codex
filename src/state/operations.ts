@@ -70,6 +70,7 @@ import {
   type PinnedDirectoryIdentity,
   type PinnedFileSnapshot,
 } from './pinned-file.js';
+import { readProcessStartIdentity } from './process-identity.js';
 export const SUPPORTED_STATE_READ_MODES = [
   'autopilot',
   'autoresearch',
@@ -215,6 +216,19 @@ interface StateFileLockLease {
 
 const INCOMPLETE_STATE_WRITE_LOCK_STALE_MS = 30_000;
 
+async function stateLockOwnerIsLive(owner: Record<string, unknown>, pid: number): Promise<boolean> {
+  const recorded = typeof owner.process_start_identity === 'string' ? owner.process_start_identity : null;
+  const current = await readProcessStartIdentity(pid);
+  if (recorded && current) return recorded === current;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
 async function reclaimStateFileWriteLock(
   lockPath: string,
   parent: PinnedDirectoryIdentity,
@@ -236,9 +250,10 @@ async function acquireStateFileWriteLock(path: string): Promise<StateFileLockLea
   const lockPath = `${path}.write-lock`;
   await mkdir(dirname(path), { recursive: true });
   const parent = await snapshotPinnedParent(lockPath);
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      await createPinnedFileExclusive(lockPath, `${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`, parent);
+      await createPinnedFileExclusive(lockPath, `${JSON.stringify({ schema_version: 1, pid: process.pid, process_start_identity: processStartIdentity })}\n`, parent);
       const snapshot = await snapshotPinnedFile(lockPath);
       if (!snapshot) throw new Error('state_file_write_lock_missing');
       return { lockPath, snapshot, parent };
@@ -263,12 +278,7 @@ async function acquireStateFileWriteLock(path: string): Promise<StateFileLockLea
         continue;
       }
       if (attempt > 0) throw new Error('state_file_write_lock_held');
-      try {
-        process.kill(pid, 0);
-        throw new Error('state_file_write_lock_held');
-      } catch (probeError) {
-        if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
-      }
+      if (await stateLockOwnerIsLive(owner!, pid)) throw new Error('state_file_write_lock_held');
       if (!await reclaimStateFileWriteLock(lockPath, parent, 0)) throw new Error('state_file_write_lock_held');
     }
   }

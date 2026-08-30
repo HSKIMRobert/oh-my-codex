@@ -1149,6 +1149,22 @@ describe('ralplan advisory fence and journal', () => {
     assert.equal(existsSync(lockPath), false);
     assert.equal(existsSync(guardPath), false);
   });
+
+  it('reclaims a lock whose PID was reused by a different process start', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-reused-pid-lock-'));
+    roots.push(cwd);
+    const sessionId = 'session-a';
+    const root = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory');
+    await mkdir(root, { recursive: true });
+    const lockPath = join(root, 'current.lock');
+    await writeFile(lockPath, `${JSON.stringify({
+      schema_version: 1,
+      pid: process.pid,
+      process_start_identity: 'linux:stale-reused-pid',
+    })}\n`);
+    await withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => undefined);
+    assert.equal(existsSync(lockPath), false);
+  });
 });
 
 describe('ralplan advisory routing classifier', () => {

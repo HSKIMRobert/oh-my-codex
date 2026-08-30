@@ -12,6 +12,7 @@ import {
   snapshotPinnedParent,
   type PinnedDirectoryIdentity,
 } from '../state/pinned-file.js';
+import { readProcessStartIdentity } from '../state/process-identity.js';
 import { projectAdvisoryReviewLifecycle, type AdvisoryReviewLifecycle } from './advisory-evidence.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
 
@@ -370,6 +371,19 @@ async function canonicalCwd(cwd: string): Promise<string> {
 
 const INCOMPLETE_ADVISORY_LOCK_STALE_MS = 30_000;
 
+async function advisoryLockOwnerIsLive(owner: Record<string, unknown>, pid: number): Promise<boolean> {
+  const recorded = typeof owner.process_start_identity === 'string' ? owner.process_start_identity : null;
+  const current = await readProcessStartIdentity(pid);
+  if (recorded && current) return recorded === current;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
 async function reclaimAdvisoryLockByIdentity(
   lockPath: string,
   minimumAgeMs: number,
@@ -377,9 +391,10 @@ async function reclaimAdvisoryLockByIdentity(
   const reclaimPath = `${lockPath}.reclaim`;
   const parent = await snapshotPinnedParent(lockPath);
   let reclaimLease: NonNullable<Awaited<ReturnType<typeof snapshotPinnedFile>>> | null = null;
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      await createPinnedFileExclusive(reclaimPath, `${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`, parent);
+      await createPinnedFileExclusive(reclaimPath, `${JSON.stringify({ schema_version: 1, pid: process.pid, process_start_identity: processStartIdentity })}\n`, parent);
       reclaimLease = await snapshotPinnedFile(reclaimPath);
       break;
     } catch (error) {
@@ -391,12 +406,7 @@ async function reclaimAdvisoryLockByIdentity(
         ? Number(owner.pid)
         : null;
       if (pid !== null) {
-        try {
-          process.kill(pid, 0);
-          return false;
-        } catch (probeError) {
-          if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') return false;
-        }
+        if (await advisoryLockOwnerIsLive(owner!, pid)) return false;
       } else if (Date.now() - guard.mtimeMs < INCOMPLETE_ADVISORY_LOCK_STALE_MS) {
         return false;
       }
@@ -438,11 +448,12 @@ interface AdvisoryLockLease {
 
 async function acquireAdvisoryLock(lockPath: string, heldError: string): Promise<AdvisoryLockLease> {
   const parent = await snapshotPinnedParent(lockPath);
+  const processStartIdentity = await readProcessStartIdentity(process.pid);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await createPinnedFileExclusive(
         lockPath,
-        `${JSON.stringify({ schema_version: 1, pid: process.pid, created_at: new Date().toISOString() })}\n`,
+        `${JSON.stringify({ schema_version: 1, pid: process.pid, process_start_identity: processStartIdentity, created_at: new Date().toISOString() })}\n`,
         parent,
       );
       const snapshot = await snapshotPinnedFile(lockPath);
@@ -460,12 +471,7 @@ async function acquireAdvisoryLock(lockPath: string, heldError: string): Promise
         continue;
       }
       if (attempt > 0) throw new Error(heldError);
-      try {
-        process.kill(pid, 0);
-        throw new Error(heldError);
-      } catch (probeError) {
-        if ((probeError as NodeJS.ErrnoException).code !== 'ESRCH') throw probeError;
-      }
+      if (await advisoryLockOwnerIsLive(owner!, pid)) throw new Error(heldError);
       if (!await reclaimAdvisoryLockByIdentity(lockPath, 0)) throw new Error(heldError);
       await syncDirectory(dirname(lockPath));
     }

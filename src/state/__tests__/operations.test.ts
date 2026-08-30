@@ -34,6 +34,13 @@ describe('state write-lock crash recovery', () => {
       await withStateFileWriteLock(path, async () => { entered = true; });
       assert.equal(entered, true);
       assert.equal(existsSync(lockPath), false);
+      await writeFile(lockPath, `${JSON.stringify({
+        schema_version: 1,
+        pid: process.pid,
+        process_start_identity: 'linux:stale-reused-pid',
+      })}\n`);
+      await withStateFileWriteLock(path, async () => undefined);
+      assert.equal(existsSync(lockPath), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
