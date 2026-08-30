@@ -21,6 +21,7 @@ import {
   observeRalplanAdvisoryPrompt,
   terminalizeRalplanAdvisory,
   validateAdvisoryInactiveState,
+  withRalplanAdvisoryCurrentLock,
 } from '../advisory.js';
 import { updateModeState } from '../../modes/base.js';
 import { executeStateOperation } from '../../state/operations.js';
@@ -1035,6 +1036,35 @@ describe('ralplan advisory fence and journal', () => {
       revalidateEvidence: async () => lifecycle.evidence_bundle_sha256,
     });
     assert.equal(closed.fence?.state, 'closed');
+  });
+
+  it('serializes concurrent incomplete-lock reclaimers without deleting the winner', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-concurrent-lock-reclaim-'));
+    roots.push(cwd);
+    const sessionId = 'session-a';
+    const root = join(cwd, '.omx', 'state', 'sessions', sessionId, 'ralplan-advisory');
+    await mkdir(root, { recursive: true });
+    const lockPath = join(root, 'current.lock');
+    await writeFile(lockPath, '');
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(lockPath, stale, stale);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const winner = withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => {
+      entered();
+      await held;
+    });
+    await enteredPromise;
+    await assert.rejects(
+      withRalplanAdvisoryCurrentLock(cwd, sessionId, async () => undefined),
+      /current_lock_held/,
+    );
+    assert.equal(existsSync(lockPath), true);
+    release();
+    await winner;
+    assert.equal(existsSync(lockPath), false);
   });
 });
 

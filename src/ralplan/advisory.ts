@@ -362,30 +362,56 @@ async function canonicalCwd(cwd: string): Promise<string> {
 const INCOMPLETE_ADVISORY_LOCK_STALE_MS = 30_000;
 
 async function reclaimIncompleteAdvisoryLock(lockPath: string): Promise<boolean> {
-  let handle: Awaited<ReturnType<typeof open>>;
+  const reclaimPath = `${lockPath}.reclaim`;
+  let reclaim: Awaited<ReturnType<typeof open>>;
   try {
-    handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    reclaim = await open(reclaimPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    await reclaim.writeFile(`${JSON.stringify({ schema_version: 1, pid: process.pid })}\n`);
+    await reclaim.sync();
   } catch {
     return false;
   }
   try {
-    const opened = await handle.stat();
-    const before = await lstat(lockPath);
-    if (!opened.isFile() || opened.nlink !== 1 || !before.isFile() || before.isSymbolicLink()
-      || before.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino
-      || Date.now() - before.mtimeMs < INCOMPLETE_ADVISORY_LOCK_STALE_MS) {
+    let expectedIdentity: { dev: number; ino: number } | null = null;
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(lockPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch {
       return false;
     }
-    const after = await lstat(lockPath);
-    if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs
-      || after.size !== before.size) {
+    try {
+      const opened = await handle.stat();
+      const before = await lstat(lockPath);
+      if (!opened.isFile() || opened.nlink !== 1 || !before.isFile() || before.isSymbolicLink()
+        || before.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino
+        || Date.now() - before.mtimeMs < INCOMPLETE_ADVISORY_LOCK_STALE_MS) {
+        return false;
+      }
+      const after = await lstat(lockPath);
+      if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs
+        || after.size !== before.size) {
+        return false;
+      }
+      expectedIdentity = { dev: before.dev, ino: before.ino };
+    } finally {
+      await handle.close();
+    }
+    const quarantinePath = `${lockPath}.stale-${process.pid}-${Date.now()}-${randomUUID()}`;
+    try {
+      await rename(lockPath, quarantinePath);
+      const quarantined = await lstat(quarantinePath);
+      const reclaimable = quarantined.isFile() && !quarantined.isSymbolicLink()
+        && quarantined.dev === expectedIdentity?.dev && quarantined.ino === expectedIdentity?.ino;
+      await rm(quarantinePath, { force: true });
+      return reclaimable;
+    } catch {
+      await rm(quarantinePath, { force: true }).catch(() => {});
       return false;
     }
   } finally {
-    await handle.close();
+    await reclaim.close().catch(() => {});
+    await rm(reclaimPath, { force: true });
   }
-  await rm(lockPath, { force: false });
-  return true;
 }
 
 async function acquireAdvisoryLock(lockPath: string, directory: string, heldError: string): Promise<Awaited<ReturnType<typeof open>>> {

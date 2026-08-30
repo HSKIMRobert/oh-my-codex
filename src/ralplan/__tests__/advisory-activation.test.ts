@@ -356,6 +356,28 @@ describe('central Ralplan Advisory activation owner', () => {
     assert.equal(existsSync(join(outside, 'ralplan-advisory')), false);
   });
 
+  it('rejects symlinked .omx and sessions ancestors before recursive creation', async () => {
+    for (const ancestor of ['omx', 'sessions'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-advisory-activation-${ancestor}-ancestor-`));
+      roots.push(cwd);
+      const outside = await mkdtemp(join(tmpdir(), `omx-advisory-activation-${ancestor}-target-`));
+      roots.push(outside);
+      if (ancestor === 'omx') {
+        await symlink(outside, join(cwd, '.omx'));
+      } else {
+        await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+        await symlink(outside, join(cwd, '.omx', 'state', 'sessions'));
+      }
+
+      await assert.rejects(activateOrResumeRalplanAdvisory({
+        cwd, sessionId: 'session-a', rootThreadId: 'root-a', activationTurnId: 'turn-a',
+        prompt: `$ralplan --advisory unsafe ${ancestor} ancestor`, generationId: `generation-${ancestor}`,
+      }), /state_authority_unsafe/);
+      assert.equal(existsSync(join(outside, 'state', 'sessions', 'session-a', 'ralplan-advisory')), false);
+      assert.equal(existsSync(join(outside, 'session-a', 'ralplan-advisory')), false);
+    }
+  });
+
   it('keeps fast repair atomic when a Standard writer wins immediately after the mirror transaction', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-advisory-activation-fast-repair-race-'));
     roots.push(cwd);

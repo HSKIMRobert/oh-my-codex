@@ -17,6 +17,22 @@ import {
 } from './advisory.js';
 import { describeAdvisoryActivationProjections, verifyPinnedJsonAndSync } from './advisory-activation-verifier.js';
 
+async function ensureOwnedDirectory(path: string): Promise<void> {
+  try {
+    const identity = await lstat(path);
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+      throw new Error('ralplan_advisory_activation_state_authority_unsafe');
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    await mkdir(path);
+    const identity = await lstat(path);
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+      throw new Error('ralplan_advisory_activation_state_authority_unsafe');
+    }
+  }
+}
+
 export type AdvisoryActivationCheckpoint =
   | 'after_intent'
   | 'after_mode'
@@ -160,15 +176,18 @@ export async function activateOrResumeRalplanAdvisory(
   }
   const authorityStateDir = getBaseStateDir(input.cwd);
   const authoritySessionDir = join(authorityStateDir, 'sessions', input.sessionId);
-  await mkdir(authoritySessionDir, { recursive: true });
-  const [stateIdentity, sessionIdentity] = await Promise.all([
-    lstat(authorityStateDir),
-    lstat(authoritySessionDir),
-  ]);
-  if (!stateIdentity.isDirectory() || stateIdentity.isSymbolicLink()
-    || !sessionIdentity.isDirectory() || sessionIdentity.isSymbolicLink()) {
-    throw new Error('ralplan_advisory_activation_state_authority_unsafe');
+  const projectStateDir = join(input.cwd, '.omx', 'state');
+  if (authorityStateDir === projectStateDir) {
+    const omxDir = join(input.cwd, '.omx');
+    await ensureOwnedDirectory(omxDir);
+    await ensureOwnedDirectory(authorityStateDir);
+  } else {
+    await mkdir(authorityStateDir, { recursive: true });
+    await ensureOwnedDirectory(authorityStateDir);
   }
+  const sessionsDir = join(authorityStateDir, 'sessions');
+  await ensureOwnedDirectory(sessionsDir);
+  await ensureOwnedDirectory(authoritySessionDir);
   const authority = {
     cwd: input.cwd, sessionId: input.sessionId, producer: input.producer, threadKind: input.threadKind,
     rootThreadId: input.rootThreadId, activationTurnId: input.activationTurnId, prompt: input.prompt,
