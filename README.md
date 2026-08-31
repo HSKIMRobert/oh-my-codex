@@ -496,6 +496,7 @@ If this happens, try:
 - [Ελληνικά](./docs/readme/README.el.md)
 - [Polski](./docs/readme/README.pl.md)
 - [Українська](./docs/readme/README.uk.md)
+- [Bahasa Indonesia](./docs/readme/README.id.md)
 
 ## Contributors
 
