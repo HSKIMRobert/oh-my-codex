@@ -6,6 +6,7 @@ import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.j
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import { pickPrimaryWorkflowMode } from './workflow-transition.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
+import { pinAtomicFile } from './pinned-atomic-file.js';
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = `${SKILL_ACTIVE_STATE_MODE}-state.json`;
@@ -15,7 +16,7 @@ const ROOT_SKILL_ACTIVE_LOCK_RETRY_MS = 10;
 const ROOT_SKILL_ACTIVE_LOCK_STALE_MS = 10_000;
 
 export class SkillActiveStateWriteError extends Error {
-  readonly code: 'lock-timeout' | 'lock-lost' | 'malformed-root' | 'atomic-replace-failed';
+  readonly code: 'lock-timeout' | 'lock-lost' | 'malformed-root' | 'malformed-session' | 'atomic-replace-failed';
 
   constructor(code: SkillActiveStateWriteError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -48,6 +49,8 @@ export interface SkillActiveEntry {
   thread_id?: string;
   turn_id?: string;
   owner_codex_session_id?: string;
+  workflow_variant?: 'advisory';
+  advisory_generation_id?: string;
 }
 
 export interface SkillActiveStateLike {
@@ -262,12 +265,31 @@ export function isTransitionCanonicalStateOwned(raw: unknown, sessionId?: string
 
 export function listTransitionActiveSkills(raw: unknown, sessionId?: string): SkillActiveEntry[] {
   if (!isTransitionCanonicalStateOwned(raw, sessionId)) return [];
-  const entries = listActiveSkills(raw);
+  const advisoryRalplan = safeString((raw as SkillActiveStateLike).workflow_variant).trim() === 'advisory';
+  const entries = listActiveSkills(raw).filter((entry) => !(entry.skill === 'ralplan'
+    && (advisoryRalplan || entry.workflow_variant === 'advisory')));
   const normalizedSessionId = safeString(sessionId).trim();
   if (normalizedSessionId) {
     return entries.filter((entry) => safeString(entry.session_id).trim() === normalizedSessionId);
   }
   return entries.filter((entry) => safeString(entry.session_id).trim().length === 0);
+}
+
+/** Merge one authenticated session projection without replacing foreign-session root entries. */
+export function mergeRootSkillStateForExactSession(
+  currentRoot: SkillActiveStateLike | null,
+  sessionState: SkillActiveStateLike,
+  sessionId: string,
+): SkillActiveStateLike {
+  const normalizedSessionId = safeString(sessionId).trim();
+  const currentEntries = listActiveSkills(currentRoot ?? {});
+  const incomingEntries = listActiveSkills(sessionState)
+    .filter((entry) => entryMatchesSessionOrOwner(entry, normalizedSessionId));
+  const mergedEntries = [
+    ...currentEntries.filter((entry) => !entryMatchesSessionOrOwner(entry, normalizedSessionId)),
+    ...incomingEntries,
+  ];
+  return stateWithActiveEntries(currentRoot ?? sessionState, mergedEntries, sessionState.skill || 'skill-active');
 }
 
 /**
@@ -278,10 +300,18 @@ export function listTransitionActiveSkills(raw: unknown, sessionId?: string): Sk
  *     normalized session id (unscoped root entry owned by the session).
  * This prevents stale root-scoped entries from surviving a mode clear (#3451-A).
  */
+export function skillActiveOwnershipMatchesExactSession(
+  value: Pick<SkillActiveStateLike, 'session_id' | 'owner_codex_session_id'>,
+  normalizedSessionId: string,
+): boolean {
+  const sessionId = safeString(value.session_id).trim();
+  if (sessionId === normalizedSessionId) return true;
+  return sessionId.length === 0
+    && safeString(value.owner_codex_session_id).trim() === normalizedSessionId;
+}
+
 function entryMatchesSessionOrOwner(entry: SkillActiveEntry, normalizedSessionId: string): boolean {
-  if (safeString(entry.session_id).trim() === normalizedSessionId) return true;
-  return safeString(entry.session_id).trim().length === 0
-    && safeString(entry.owner_codex_session_id).trim() === normalizedSessionId;
+  return skillActiveOwnershipMatchesExactSession(entry, normalizedSessionId);
 }
 
 /** Owner metadata for read-only provenance preflight; never infers ownership from storage. */
@@ -706,6 +736,69 @@ export async function updateRootSkillActiveStateForStateDir(
     const nextRoot = update(currentRoot);
     if (nextRoot === null) return;
     await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+  });
+}
+
+export async function updateSkillActiveStateCopiesForExactSessionTransaction(
+  stateDir: string,
+  sessionId: string,
+  update: (
+    currentRoot: SkillActiveStateLike | null,
+    currentSession: SkillActiveStateLike | null,
+  ) => SkillActiveStateLike | Promise<SkillActiveStateLike>,
+  options: {
+    beforeCommit?: BeforeWritableCommit;
+    projectRoot?: (currentRoot: SkillActiveStateLike | null, nextSession: SkillActiveStateLike) => SkillActiveStateLike;
+  } = {},
+): Promise<SkillActiveStateLike> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  if (!sessionPath) throw new Error('skill-active exact-session transaction requires a session path');
+  return withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const pinnedSession = await pinAtomicFile(sessionPath);
+    try {
+      const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
+      const previousSession = pinnedSession.bytes;
+      const currentRoot = await readRootStateForWrite(rootPath);
+      let currentSession: SkillActiveStateLike | null = null;
+      if (previousSession !== null) {
+        try {
+          currentSession = normalizeSkillActiveState(JSON.parse(previousSession.toString('utf8')));
+        } catch (error) {
+          throw new SkillActiveStateWriteError(
+            'malformed-session', `malformed session skill-active state: ${sessionPath}`, { cause: error },
+          );
+        }
+        if (!currentSession) {
+          throw new SkillActiveStateWriteError('malformed-session', `invalid session skill-active state: ${sessionPath}`);
+        }
+      }
+      const nextSession = { version: 1, ...await update(currentRoot, currentSession) };
+      const nextRoot = options.projectRoot
+        ? options.projectRoot(currentRoot, nextSession)
+        : mergeRootStateForSession(currentRoot, nextSession, sessionId);
+      let sessionCommitted = false;
+      try {
+        await options.beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
+        await assertRootSkillActiveLockOwner(lock);
+        await pinnedSession.replace(Buffer.from(`${JSON.stringify(nextSession, null, 2)}\n`));
+        sessionCommitted = true;
+        await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+        return nextSession;
+      } catch (error) {
+        let rollbackError: unknown;
+        try {
+          await assertRootSkillActiveLockOwner(lock);
+          if (sessionCommitted) {
+            if (previousSession === null) await pinnedSession.remove();
+            else await pinnedSession.replace(previousSession);
+          }
+          await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
+        } catch (ownershipOrRestoreError) {
+          rollbackError = ownershipOrRestoreError;
+        }
+        throw rollbackError ?? error;
+      }
+    } finally { await pinnedSession.close(); }
   });
 }
 

@@ -30,8 +30,14 @@ import {
   getStateFilename,
   resolveWritableStateScope,
 } from '../mcp/state-paths.js';
-import { completeRalplanSession, writeStateFile } from '../state/operations.js';
+import { completeRalplanSession, outsideStateFileWriteTransaction, withStateFileWriteTransaction, writeStateFile } from '../state/operations.js';
 import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
+import {
+  readAuthorizedPendingRalplanActivation,
+  readCurrentRalplanAdvisory,
+  validateAdvisoryInactiveState,
+  validateAdvisoryPreparedInactiveWrite,
+} from '../ralplan/advisory.js';
 
 
 export interface ModeState {
@@ -50,6 +56,42 @@ export interface ModeState {
 }
 
 export type ModeName = 'autopilot' | 'autoresearch' | 'deep-interview' | 'ralph' | 'ultrawork' | 'team' | 'ultraqa' | 'ultragoal' | 'ralplan';
+
+/**
+ * Restricted startup profile for Ralplan Advisory. This is deliberately not a
+ * generic partial-state escape hatch: callers may only supply the identities
+ * required to publish the canonical, non-authoritative Advisory binding.
+ */
+export interface RalplanAdvisoryStartProfile {
+  kind: 'ralplan-advisory';
+  sessionId: string;
+  generationId: string;
+  rootThreadId: string;
+  activationTurnId: string;
+  activationPrompt: string;
+}
+
+async function assertRalplanAdvisoryStartBindingAllowed(
+  path: string,
+  profile: RalplanAdvisoryStartProfile,
+): Promise<void> {
+  if (!existsSync(path)) return;
+  let binding: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('invalid binding');
+    }
+    binding = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error('ralplan_advisory_start_binding_unreadable');
+  }
+  if (binding.active !== true) return;
+  const sameAdvisoryBinding = binding.workflow_variant === 'advisory'
+    && binding.session_id === profile.sessionId
+    && binding.advisory_generation_id === profile.generationId;
+  if (!sameAdvisoryBinding) throw new Error('ralplan_advisory_start_binding_conflict');
+}
 
 /** @deprecated These mode names were removed in v4.6. Use the canonical modes instead. */
 export type DeprecatedModeName = 'ultrapilot' | 'pipeline' | 'ecomode';
@@ -147,8 +189,43 @@ export async function startMode(
   maxIterations: number = 50,
   projectRoot?: string,
   explicitSessionId?: string,
+  startProfile?: RalplanAdvisoryStartProfile,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
+  const path = join(scope.stateDir, getStateFilename(mode));
+  return withStateFileWriteTransaction(path, () => startModeUnderCanonicalLock(
+    mode, taskDescription, maxIterations, projectRoot, explicitSessionId, startProfile,
+  ), getBaseStateDir(projectRoot));
+}
+
+async function startModeUnderCanonicalLock(
+  mode: ModeName,
+  taskDescription: string,
+  maxIterations: number,
+  projectRoot: string | undefined,
+  explicitSessionId: string | undefined,
+  startProfile: RalplanAdvisoryStartProfile | undefined,
+): Promise<ModeState> {
+  const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
+  const primaryStatePath = join(scope.stateDir, getStateFilename(mode));
+  if (startProfile) {
+    if (mode !== 'ralplan') throw new Error('ralplan_advisory_start_profile_mode_mismatch');
+    if (!scope.sessionId || scope.sessionId !== startProfile.sessionId || explicitSessionId !== startProfile.sessionId) {
+      throw new Error('ralplan_advisory_start_profile_session_mismatch');
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(startProfile.generationId)) {
+      throw new Error('ralplan_advisory_start_profile_generation_invalid');
+    }
+    const pending = await readAuthorizedPendingRalplanActivation({
+      cwd: projectRoot ?? process.cwd(), sessionId: startProfile.sessionId,
+      producer: 'native', threadKind: 'root-or-drift', rootThreadId: startProfile.rootThreadId,
+      activationTurnId: startProfile.activationTurnId, prompt: startProfile.activationPrompt,
+    });
+    if (!pending || pending.generation_id !== startProfile.generationId) {
+      throw new Error('ralplan_advisory_start_profile_intent_mismatch');
+    }
+    await assertRalplanAdvisoryStartBindingAllowed(primaryStatePath, startProfile);
+  }
   const dir = stateDir(projectRoot);
   await mkdir(dir, { recursive: true });
 
@@ -161,7 +238,7 @@ export async function startMode(
     baseStateDir,
   });
   let transitionMessage: string | undefined;
-  if (isTrackedWorkflowMode(mode)) {
+  if (isTrackedWorkflowMode(mode) && !startProfile) {
     const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
       action: 'start',
       sessionId: scope.sessionId,
@@ -183,13 +260,32 @@ export async function startMode(
     started_at: new Date().toISOString(),
     ...(transitionMessage ? { transition_message: transitionMessage } : {}),
     ...(mode === 'ralph' && scope.sessionId ? { owner_omx_session_id: scope.sessionId } : {}),
+    ...(startProfile ? {
+      session_id: startProfile.sessionId,
+      workflow_variant: 'advisory',
+      advisory_generation_id: startProfile.generationId,
+      planning_complete: false,
+      execution_handoff_authorized: false,
+      host_verified: false,
+    } : {}),
   };
 
   const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
   const state = normalizeModeStateOrThrow(mode, withContext);
   const payload = JSON.stringify(state, null, 2);
-  const path = join(scope.stateDir, getStateFilename(mode));
+  const path = primaryStatePath;
   await beforeCommit({ site: 'mode.primary', kind: 'write', path });
+  if (startProfile) {
+    const pending = await readAuthorizedPendingRalplanActivation({
+      cwd: projectRoot ?? process.cwd(), sessionId: startProfile.sessionId,
+      producer: 'native', threadKind: 'root-or-drift', rootThreadId: startProfile.rootThreadId,
+      activationTurnId: startProfile.activationTurnId, prompt: startProfile.activationPrompt,
+    });
+    if (!pending || pending.generation_id !== startProfile.generationId) {
+      throw new Error('ralplan_advisory_start_profile_intent_changed');
+    }
+    await assertRalplanAdvisoryStartBindingAllowed(path, startProfile);
+  }
   await writeStateFile(path, payload);
   await syncRunStateFromModeState(state, projectRoot, scope.sessionId, {
     beforeCommit,
@@ -298,8 +394,9 @@ export async function updateModeState(
   updates: Partial<ModeState>,
   projectRoot?: string,
   explicitSessionId?: string,
+  externalBeforeCommit?: (site: string) => void | Promise<void>,
 ): Promise<ModeState> {
-  return updateModeStateInternal(mode, updates, projectRoot, explicitSessionId, false);
+  return updateModeStateInternal(mode, updates, projectRoot, explicitSessionId, false, externalBeforeCommit);
 }
 
 /** Persists Autopilot pipeline bookkeeping while enforcing the ralplan-to-ultragoal gate. */
@@ -317,16 +414,38 @@ async function updateModeStateInternal(
   projectRoot: string | undefined,
   explicitSessionId: string | undefined,
   pipelineProgressWrite: boolean,
+  externalBeforeCommit?: (site: string) => void | Promise<void>,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
+  const path = join(scope.stateDir, getStateFilename(mode));
+  return withStateFileWriteTransaction(path, () => updateModeStateUnderCanonicalLock(
+    mode, updates, projectRoot, explicitSessionId, pipelineProgressWrite, externalBeforeCommit, scope,
+  ), getBaseStateDir(projectRoot));
+}
+
+async function updateModeStateUnderCanonicalLock(
+  mode: string,
+  updates: Partial<ModeState>,
+  projectRoot: string | undefined,
+  explicitSessionId: string | undefined,
+  pipelineProgressWrite: boolean,
+  externalBeforeCommit: ((site: string) => void | Promise<void>) | undefined,
+  scope: Awaited<ReturnType<typeof resolveWritableStateScope>>,
+): Promise<ModeState> {
   const baseStateDir = getBaseStateDir(projectRoot);
-  const beforeCommit = createWritableCommitRevalidator({
+  const revalidateWritableScope = createWritableCommitRevalidator({
     operation: 'updateModeState',
     cwd: projectRoot ?? process.cwd(),
     explicitSessionId,
     capturedScope: scope,
     baseStateDir,
   });
+  const beforeCommit: typeof revalidateWritableScope = async (commit) => {
+    await revalidateWritableScope(commit);
+    if (externalBeforeCommit) {
+      await outsideStateFileWriteTransaction(() => externalBeforeCommit(commit.site));
+    }
+  };
   const current = mode === 'ralph' && scope.sessionId
     ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
     : explicitSessionId
@@ -373,6 +492,16 @@ async function updateModeStateInternal(
     updatedBase.owner_omx_session_id = scope.sessionId;
   }
   const normalizedBase = normalizeModeStateOrThrow(mode, updatedBase as ModeState);
+  if (mode === 'ralplan' && normalizedBase.workflow_variant === 'advisory' && normalizedBase.active === false) {
+    const advisoryProjection = await readCurrentRalplanAdvisory(
+      projectRoot ?? process.cwd(),
+      scope.sessionId ?? String(normalizedBase.session_id ?? ''),
+    );
+    const validationError = advisoryProjection?.fence?.state === 'pending_closeout'
+      ? validateAdvisoryPreparedInactiveWrite(normalizedBase as Record<string, unknown>, advisoryProjection)
+      : validateAdvisoryInactiveState(normalizedBase as Record<string, unknown>, advisoryProjection);
+    if (validationError) throw new Error(validationError);
+  }
   if (mode === 'autopilot') {
     const completionAdvisory = validateAutopilotCompletionTransition(
       current as Record<string, unknown>,
@@ -392,7 +521,8 @@ async function updateModeStateInternal(
   });
   if (isTrackedWorkflowMode(mode)) {
     const cwd = projectRoot ?? process.cwd();
-    const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({
+    const ralplanCompletionHandled = mode === 'ralplan'
+      && await completeRalplanSession({
       cwd,
       baseStateDir,
       state: updated as Record<string, unknown>,
@@ -422,6 +552,9 @@ async function updateModeStateInternal(
 export async function cancelMode(mode: string, projectRoot?: string): Promise<void> {
   const state = await readModeState(mode, projectRoot);
   if (state && state.active) {
+    if (mode === 'ralplan' && state.workflow_variant === 'advisory') {
+      throw new Error('ralplan_advisory_cancel_requires_terminalizeRalplanAdvisory');
+    }
     await updateModeState(mode, {
       active: false,
       current_phase: 'cancelled',

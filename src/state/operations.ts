@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { constants as fsConstants, existsSync } from 'node:fs';
+import { lstat, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { assertValidHandoffCarriersIn, requirePersistedHandoffCarrier } from './handoff-carrier.js';
 
@@ -53,10 +53,17 @@ import {
   writeSkillActiveStateWithPrimaryTransactionForStateDir,
 } from './skill-active.js';
 import {
+  assertModeBindingOwnerIdentity as assertStateFileWriteTransactionIdentity,
+  outsideModeBindingOwnerTransaction as outsideStateFileWriteTransaction,
+  withModeBindingOwnerTransaction as withStateFileWriteTransaction,
+} from './mode-binding-lease.js';
+export { assertStateFileWriteTransactionIdentity, outsideStateFileWriteTransaction, withStateFileWriteTransaction };
+import {
   isTrackedWorkflowMode,
   type TrackedWorkflowMode,
 } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
+import { readCurrentRalplanAdvisory, validateAdvisoryInactiveState, validateAdvisoryPreparedInactiveWrite } from '../ralplan/advisory.js';
 export const SUPPORTED_STATE_READ_MODES = [
   'autopilot',
   'autoresearch',
@@ -82,35 +89,64 @@ export interface StateOperationResponse {
   isError?: boolean;
 }
 
-const stateWriteQueues = new Map<string, Promise<void>>();
-
-async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const tail = stateWriteQueues.get(path) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const queued = tail.finally(() => gate);
-  stateWriteQueues.set(path, queued);
-
-  await tail.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    release();
-    if (stateWriteQueues.get(path) === queued) {
-      stateWriteQueues.delete(path);
-    }
-  }
+const stateOperationTestHooks: { afterStateClearPrimary?: () => void } = {};
+export function __setStateOperationTestHooksForTests(hooks: typeof stateOperationTestHooks): void {
+  stateOperationTestHooks.afterStateClearPrimary = hooks.afterStateClearPrimary;
 }
-
 /**
  * The sole writer primitive for `.omx/state/` session-scoped workflow state.
  * Every module that persists `{mode}-state.json` MUST route through this function
  * so that the single-writer invariant is preserved.
  */
-export async function writeStateFile(path: string, data: string): Promise<void> {
-  await writeAtomicFile(path, data);
+export async function writeStateFile(path: string, data: string, authorizedBaseStateDir?: string): Promise<void> {
+  await withStateFileWriteTransaction(path, () => writeAtomicFile(path, data), authorizedBaseStateDir);
+}
+
+/**
+ * Holds the canonical successor-safe state lock across a multi-projection owner
+ * transaction. Nested sanctioned writes to the same path inherit the lease.
+ */
+/**
+ * Durably pin a mode projection already published by the canonical workflow
+ * writer. Keeping the path resolution and descriptor validation in the state
+ * owner prevents callers from becoming undeclared mode-state writers merely
+ * to obtain a durable activation boundary.
+ */
+export async function syncExplicitSessionModeState(
+  mode: string,
+  cwd: string,
+  sessionId: string,
+): Promise<void> {
+  validateStateModeSegment(mode);
+  validateSessionId(sessionId);
+  const scope = await resolveWritableStateScope(cwd, sessionId);
+  if (scope.sessionId !== sessionId) throw new Error('mode_state_sync_session_scope_mismatch');
+  const path = join(scope.stateDir, getStateFilename(mode));
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw new Error('mode_state_sync_requires_canonical_regular_file');
+  }
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    const current = await lstat(path);
+    if (
+      !opened.isFile()
+      || opened.nlink !== 1
+      || !current.isFile()
+      || current.isSymbolicLink()
+      || current.nlink !== 1
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || current.dev !== before.dev
+      || current.ino !== before.ino
+    ) {
+      throw new Error('mode_state_sync_identity_changed');
+    }
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -145,7 +181,7 @@ async function writeClearedSessionScopedModeState(
   });
   const payload = JSON.stringify(clearedState, null, 2);
   await beforeCommit?.({ site: 'state-clear.primary', kind: 'write', path });
-  await writeAtomicFile(path, payload);
+  await writeStateFile(path, payload);
 }
 
 async function clearSessionNativeStopState(
@@ -302,6 +338,14 @@ function appendAutopilotCompletionAdvisory(
 
 function isCompleteRalplanTerminalState(state: Record<string, unknown>): boolean {
   const currentPhase = stringValue(state.current_phase).trim().toLowerCase();
+  const gate = objectRecord(state.ralplan_consensus_gate);
+  if (state.workflow_variant === 'advisory') {
+    return state.active === false
+      && ['complete', 'cancelled', 'failed'].includes(currentPhase)
+      && gate.complete === false
+      && state.execution_handoff_authorized === false
+      && state.host_verified === false;
+  }
   return state.active === false
     && currentPhase === 'complete';
 }
@@ -314,16 +358,23 @@ function buildRalplanTerminalState(
 ): Record<string, unknown> {
   const completedAt = stringValue(state.completed_at).trim() || nowIso;
   const terminalReason = stringValue(state.terminal_reason).trim() || 'ralplan consensus complete';
+  const advisory = state.workflow_variant === 'advisory';
+  const terminalPhase = advisory ? stringValue(state.current_phase).trim() || 'complete' : 'complete';
   return withModeRuntimeContext(state, {
     ...state,
     mode: 'ralplan',
     active: false,
-    current_phase: 'complete',
-    status: 'complete',
+    current_phase: terminalPhase,
+    status: terminalPhase,
     updated_at: nowIso,
     completed_at: completedAt,
     terminal_reason: terminalReason,
     session_id: sessionId,
+    ralplan_consensus_gate: {
+      ...objectRecord(state.ralplan_consensus_gate),
+      complete: advisory ? false : true,
+    },
+    ...(advisory ? { execution_handoff_authorized: false, host_verified: false } : {}),
   });
 }
 
@@ -335,13 +386,14 @@ function buildRalplanTerminalSkillState(
 ): SkillActiveStateLike {
   const completedAt = stringValue(terminalState.completed_at).trim() || nowIso;
   const terminalReason = stringValue(terminalState.terminal_reason).trim() || 'ralplan consensus complete';
+  const terminalPhase = stringValue(terminalState.current_phase).trim() || 'complete';
   return {
     ...(base ?? {}),
     version: 1,
     active: false,
     skill: 'ralplan',
     keyword: stringValue(base?.keyword).trim() || 'ralplan',
-    phase: 'complete',
+    phase: terminalPhase,
     activated_at: stringValue(base?.activated_at).trim() || stringValue(terminalState.started_at).trim() || nowIso,
     updated_at: nowIso,
     completed_at: completedAt,
@@ -426,6 +478,30 @@ function collectCompletedRalplanSessionEntries(
   return [...entries.values()];
 }
 
+export function projectRalplanTerminalSkillMirrors(input: {
+  rootSkillState: SkillActiveStateLike | null;
+  sessionSkillState: SkillActiveStateLike | null;
+  terminalState: Record<string, unknown>;
+  sessionId: string;
+  nowIso: string;
+}): { root_skill: SkillActiveStateLike | null; session_skill: SkillActiveStateLike | null } {
+  const rootEntries = filterCompletedRalplanRootEntries(
+    listActiveSkills(input.rootSkillState ?? {}), input.sessionId, false,
+  );
+  const rootSkill = rootEntries.length > 0 || input.rootSkillState !== null
+    ? buildRalplanSkillStateFromEntries(input.rootSkillState, input.terminalState, rootEntries, undefined, input.nowIso)
+    : null;
+  const sessionEntries = collectCompletedRalplanSessionEntries(
+    input.sessionSkillState, input.rootSkillState, input.sessionId,
+  );
+  const sessionSkill = sessionEntries.length > 0
+    ? buildRalplanSkillStateFromEntries(input.sessionSkillState ?? input.rootSkillState, input.terminalState, sessionEntries, input.sessionId, input.nowIso)
+    : input.sessionSkillState !== null
+      ? buildRalplanTerminalSkillState(input.sessionSkillState, input.terminalState, input.sessionId, input.nowIso)
+      : null;
+  return { root_skill: rootSkill, session_skill: sessionSkill };
+}
+
 function serializeAtomicJson(value: unknown): string {
   const serialized = JSON.stringify(value, null, 2);
   JSON.parse(serialized);
@@ -466,6 +542,13 @@ export async function completeRalplanSession(options: {
   const writableScope = options.capturedScope
     ?? await resolveWritableStateScope(options.cwd, options.explicitSessionId);
   const sessionId = writableScope.sessionId;
+  if (options.state.workflow_variant === 'advisory') {
+    const advisoryProjection = await readCurrentRalplanAdvisory(options.cwd, sessionId ?? String(options.state.session_id ?? ''));
+    const validationError = advisoryProjection?.fence?.state === 'pending_closeout'
+      ? validateAdvisoryPreparedInactiveWrite(options.state, advisoryProjection)
+      : validateAdvisoryInactiveState(options.state, advisoryProjection);
+    if (validationError) throw new Error(validationError);
+  }
   const beforeCommit = options.beforeCommit ?? createWritableCommitRevalidator({
     operation: 'completeRalplanSession',
     cwd: options.cwd,
@@ -476,7 +559,7 @@ export async function completeRalplanSession(options: {
   const completedSessionId = sessionId ?? optionalSessionId(options.state.session_id);
   const rootScopeCompletion = !sessionId;
 
-  const nowIso = new Date().toISOString();
+  const nowIso = stringValue(options.state.updated_at).trim() || new Date().toISOString();
   const rootState = buildRalplanTerminalState(options.state, sessionId, nowIso);
   const rootStatePath = join(options.baseStateDir, getStateFilename('ralplan'));
   const existingRootState = await readJsonRecordIfExists(rootStatePath);
@@ -718,7 +801,7 @@ export async function executeStateOperation(
         let ensureRalphArtifacts = false;
         let skillActivePrimaryCommitted = false;
 
-        await withStateWriteLock(path, async () => {
+        await withStateFileWriteTransaction(path, async () => {
           let existing: Record<string, unknown> = {};
           if (existsSync(path)) {
             try {
@@ -841,6 +924,13 @@ export async function executeStateOperation(
             normalizeCleanAutopilotCompletionEvidence(mergedRaw);
           }
 
+          if (mode === 'ralplan' && mergedRaw.workflow_variant === 'advisory' && mergedRaw.active === false) {
+            validationError = validateAdvisoryInactiveState(
+              mergedRaw,
+              await readCurrentRalplanAdvisory(cwd, effectiveSessionId ?? String(mergedRaw.session_id ?? '')),
+            );
+            if (validationError) return;
+          }
 
 
           if (mode === 'autopilot') {
@@ -889,22 +979,17 @@ export async function executeStateOperation(
               path,
               async () => {
                 await beforeCommit({ site: 'mode.primary', kind: 'write', path });
-                await writeAtomicFile(path, payload);
+                await writeStateFile(path, payload);
               },
               { beforeCommit },
             );
             skillActivePrimaryCommitted = true;
           } else {
             await beforeCommit({ site: 'mode.primary', kind: 'write', path });
-            await writeAtomicFile(path, payload);
+            await writeStateFile(path, payload);
           }
-        });
-
         if (validationError) {
-          return {
-            payload: { error: validationError },
-            isError: true,
-          };
+          return;
         }
 
         if (mode === SKILL_ACTIVE_STATE_MODE) {
@@ -941,6 +1026,14 @@ export async function executeStateOperation(
               beforeCommit,
             });
           }
+          }
+        }, baseStateDir);
+
+        if (validationError) {
+          return {
+            payload: { error: validationError },
+            isError: true,
+          };
         }
 
         return {
@@ -960,37 +1053,41 @@ export async function executeStateOperation(
         const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
 
         if (allSessions) {
-          const removedPaths: string[] = [];
-          const paths = await getAllScopedStatePaths(mode, cwd);
-          for (const path of paths) {
-            if (!existsSync(path)) continue;
-            await unlink(path);
-            removedPaths.push(path);
-          }
-          const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
-            ? []
-            : await getAllScopedStatePaths(SKILL_ACTIVE_STATE_MODE, cwd);
-          if (canonicalPaths.some((path) => existsSync(path))) {
-            await syncCanonicalSkillStateForMode({
-              cwd,
-              baseStateDir,
-              mode,
-              active: false,
-              source: 'state-operations',
-              allSessions: true,
-            });
-          }
+          const ownerPath = join(baseStateDir, getStateFilename(mode));
+          return await withStateFileWriteTransaction(ownerPath, async () => {
+            const removedPaths: string[] = [];
+            const paths = await getAllScopedStatePaths(mode, cwd);
+            for (const path of paths) {
+              if (!existsSync(path)) continue;
+              await withStateFileWriteTransaction(path, () => unlink(path));
+              removedPaths.push(path);
+            }
+            outsideStateFileWriteTransaction(() => stateOperationTestHooks.afterStateClearPrimary?.());
+            const canonicalPaths = mode === SKILL_ACTIVE_STATE_MODE
+              ? []
+              : await getAllScopedStatePaths(SKILL_ACTIVE_STATE_MODE, cwd);
+            if (canonicalPaths.some((path) => existsSync(path))) {
+              await syncCanonicalSkillStateForMode({
+                cwd,
+                baseStateDir,
+                mode,
+                active: false,
+                source: 'state-operations',
+                allSessions: true,
+              });
+            }
 
-          return {
-            payload: {
-              cleared: true,
-              mode,
-              all_sessions: true,
-              removed: removedPaths.length,
-              paths: removedPaths,
-              warning: 'all_sessions clears global and session-scoped state files',
-            },
-          };
+            return {
+              payload: {
+                cleared: true,
+                mode,
+                all_sessions: true,
+                removed: removedPaths.length,
+                paths: removedPaths,
+                warning: 'all_sessions clears global and session-scoped state files',
+              },
+            };
+          }, baseStateDir);
         }
 
         const stateScope = await resolveWritableStateScope(cwd, explicitSessionId);
@@ -1004,31 +1101,34 @@ export async function executeStateOperation(
           baseStateDir,
         });
         const path = join(stateScope.stateDir, getStateFilename(mode));
-        if (
-          mode !== SKILL_ACTIVE_STATE_MODE
-          && effectiveSessionId
-          && existsSync(getStatePath(mode, cwd))
-        ) {
-          await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
-        } else if (existsSync(path)) {
-          await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
-          await unlink(path);
-        }
-        const nativeStopCleared = effectiveSessionId
-          ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)
-          : [];
-        if (mode !== SKILL_ACTIVE_STATE_MODE) {
-          await syncCanonicalSkillStateForMode({
-            cwd,
-            baseStateDir,
-            mode,
-            active: false,
-            sessionId: effectiveSessionId,
-            source: 'state-operations',
-            beforeCommit,
-          });
-        }
-        return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
+        return await withStateFileWriteTransaction(path, async () => {
+          if (
+            mode !== SKILL_ACTIVE_STATE_MODE
+            && effectiveSessionId
+            && existsSync(getStatePath(mode, cwd))
+          ) {
+            await writeClearedSessionScopedModeState(path, mode, effectiveSessionId, beforeCommit);
+          } else if (existsSync(path)) {
+            await beforeCommit({ site: 'state-clear.primary', kind: 'unlink', path });
+            await withStateFileWriteTransaction(path, () => unlink(path));
+          }
+          outsideStateFileWriteTransaction(() => stateOperationTestHooks.afterStateClearPrimary?.());
+          const nativeStopCleared = effectiveSessionId
+            ? await clearSessionNativeStopState(baseStateDir, effectiveSessionId, beforeCommit)
+            : [];
+          if (mode !== SKILL_ACTIVE_STATE_MODE) {
+            await syncCanonicalSkillStateForMode({
+              cwd,
+              baseStateDir,
+              mode,
+              active: false,
+              sessionId: effectiveSessionId,
+              source: 'state-operations',
+              beforeCommit,
+            });
+          }
+          return { payload: { cleared: true, mode, path, ...(nativeStopCleared.length > 0 ? { native_stop_cleared: nativeStopCleared } : {}) } };
+        }, baseStateDir);
       }
 
       case 'state_list_active': {
