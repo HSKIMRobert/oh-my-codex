@@ -2,7 +2,7 @@
 
 Release date: 2026-08-31
 
-`0.21.1` is a patch release covering `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9`: 123 commits, 114 changed files (+23,880/−1,140), and 27 referenced issues/PRs. It hardens release authority, detached HUD/session cleanup, state and plugin provenance, and introduces Ralplan Advisory as a cooperative, non-authorizing planning workflow.
+`0.21.1` is a patch release covering `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9`: 123 commits, 114 changed files (+23,880/−1,140), 27 commit-subject issue/PR references, and two additional linked issues (#3587, #3589). It hardens release authority, detached HUD/session cleanup, state and plugin provenance, and introduces Ralplan Advisory as a cooperative, non-authorizing planning workflow.
 
 ## Highlights
 

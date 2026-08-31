@@ -1,6 +1,6 @@
 # oh-my-codex 0.21.1
 
-`0.21.1` is a patch release for `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9` (123 commits, 114 changed files, 27 referenced issues/PRs).
+`0.21.1` is a patch release for `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9` (123 commits, 114 changed files, 27 commit-subject references plus linked issues #3587/#3589).
 
 ## Highlights
 
@@ -12,7 +12,7 @@
 
 ## Compatibility
 
-Patch release. Ralplan Advisory is additive and non-authorizing. Existing standard workflows remain independent. Publication uses only the tag-triggered trusted Release workflow.
+Patch release. Ralplan Advisory is additive and non-authorizing. Existing standard workflows remain independent. The tag workflow publishes GitHub Release/native assets; npm publication uses the exact tag/SHA-bound OIDC trusted-publish job in the CI workflow.
 
 ## Contributors
 

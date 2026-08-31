@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 ## [0.21.1] - 2026-08-31
 
-Patch release for `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9` (123 commits, 114 changed files, +23,880/−1,140, 27 referenced issues/PRs).
+Patch release for `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9` (123 commits, 114 changed files, +23,880/−1,140, 27 commit-subject references plus linked issues #3587/#3589).
 
 ### Added
 

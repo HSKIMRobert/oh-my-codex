@@ -7,7 +7,7 @@
 - Previous tag: `v0.21.0` (`3ad79a8a6fe6e95fdbb8c00e40716fffe4011ce2`).
 - Frozen dev base: `39c70861a124b733f3b7eef42969e1dcba4344b9`.
 - Exact range: `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9`.
-- Range size: 123 commits, 114 changed files (+23,880/−1,140), 27 referenced issues/PRs.
+- Range size: 123 commits, 114 changed files (+23,880/−1,140), 27 commit-subject references plus linked issues #3587/#3589 (29 tracked references).
 - Backlog at freeze: 0 open PRs, 0 open issues.
 - Owner authorization: direct `ㄱ` in the OmX release-candidate thread, reaffirmed on 2026-08-31.
 
@@ -30,9 +30,9 @@
 | Full tests | `npm test` under supported Node | Pending validation |
 | Package smoke | `npm pack --dry-run` and packed install smoke | Pending validation |
 | Main promotion | one release PR targeting `main` | Pending |
-| Tag/publish | annotated `v0.21.1`, tag-triggered trusted Release workflow | Pending |
+| Tag/publish | annotated `v0.21.1`; tag-triggered GitHub Release/assets; exact tag/SHA-bound `CI` workflow dispatch for OIDC npm trusted publishing | Pending |
 | External verification | GitHub Release assets and npm `oh-my-codex@0.21.1` | Pending |
 
 ## Publish contract
 
-The annotated tag is created only after the release PR is merged to `main` and the exact main commit is green. The `.github/workflows/release.yml` tag workflow is the sole publication path. The retired Manual npm publish workflow must not be used.
+The annotated tag is created only after the release PR is merged to `main` and the exact main commit is green. The tag-triggered `.github/workflows/release.yml` publishes and verifies GitHub Release/native assets. npm publication uses the current `.github/workflows/ci.yml` `publish-npm-trusted` job via an explicit `workflow_dispatch` bound to both immutable `release_tag=v0.21.1` and the exact peeled 40-character main SHA. This is the repository's OIDC trusted-publishing path; no npm token or retired standalone Manual npm publish workflow is used.
