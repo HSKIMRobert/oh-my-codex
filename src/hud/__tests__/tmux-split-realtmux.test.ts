@@ -15,7 +15,8 @@ import { isRealTmuxAvailable, type TempTmuxSessionFixture, withTempTmuxSession }
 const PANE_READY_TIMEOUT_MS = 1_000;
 const PANE_READY_INTERVAL_MS = 50;
 const ENV_FILE_TIMEOUT_MS = 3_000;
-const HUD_RECONCILE_TIMEOUT_MS = 5_000;
+const HUD_RECONCILE_TIMEOUT_MS = 15_000;
+const TEMP_CLEANUP_RETRIES = 20;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function skipUnlessPrivateRealTmux(t: TestContext): boolean {
@@ -60,6 +61,22 @@ async function waitForFileContent(filePath: string): Promise<string> {
     await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
   }
   throw new Error(`timed out waiting for pane env marker file: ${filePath} (last: ${JSON.stringify(lastContent)})`);
+}
+
+async function removeTempDirWithRetry(path: string): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < TEMP_CLEANUP_RETRIES; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOTEMPTY' && code !== 'EBUSY') throw error;
+      await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+    }
+  }
+  throw lastError;
 }
 
 async function waitForReconciledHud(
@@ -169,7 +186,7 @@ describe('createHudWatchPane real private-server split transaction', () => {
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
-      await rm(workDir, { recursive: true, force: true });
+      await removeTempDirWithRetry(workDir);
     }
   });
 
@@ -228,7 +245,7 @@ describe('createHudWatchPane real private-server split transaction', () => {
         assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
       });
     } finally {
-      await rm(workDir, { recursive: true, force: true });
+      await removeTempDirWithRetry(workDir);
     }
   });
 
@@ -304,7 +321,7 @@ describe('createHudWatchPane real private-server split transaction', () => {
           assert.doesNotMatch(await fixture.readServerLog(), /too many arguments|unknown hook/i);
         });
       } finally {
-        await rm(workDir, { recursive: true, force: true });
+        await removeTempDirWithRetry(workDir);
       }
     });
   }

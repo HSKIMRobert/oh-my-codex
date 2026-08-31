@@ -28,6 +28,7 @@ import {
   registerHudResizeHook,
   clearTmuxPaneHistory,
   resizeTmuxPane,
+  shellEscapeSingle,
 } from './tmux.js';
 import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit } from './reconcile.js';
 import { buildHudRuntimeEnv } from './tmux.js';
@@ -82,6 +83,7 @@ interface RunWatchModeDependencies {
   resizeTmuxPaneFn: (paneId: string, heightLines: number) => boolean;
   clearTmuxPaneHistoryFn: (paneId: string) => boolean;
   registerHudResizeHookFn: (hudPaneId: string, leaderPaneId: string | undefined, heightLines: number) => boolean;
+  reconcileTmuxHudFn: (cwd: string) => Promise<void>;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
   registerSigint: (handler: () => void) => void | (() => void);
@@ -187,6 +189,41 @@ export async function runWatchMode(
     resizeTmuxPaneFn: deps.resizeTmuxPaneFn ?? resizeTmuxPane,
     clearTmuxPaneHistoryFn: deps.clearTmuxPaneHistoryFn ?? clearTmuxPaneHistory,
     registerHudResizeHookFn: deps.registerHudResizeHookFn ?? registerHudResizeHook,
+    reconcileTmuxHudFn: deps.reconcileTmuxHudFn ?? (async (reconcileCwd) => {
+      const leaderPaneId = dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]?.trim();
+      if (!leaderPaneId?.startsWith('%')) return;
+      const omxEntry = resolveOmxCliEntryPath({
+        cwd: reconcileCwd,
+        env: {
+          ...dependencies.env,
+          TMUX_PANE: leaderPaneId,
+        },
+      });
+      if (!omxEntry) return;
+      const command = [
+        'cd',
+        shellEscapeSingle(reconcileCwd),
+        '&&',
+        `TMUX_PANE=${shellEscapeSingle(leaderPaneId)}`,
+        `OMX_TMUX_HUD_OWNER=${shellEscapeSingle('1')}`,
+        dependencies.env.OMX_SESSION_ID
+          ? `OMX_SESSION_ID=${shellEscapeSingle(dependencies.env.OMX_SESSION_ID)}`
+          : '',
+        dependencies.env.OMX_ROOT
+          ? `OMX_ROOT=${shellEscapeSingle(dependencies.env.OMX_ROOT)}`
+          : '',
+        shellEscapeSingle(process.execPath),
+        shellEscapeSingle(omxEntry),
+        'hud',
+        '--reconcile-tmux',
+        '>/dev/null',
+        '2>&1',
+      ].filter(Boolean).join(' ');
+      execFileSync('tmux', ['run-shell', '-b', command], {
+        env: dependencies.env,
+        stdio: 'ignore',
+      });
+    }),
     writeStdout: deps.writeStdout ?? ((text: string) => process.stdout.write(text)),
     writeStderr: deps.writeStderr ?? ((text: string) => process.stderr.write(text)),
     registerSigint: deps.registerSigint ?? ((handler: () => void) => {
@@ -282,6 +319,16 @@ export async function runWatchMode(
         }
         firstRender = false;
         renderedThisTick = 'rendered';
+      }
+      if (
+        dependencies.env.TMUX
+        && dependencies.env[OMX_TMUX_HUD_OWNER_ENV] === '1'
+        && dependencies.env.TMUX_PANE?.trim().startsWith('%')
+      ) {
+        // tmux has no command hook for swap-pane on supported 3.2-era builds.
+        // Run this even while the session is detached: render work may pause,
+        // but topology ownership must still converge without a later prompt.
+        await dependencies.reconcileTmuxHudFn(frameCwd);
       }
       try {
         await dependencies.runAuthorityTickFn({ cwd: frameCwd });
