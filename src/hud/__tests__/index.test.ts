@@ -497,6 +497,7 @@ describe('runWatchMode', () => {
         registered.push({ hudPaneId, leaderPaneId, heightLines });
         return true;
       },
+      reconcileTmuxHudFn: async () => {},
     });
 
     await flush();

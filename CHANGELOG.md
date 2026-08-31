@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+## [0.21.1] - 2026-08-31
+
+Patch release for `v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54` (125 commits, 116 changed files, +23,996/−1,141, 28 commit-subject references plus linked issues #3587/#3589).
+
+### Added
+
+- **Ralplan Advisory / Contract A** — cooperative Planner → Architect → Critic planning evidence without granting execution authority, installing a global tool fence, suppressing unrelated workflows, or automatically handing off to implementation (#3594).
+
+### Changed
+
+- **Trusted release publication** — tag publication is bound to `main` ancestry and exact SHA, native release assets are verified, npm uses trusted publishing, and the retired manual token path is unavailable (#3552, #3566, #3570, #3571, #3572).
+- **Canonical state and process ownership** — state leases, locks, session pointers, and recovery distinguish exact process incarnations and preserve Windows/macOS durability and path semantics.
+
+### Fixed
+
+- **Detached HUD and session lifecycle** — exact owner-pane cleanup, refresh rendering, split and non-split tmux layout reconciliation, stable hook cleanup identity, and contention re-arming (#3577, #3578, #3584, #3587, #3588, #3595).
+- **Team legacy HUD startup** — recognizes and safely removes both same-session-only and leader-only legacy HUD panes before topology freeze (#3597).
+- **Plugin/cache/launcher provenance** — symlink, namespace, and stale launcher confusion fail closed (#3558, #3561).
+- **Runtime and configuration reliability** — Ralph native-app deadlock recovery, SparkShell tail-line validation, empty hooks-state recovery, and generated configuration trust checks (#3589, #3590, #3592).
+
 ## [0.21.0] - 2026-08-22
 
 Minor release for the exact 99-commit range `v0.20.5..0f2bbb704b83f94a69622b1915f555498e0dd283` (310 files, +31,779/−69,216). This is the post-epic consolidation train: deprecated skills are removed with migration stubs, hard workflow gates are replaced by advisory guidance, state becomes a single-source-of-truth with a read-only MCP surface, and `omx autopilot` returns as the canonical staged orchestrator. Consumers invoking removed skills or MCP writer tools receive explicit migration errors — this is an intentional breaking change with migration paths.
