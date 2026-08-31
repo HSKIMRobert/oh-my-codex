@@ -118,7 +118,7 @@ describe('renderHud – GitGuardex finish', () => {
     }
   });
 
-  it('animates review while it is running', () => {
+  it('advances review animation at the one-second watch cadence', () => {
     const ctx = {
       ...emptyCtx(),
       guardexFinish: {
@@ -134,7 +134,7 @@ describe('renderHud – GitGuardex finish', () => {
     mock.method(Date, 'now', () => 0);
     const first = stripSgr(renderHud(ctx, 'focused'));
     mock.restoreAll();
-    mock.method(Date, 'now', () => 250);
+    mock.method(Date, 'now', () => 1000);
     const second = stripSgr(renderHud(ctx, 'focused'));
 
     assert.match(first, /gx:4\/8 review [◐◓◑◒]/u);

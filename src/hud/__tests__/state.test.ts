@@ -20,6 +20,7 @@ import {
   readAutoresearchState,
   readUltraqaState,
   readGuardexFinishState,
+  readHudConfig,
   normalizeHudConfig,
 } from '../state.js';
 
@@ -128,6 +129,20 @@ describe('readGuardexFinishState', () => {
       ]);
 
       assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+});
+
+describe('readHudConfig', () => {
+  it('loads the project-local config when invoked from a nested directory', async () => {
+    await withTempRepo('omx-hud-config-nested-', async (cwd) => {
+      initGitRepo(cwd);
+      const nested = join(cwd, 'packages', 'app');
+      await mkdir(join(cwd, '.omx'), { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(cwd, '.omx', 'hud-config.json'), JSON.stringify({ guardex: { enabled: true } }));
+
+      assert.equal((await readHudConfig(nested)).guardex?.enabled, true);
     });
   });
 });

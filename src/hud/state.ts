@@ -438,7 +438,8 @@ export async function readSessionState(cwd: string): Promise<SessionStateForHud 
 }
 
 export async function readHudConfig(cwd: string): Promise<ResolvedHudConfig> {
-  const config = await readJsonFile<HudConfig>(join(cwd, '.omx', 'hud-config.json'));
+  const repoRoot = findGitLayout(cwd)?.worktreeRoot ?? cwd;
+  const config = await readJsonFile<HudConfig>(join(repoRoot, '.omx', 'hud-config.json'));
   return normalizeHudConfig(config);
 }
 
