@@ -2460,7 +2460,16 @@ export function createTeamSession(
     partialLeaderPaneId = leaderPaneId;
     partialLeaderPanePid = leaderPanePid;
 
-    const initialHudPaneIds = findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId });
+    // Legacy HUDs may carry either the leader marker or the OMX session marker,
+    // but not both. Keep the compatibility identities independent so combining
+    // them in one owner query does not reject a leader-owned HUD that lacks a
+    // session tag.
+    const initialHudPaneIds = Array.from(new Set([
+      ...findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId }),
+      ...(ownerSessionId
+        ? findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId, sessionId: ownerSessionId })
+        : []),
+    ]));
     const initialWindowPanePids = new Map<string, number>([[leaderPaneId, leaderPanePid]]);
 
     const omxEntry = resolveOmxCliEntryPath();
