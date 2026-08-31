@@ -79,7 +79,12 @@ const GUARDEX_FINISH_TAIL_BYTES = 64 * 1024;
 const GUARDEX_FINISH_MAX_CANDIDATES = 32;
 const GUARDEX_FINISH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const GUARDEX_FINISH_RUN_ID_RE = /^finish-[^-]+-(\d+)-/;
+const GUARDEX_FINISH_FILE_RE = /^finish-([0-9a-z]+)-\d+-[^/]+\.jsonl$/;
 const GUARDEX_TERMINAL_STATES = new Set(['failed', 'finished']);
+
+interface GuardexFinishStateDependencies {
+  statFile?: (path: string) => Promise<{ mtimeMs: number }>;
+}
 
 interface RawGuardexFinishEvent {
   schemaVersion?: unknown;
@@ -167,21 +172,36 @@ async function readGuardexFinishFile(path: string): Promise<GuardexFinishStateFo
 }
 
 /** Read the newest active GitGuardex branch-finish event stream. */
-export async function readGuardexFinishState(cwd: string): Promise<GuardexFinishStateForHud | null> {
+export async function readGuardexFinishState(
+  cwd: string,
+  dependencies: GuardexFinishStateDependencies = {},
+): Promise<GuardexFinishStateForHud | null> {
   // Guardex writes to the repository-local state directory, independent of
   // OMX session/team state-root overrides inherited by the HUD process.
   const repoRoot = findGitLayout(cwd)?.worktreeRoot ?? cwd;
   const directory = join(repoRoot, '.omx', 'state', 'finish-runs');
   try {
     const entries = await readdir(directory, { withFileTypes: true });
-    const candidates = await Promise.all(entries
-      .filter(entry => entry.isFile() && entry.name.startsWith('finish-') && entry.name.endsWith('.jsonl'))
+    // Guardex encodes the run start time as base36 in each filename. Bound the
+    // newest run IDs before metadata reads so one HUD tick stays O(1).
+    const recentEntries = entries
+      .flatMap(entry => {
+        if (!entry.isFile()) return [];
+        const match = entry.name.match(GUARDEX_FINISH_FILE_RE);
+        if (!match) return [];
+        const startedAt = Number.parseInt(match[1], 36);
+        return Number.isSafeInteger(startedAt) ? [{ name: entry.name, startedAt }] : [];
+      })
+      .sort((left, right) => right.startedAt - left.startedAt || right.name.localeCompare(left.name))
+      .slice(0, GUARDEX_FINISH_MAX_CANDIDATES);
+    const statFile = dependencies.statFile ?? stat;
+    const candidates = await Promise.all(recentEntries
       .map(async entry => ({
         path: join(directory, entry.name),
-        modifiedAt: (await stat(join(directory, entry.name))).mtimeMs,
+        modifiedAt: (await statFile(join(directory, entry.name))).mtimeMs,
       })));
     candidates.sort((left, right) => right.modifiedAt - left.modifiedAt);
-    for (const candidate of candidates.slice(0, GUARDEX_FINISH_MAX_CANDIDATES)) {
+    for (const candidate of candidates) {
       const state = await readGuardexFinishFile(candidate.path);
       if (state) return state;
     }
