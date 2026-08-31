@@ -19,4 +19,8 @@ Patch release. Ralplan Advisory is additive and non-authorizing. Existing standa
 
 Thanks to Bellman (@Yeachan-Heo), @FacuVCanale, @NagyVikt, @berahac, @XCRobert, @colanx, @wangxingzhen, @chenjiaming-kezaihui, @app/dependabot, and the gaebal-gajae (clawdbot) release and repair lanes.
 
+## Frozen-range acknowledgements
+
+The release PR must be merged with a two-parent merge commit, not squash/rebase, so the complete frozen `dev@abf2393a` history remains reachable from the `v0.21.1` tag. This preserves generated contributor attribution for every frozen-range contributor, including @wangxingzhen for #3597. The tag gate must verify both `release/0.21.1@dfb72459` and frozen dev `abf2393a` are ancestors of the tagged `main` commit.
+
 **Full Changelog**: [`v0.21.0...v0.21.1`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.0...v0.21.1)
