@@ -5653,6 +5653,112 @@ esac
     }
   });
 
+  it('recognizes existing legacy HUDs by session or leader ownership during Team startup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-existing-detached-hud-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousEntryPath = process.env[OMX_ENTRY_PATH_ENV];
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-existing-detached-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V) echo 'tmux 3.4' ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo 120 ;;
+      *) echo 'shared:0 %1' ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*)
+        printf '%%1\\t0\\t2000000001\\n'
+        [ -f "${logPath}.existing-hud-killed" ] || printf '%%2\\t0\\t2000000002\\n'
+        [ -f "${logPath}.leader-hud-killed" ] || printf '%%5\\t0\\t2000000005\\n'
+        [ -f "${logPath}.worker" ] && printf '%%3\\t0\\t2000000003\\n'
+        [ -f "${logPath}.team-hud" ] && printf '%%4\\t0\\t2000000004\\n'
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        [ -f "${logPath}.existing-hud-killed" ] || printf "%%2\\tnode\\texec env OMX_SESSION_ID='omx-existing-hud' node /node/omx.js hud --watch\\n"
+        [ -f "${logPath}.leader-hud-killed" ] || printf "%%5\\tnode\\texec env OMX_TMUX_HUD_LEADER_PANE='%%1' node /node/omx.js hud --watch\\n"
+        [ -f "${logPath}.worker" ] && printf "%%3\\tgemini\\t'gemini'\\n"
+        [ -f "${logPath}.team-hud" ] && printf "%%4\\tnode\\texec env OMX_SESSION_ID='omx-existing-hud' OMX_TMUX_HUD_LEADER_PANE='%1' node /node/omx.js hud --watch\\n"
+        ;;
+      *)
+        printf '%%1\\n'
+        [ -f "${logPath}.existing-hud-killed" ] || printf '%%2\\n'
+        [ -f "${logPath}.leader-hud-killed" ] || printf '%%5\\n'
+        [ -f "${logPath}.worker" ] && printf '%%3\\n'
+        [ -f "${logPath}.team-hud" ] && printf '%%4\\n'
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*) : > "${logPath}.worker"; echo '%3' ;;
+      *) : > "${logPath}.team-hud"; echo '%4' ;;
+    esac
+    ;;
+  kill-pane)
+    case "$*" in
+      *'%2'*) : > "${logPath}.existing-hud-killed" ;;
+      *'%5'*) : > "${logPath}.leader-hud-killed" ;;
+      *'%3'*) : > "${logPath}.worker-killed" ;;
+      *'%4'*) : > "${logPath}.team-hud-killed" ;;
+    esac
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys) ;;
+  *) ;;
+esac
+exit 0
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = dirname(logPath);
+          const geminiPath = join(fakeBinDir, 'gemini');
+          const entryPath = join(fakeBinDir, 'omx.js');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          await writeFile(entryPath, '');
+
+          process.env.TMUX = '1';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_SESSION_ID = 'omx-existing-hud';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          process.env[OMX_ENTRY_PATH_ENV] = entryPath;
+
+          const session = createTeamSession('Existing Detached HUD', 1, cwd);
+          assert.equal(session.leaderPaneId, '%1');
+          assert.deepEqual(session.workerPaneIds, ['%3']);
+          assert.equal(session.hudPaneId, '%4');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.match(tmuxLog, /kill-pane -t %5/);
+          assert.match(tmuxLog, /split-window -h -t %1/);
+          assert.doesNotMatch(tmuxLog, /window topology changed before layout mutation/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousEntryPath === 'string') process.env[OMX_ENTRY_PATH_ENV] = previousEntryPath;
+      else delete process.env[OMX_ENTRY_PATH_ENV];
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when a tagged worker keeps its PID but loses Team owner continuity before a later split', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-owner-change-'));
     const prevTmux = process.env.TMUX;
