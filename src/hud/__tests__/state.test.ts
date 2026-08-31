@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 import { renderHud } from '../render.js';
@@ -20,6 +20,7 @@ import {
   readAutoresearchState,
   readUltraqaState,
   readGuardexFinishState,
+  readHudConfig,
   normalizeHudConfig,
 } from '../state.js';
 
@@ -128,6 +129,44 @@ describe('readGuardexFinishState', () => {
       ]);
 
       assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+
+  it('bounds metadata reads when historical finish streams accumulate', async () => {
+    await withTempRepo('omx-hud-guardex-bounded-', async (cwd) => {
+      const timestamp = new Date().toISOString();
+      for (let index = 0; index < 40; index += 1) {
+        const startedAt = (Date.now() - index).toString(36);
+        const runId = `finish-${startedAt}-${process.pid}-${String(index).padStart(8, '0')}`;
+        await writeGuardexFinishEvents(cwd, runId, [
+          { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+        ]);
+      }
+
+      let metadataReads = 0;
+      const state = await readGuardexFinishState(cwd, {
+        statFile: async path => {
+          metadataReads += 1;
+          return stat(path);
+        },
+      });
+
+      assert.equal(state?.stage, 'review');
+      assert.equal(metadataReads, 32);
+    });
+  });
+});
+
+describe('readHudConfig', () => {
+  it('loads the project-local config when invoked from a nested directory', async () => {
+    await withTempRepo('omx-hud-config-nested-', async (cwd) => {
+      initGitRepo(cwd);
+      const nested = join(cwd, 'packages', 'app');
+      await mkdir(join(cwd, '.omx'), { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(cwd, '.omx', 'hud-config.json'), JSON.stringify({ guardex: { enabled: true } }));
+
+      assert.equal((await readHudConfig(nested)).guardex?.enabled, true);
     });
   });
 });

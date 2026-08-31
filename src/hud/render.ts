@@ -57,6 +57,7 @@ function renderGitBranch(ctx: HudRenderContext): string | null {
 }
 
 const GUARDEX_SPINNER_FRAMES = ['◐', '◓', '◑', '◒'] as const;
+const GUARDEX_SPINNER_FRAME_MS = 400;
 
 function renderGuardexFinish(ctx: HudRenderContext): string | null {
   if (!ctx.guardexFinish?.active) return null;
@@ -66,7 +67,7 @@ function renderGuardexFinish(ctx: HudRenderContext): string | null {
   if (!stage) return null;
   const animates = state === 'running' && (stage === 'review' || stage === 'autofix');
   const frame = animates
-    ? ` ${GUARDEX_SPINNER_FRAMES[Math.floor(Date.now() / 250) % GUARDEX_SPINNER_FRAMES.length]}`
+    ? ` ${GUARDEX_SPINNER_FRAMES[Math.floor(Date.now() / GUARDEX_SPINNER_FRAME_MS) % GUARDEX_SPINNER_FRAMES.length]}`
     : '';
   return yellow(`gx:${index}/${total} ${stage}${frame}`);
 }
