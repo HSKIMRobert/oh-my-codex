@@ -33,6 +33,7 @@ import {
   writeUserInstallStamp,
   type UserInstallStamp,
 } from '../scripts/postinstall-advisory.js';
+import { hydrateOmxRuntimeNonFatal } from '../scripts/postinstall.js';
 export {
   isInstallVersionBump,
   readUserInstallStamp,
@@ -569,6 +570,7 @@ interface UpdateDependencies {
   runGlobalUpdate: (installSource: string, ownership?: PackageManagerOwnership) => RunGlobalUpdateResult;
   runDeferredGlobalUpdate: (cwd: string, ownership?: PackageManagerOwnership) => RunDeferredUpdateResult;
   runSetupRefresh: (cwd: string, ownership?: PackageManagerOwnership) => Promise<RunSetupRefreshResult>;
+  hydrateRuntime: (ownership?: PackageManagerOwnership) => Promise<string | undefined>;
   writeUpdateState: typeof writeUpdateState;
 }
 
@@ -591,6 +593,10 @@ const defaultUpdateDependencies: UpdateDependencies = {
   runGlobalUpdate: (installSource, ownership) => runGlobalUpdate(installSource, spawnSync, process.platform, ownership),
   runDeferredGlobalUpdate: (cwd, ownership) => runDeferredGlobalUpdate(cwd, spawn, process.platform, process.pid, ownership),
   runSetupRefresh,
+  hydrateRuntime: (ownership) => hydrateOmxRuntimeNonFatal({
+    packageRoot: ownership?.packageRoot,
+    env: ownership?.environment,
+  }),
   writeUpdateState,
 }
 
@@ -897,6 +903,11 @@ async function executeUpdate(
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
 
+  // Installation already replaced the package with --ignore-scripts. Repair
+  // the version-keyed native cache before setup so a setup failure cannot
+  // strand the successfully installed package without omx-runtime.
+  await dependencies.hydrateRuntime(ownership ?? undefined);
+
   const setupRefreshResult = await dependencies.runSetupRefresh(cwd, ownership ?? undefined);
   if (!setupRefreshResult.ok) {
     console.log(
@@ -904,7 +915,6 @@ async function executeUpdate(
     );
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
-
   const installedVersion = await dependencies.getInstalledVersionAfterUpdate(ownership ?? undefined);
   const installedRevision = channelConfig.channel === 'dev'
     ? ((await dependencies.getInstalledRevisionAfterUpdate(ownership ?? undefined)) ?? result.revision ?? null)

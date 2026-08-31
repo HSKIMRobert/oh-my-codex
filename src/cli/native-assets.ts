@@ -41,6 +41,7 @@ export interface HydrateNativeBinaryOptions {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   arch?: string;
+  signal?: AbortSignal;
 }
 
 export interface NativeBinaryCandidateOptions {
@@ -236,9 +237,10 @@ export async function loadNativeReleaseManifest(
   packageRoot = getPackageRoot(),
   version?: string,
   env: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
 ): Promise<NativeReleaseManifest> {
   const url = await resolveNativeManifestUrl(packageRoot, version, env);
-  const response = await fetch(url);
+  const response = await fetch(url, { signal });
   if (!response.ok) {
     throw new Error(`[native-assets] failed to fetch native release manifest (${response.status} ${response.statusText}) from ${url}`);
   }
@@ -260,8 +262,8 @@ function isUnavailableArchiveError(error: unknown): boolean {
     || /fetch failed/i.test(error.message);
 }
 
-async function downloadFile(url: string, destinationPath: string): Promise<void> {
-  const response = await fetch(url);
+async function downloadFile(url: string, destinationPath: string, signal?: AbortSignal): Promise<void> {
+  const response = await fetch(url, { signal });
   if (!response.ok || !response.body) {
     throw new Error(`[native-assets] failed to download ${url} (${response.status} ${response.statusText})`);
   }
@@ -689,6 +691,7 @@ export async function hydrateNativeBinary(
     env = process.env,
     platform = process.platform,
     arch = process.arch,
+    signal,
   } = options;
 
   if (env[NATIVE_AUTO_FETCH_ENV]?.trim() === '0') return undefined;
@@ -703,7 +706,7 @@ export async function hydrateNativeBinary(
 
   let manifest: NativeReleaseManifest;
   try {
-    manifest = await loadNativeReleaseManifest(packageRoot, version, env);
+    manifest = await loadNativeReleaseManifest(packageRoot, version, env, signal);
   } catch (error) {
     if (isUnavailableManifestError(error)) return undefined;
     throw error;
@@ -729,7 +732,7 @@ export async function hydrateNativeBinary(
         inferNativeAssetLibc(asset),
       );
       try {
-        await downloadFile(asset.download_url, archivePath);
+        await downloadFile(asset.download_url, archivePath, signal);
         const archiveStat = await stat(archivePath);
         if (typeof asset.size === 'number' && asset.size > 0 && archiveStat.size !== asset.size) {
           throw new Error(`[native-assets] downloaded archive size mismatch for ${asset.archive}`);
