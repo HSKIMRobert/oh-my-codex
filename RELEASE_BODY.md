@@ -21,6 +21,6 @@ Thanks to Bellman (@Yeachan-Heo), @FacuVCanale, @NagyVikt, @berahac, @XCRobert, 
 
 ## Frozen-range acknowledgements
 
-The release PR must be merged with a two-parent merge commit, not squash/rebase, so the complete frozen `dev@abf2393a` history remains reachable from the `v0.21.1` tag. This preserves generated contributor attribution for every frozen-range contributor, including @wangxingzhen for #3597. The tag gate resolves the exact `origin/release/0.21.1` head immediately before merge and verifies both that recorded head and frozen dev `abf2393a` are ancestors of the tagged `main` commit.
+The release PR must be merged with a two-parent merge commit, not squash/rebase, so the complete frozen `dev@abf2393a` history remains reachable from the `v0.21.1` tag. This preserves generated contributor attribution for every frozen-range contributor, including @wangxingzhen for #3597. Immediately before merge, the tag gate fetches `+refs/heads/release/0.21.1:refs/remotes/origin/release/0.21.1`, records that exact remote head, and verifies both it and frozen dev `abf2393a` are ancestors of the tagged `main` commit.
 
 **Full Changelog**: [`v0.21.0...v0.21.1`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.0...v0.21.1)
