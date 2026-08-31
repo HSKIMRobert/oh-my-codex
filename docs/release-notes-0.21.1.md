@@ -23,6 +23,6 @@ The reproducible release inventory is recorded in `artifacts/release-0.21.1/inve
 
 ## Contributors
 
-Thanks to Bellman (@Yeachan-Heo), @FacuVCanale, @NagyVikt, @berahac, @XCRobert, @colanx, @chenjiaming-kezaihui, @app/dependabot, and the gaebal-gajae (clawdbot) release and repair lanes.
+Thanks to Bellman (@Yeachan-Heo), @FacuVCanale, @NagyVikt, @berahac, @XCRobert, @colanx, @wangxingzhen, @chenjiaming-kezaihui, @app/dependabot, and the gaebal-gajae (clawdbot) release and repair lanes.
 
 **Full Changelog**: [`v0.21.0...v0.21.1`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.0...v0.21.1)
