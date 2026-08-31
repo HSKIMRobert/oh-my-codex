@@ -96,6 +96,70 @@ describe('renderHud – gitBranch', () => {
   });
 });
 
+// ── GitGuardex finish ─────────────────────────────────────────────────────────────
+
+describe('renderHud – GitGuardex finish', () => {
+  it('renders the current finish step in every preset', () => {
+    const ctx = {
+      ...emptyCtx(),
+      guardexFinish: {
+        active: true as const,
+        stage: 'ci',
+        state: 'running',
+        index: 6,
+        total: 8,
+        label: 'CI checks',
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    for (const preset of ['minimal', 'focused', 'full'] as const) {
+      assert.ok(stripSgr(renderHud(ctx, preset)).includes('gx:6/8 ci'));
+    }
+  });
+
+  it('animates review while it is running', () => {
+    const ctx = {
+      ...emptyCtx(),
+      guardexFinish: {
+        active: true as const,
+        stage: 'review',
+        state: 'running',
+        index: 4,
+        total: 8,
+        label: 'AI review',
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    mock.method(Date, 'now', () => 0);
+    const first = stripSgr(renderHud(ctx, 'focused'));
+    mock.restoreAll();
+    mock.method(Date, 'now', () => 250);
+    const second = stripSgr(renderHud(ctx, 'focused'));
+
+    assert.match(first, /gx:4\/8 review [◐◓◑◒]/u);
+    assert.match(second, /gx:4\/8 review [◐◓◑◒]/u);
+    assert.notEqual(first, second);
+  });
+
+  it('does not animate a settled review phase', () => {
+    const ctx = {
+      ...emptyCtx(),
+      guardexFinish: {
+        active: true as const,
+        stage: 'review',
+        state: 'complete',
+        index: 4,
+        total: 8,
+        label: 'AI review',
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    assert.equal(stripSgr(renderHud(ctx, 'focused')).includes('◐'), false);
+  });
+});
+
 // ── Ralph ─────────────────────────────────────────────────────────────────────
 
 describe('renderHud – ralph', () => {

@@ -4,7 +4,7 @@
  * Reads .omx/state/ files to build HUD render context.
  */
 
-import { readFile } from 'fs/promises';
+import { open, readFile, readdir, stat } from 'fs/promises';
 import { execFileSync } from 'child_process';
 import { join, basename } from 'path';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
@@ -39,6 +39,7 @@ import type {
   ResolvedHudConfig,
   HudGitDisplay,
   LateGateHudSource,
+  GuardexFinishStateForHud,
 } from './types.js';
 import { DEFAULT_HUD_CONFIG } from './types.js';
 
@@ -74,6 +75,122 @@ function sanitizeOptionalString(value: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+const GUARDEX_FINISH_TAIL_BYTES = 64 * 1024;
+const GUARDEX_FINISH_MAX_CANDIDATES = 32;
+const GUARDEX_FINISH_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const GUARDEX_FINISH_RUN_ID_RE = /^finish-[^-]+-(\d+)-/;
+const GUARDEX_TERMINAL_STATES = new Set(['failed', 'finished']);
+
+interface RawGuardexFinishEvent {
+  schemaVersion?: unknown;
+  runId?: unknown;
+  timestamp?: unknown;
+  stage?: unknown;
+  state?: unknown;
+  index?: unknown;
+  total?: unknown;
+  label?: unknown;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function readFileTail(path: string): Promise<string> {
+  const handle = await open(path, 'r');
+  try {
+    const fileStat = await handle.stat();
+    const length = Math.min(fileStat.size, GUARDEX_FINISH_TAIL_BYTES);
+    if (length <= 0) return '';
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, fileStat.size - length);
+    return buffer.toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
+function normalizeGuardexFinishEvent(raw: RawGuardexFinishEvent): GuardexFinishStateForHud | null {
+  if (raw.schemaVersion !== 1) return null;
+  const runId = sanitizeOptionalString(raw.runId);
+  const timestamp = sanitizeOptionalString(raw.timestamp);
+  const stage = sanitizeOptionalString(raw.stage);
+  const state = sanitizeOptionalString(raw.state);
+  const label = sanitizeOptionalString(raw.label);
+  const index = Number(raw.index);
+  const total = Number(raw.total);
+  const pidMatch = runId?.match(GUARDEX_FINISH_RUN_ID_RE);
+  const pid = Number(pidMatch?.[1]);
+  const updatedAt = timestamp ? Date.parse(timestamp) : Number.NaN;
+
+  if (!runId || !timestamp || !stage || stage === 'finish' || !state || state === 'pending' || !label) return null;
+  if (!Number.isSafeInteger(index) || index <= 0 || !Number.isSafeInteger(total) || total <= 0 || index > total) return null;
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !isProcessAlive(pid)) return null;
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > GUARDEX_FINISH_MAX_AGE_MS) return null;
+  if (GUARDEX_TERMINAL_STATES.has(state)) return null;
+
+  return {
+    active: true,
+    stage: stage.slice(0, 40),
+    state: state.slice(0, 40),
+    index,
+    total,
+    label: label.slice(0, 80),
+    updatedAt: timestamp,
+  };
+}
+
+async function readGuardexFinishFile(path: string): Promise<GuardexFinishStateForHud | null> {
+  try {
+    const lines = (await readFileTail(path)).split('\n');
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index]?.trim();
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line) as RawGuardexFinishEvent;
+        const state = normalizeGuardexFinishEvent(event);
+        if (state) return state;
+        if (event.schemaVersion === 1 && GUARDEX_TERMINAL_STATES.has(String(event.state || ''))) return null;
+      } catch {
+        // The writer may be appending the trailing JSON line while the HUD reads it.
+      }
+    }
+  } catch {
+    // Optional observability must remain fail-open for missing or unreadable files.
+  }
+  return null;
+}
+
+/** Read the newest active GitGuardex branch-finish event stream. */
+export async function readGuardexFinishState(cwd: string): Promise<GuardexFinishStateForHud | null> {
+  // Guardex writes to the repository-local state directory, independent of
+  // OMX session/team state-root overrides inherited by the HUD process.
+  const repoRoot = findGitLayout(cwd)?.worktreeRoot ?? cwd;
+  const directory = join(repoRoot, '.omx', 'state', 'finish-runs');
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    const candidates = await Promise.all(entries
+      .filter(entry => entry.isFile() && entry.name.startsWith('finish-') && entry.name.endsWith('.jsonl'))
+      .map(async entry => ({
+        path: join(directory, entry.name),
+        modifiedAt: (await stat(join(directory, entry.name))).mtimeMs,
+      })));
+    candidates.sort((left, right) => right.modifiedAt - left.modifiedAt);
+    for (const candidate of candidates.slice(0, GUARDEX_FINISH_MAX_CANDIDATES)) {
+      const state = await readGuardexFinishFile(candidate.path);
+      if (state) return state;
+    }
+  } catch {
+    // GitGuardex is optional; repos without its state directory render normally.
+  }
+  return null;
+}
+
 export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedHudConfig {
   const normalized: ResolvedHudConfig = {
     preset: DEFAULT_HUD_CONFIG.preset,
@@ -82,6 +199,9 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
     },
     statusLine: {
       preset: DEFAULT_HUD_CONFIG.statusLine.preset,
+    },
+    guardex: {
+      enabled: DEFAULT_HUD_CONFIG.guardex?.enabled === true,
     },
   };
 
@@ -107,6 +227,10 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
     if (isValidPreset(raw.statusLine.preset)) {
       normalized.statusLine.preset = raw.statusLine.preset;
     }
+  }
+
+  if (raw.guardex && typeof raw.guardex === 'object' && typeof raw.guardex.enabled === 'boolean') {
+    normalized.guardex = { enabled: raw.guardex.enabled };
   }
 
   return normalized;
@@ -614,12 +738,13 @@ function codeReviewFromSubagentEvidence(
 export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFAULT_HUD_CONFIG): Promise<HudRenderContext> {
   const version = readVersion();
   const gitBranch = buildGitBranchLabel(cwd, config);
-  const [metrics, hudNotify, session, currentSessionId, subagentTracking] = await Promise.all([
+  const [metrics, hudNotify, session, currentSessionId, subagentTracking, guardexFinish] = await Promise.all([
     readMetrics(cwd),
     readHudNotifyState(cwd),
     readSessionState(cwd),
     readCurrentSessionId(cwd),
     readSubagentTrackingState(cwd),
+    config.guardex?.enabled === true ? readGuardexFinishState(cwd) : Promise.resolve(null),
   ]);
   const stateDir = getBaseStateDir(cwd);
   const canonicalSkillState = await readVisibleSkillActiveStateForStateDir(stateDir, currentSessionId);
@@ -733,6 +858,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     codeReview,
     ultraqa,
     team,
+    guardexFinish,
     metrics,
     hudNotify,
     session,

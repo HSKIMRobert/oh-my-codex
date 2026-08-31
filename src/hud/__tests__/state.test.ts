@@ -19,6 +19,8 @@ import {
   readDeepInterviewState,
   readAutoresearchState,
   readUltraqaState,
+  readGuardexFinishState,
+  normalizeHudConfig,
 } from '../state.js';
 
 function gitRunnerFromMap(map: Record<string, string | Error>) {
@@ -61,6 +63,74 @@ async function writeModeState(cwd: string, mode: string, state: unknown): Promis
   await mkdir(stateDir, { recursive: true });
   await writeFile(join(stateDir, mode + '-state.json'), JSON.stringify(state));
 }
+
+async function writeGuardexFinishEvents(cwd: string, runId: string, events: unknown[]): Promise<void> {
+  const runDir = join(cwd, '.omx', 'state', 'finish-runs');
+  await mkdir(runDir, { recursive: true });
+  await writeFile(join(runDir, `${runId}.jsonl`), `${events.map(event => JSON.stringify(event)).join('\n')}\n`);
+}
+
+describe('readGuardexFinishState', () => {
+  it('reads the latest non-pending phase from a live finish process', async () => {
+    await withTempRepo('omx-hud-guardex-finish-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      const timestamp = new Date().toISOString();
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp, stage: 'cleanup', state: 'pending', index: 8, total: 8, label: 'Cleanup' },
+        { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+      ]);
+
+      assert.deepEqual(await readGuardexFinishState(cwd), {
+        active: true,
+        stage: 'review',
+        state: 'running',
+        index: 4,
+        total: 8,
+        label: 'AI review',
+        updatedAt: timestamp,
+      });
+      assert.equal((await readAllState(cwd)).guardexFinish, null);
+      const enabledConfig = normalizeHudConfig({ guardex: { enabled: true } });
+      assert.equal((await readAllState(cwd, enabledConfig)).guardexFinish?.stage, 'review');
+    });
+  });
+
+  it('hides a finish run after its terminal cleanup event', async () => {
+    await withTempRepo('omx-hud-guardex-finished-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'cleanup', state: 'finished', index: 8, total: 8, label: 'Cleanup' },
+      ]);
+
+      assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+
+  it('ignores malformed trailing JSON and keeps the last valid live phase', async () => {
+    await withTempRepo('omx-hud-guardex-partial-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      const runDir = join(cwd, '.omx', 'state', 'finish-runs');
+      await mkdir(runDir, { recursive: true });
+      await writeFile(join(runDir, `${runId}.jsonl`), [
+        JSON.stringify({ schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'ci', state: 'running', index: 6, total: 8, label: 'CI checks' }),
+        '{"schemaVersion":1,"stage":',
+      ].join('\n'));
+
+      assert.equal((await readGuardexFinishState(cwd))?.stage, 'ci');
+    });
+  });
+
+  it('hides an abandoned run whose finish process is no longer alive', async () => {
+    await withTempRepo('omx-hud-guardex-abandoned-', async (cwd) => {
+      const runId = 'finish-test-2147483647-12345678';
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'merge', state: 'running', index: 7, total: 8, label: 'Merge' },
+      ]);
+
+      assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+});
 
 function initGitRepo(cwd: string): void {
   execFileSync('git', ['init'], { cwd, stdio: 'ignore' });

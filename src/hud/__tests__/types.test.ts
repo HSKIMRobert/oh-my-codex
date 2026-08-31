@@ -15,6 +15,10 @@ describe('DEFAULT_HUD_CONFIG', () => {
   it('defaults statusLine preset to "focused"', () => {
     assert.equal(DEFAULT_HUD_CONFIG.statusLine.preset, 'focused');
   });
+
+  it('keeps GitGuardex integration disabled by default', () => {
+    assert.deepEqual(DEFAULT_HUD_CONFIG.guardex, { enabled: false });
+  });
 });
 
 describe('normalizeHudConfig', () => {
@@ -28,6 +32,7 @@ describe('normalizeHudConfig', () => {
       preset: 'minimal',
       git: { display: 'repo-branch' },
       statusLine: { preset: 'focused' },
+      guardex: { enabled: false },
     });
   });
 
@@ -47,6 +52,7 @@ describe('normalizeHudConfig', () => {
         repoLabel: 'manual-repo',
       },
       statusLine: { preset: 'focused' },
+      guardex: { enabled: false },
     });
   });
 
@@ -84,5 +90,10 @@ describe('normalizeHudConfig', () => {
     });
     assert.equal(resolved.preset, 'minimal');
     assert.equal(resolved.statusLine.preset, 'full');
+  });
+
+  it('enables GitGuardex progress only when explicitly configured', () => {
+    assert.equal(normalizeHudConfig({ guardex: { enabled: true } }).guardex?.enabled, true);
+    assert.equal(normalizeHudConfig({ guardex: { enabled: 'yes' as never } }).guardex?.enabled, false);
   });
 });

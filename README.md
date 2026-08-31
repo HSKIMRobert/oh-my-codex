@@ -379,6 +379,7 @@ These are operator/support surfaces:
 - `.omx-config.json` model/env routing is documented in [the model/env routing reference](./docs/reference/omx-config-schema-routing.md); only edit keys supported by your installed OMX version
 - `omx doctor` verifies the install when something seems wrong; it does not prove that the active Codex profile can make an authenticated model call
 - `omx hud --watch` is a monitoring/status surface, not the primary user workflow
+- GitGuardex finish progress is opt-in. Add `"guardex": { "enabled": true }` to the project-local `.omx/hud-config.json` to show `gx:<step>/<total> <phase>`; running review/autofix phases animate in the HUD. OMX does not read Guardex state when this flag is absent or false.
 
 For non-team sessions, native Codex hooks are now the canonical lifecycle surface:
 - `plugins/oh-my-codex/hooks/hooks.json` = official plugin-scoped hook registrations for plugin installs
