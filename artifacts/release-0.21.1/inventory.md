@@ -1,11 +1,11 @@
-# Release inventory — v0.21.0..dev@39c70861
+# Release inventory — v0.21.0..dev@abf2393a
 
 - Previous tag: `v0.21.0` = `3ad79a8a6fe6e95fdbb8c00e40716fffe4011ce2`.
-- Candidate: `dev@39c70861a124b733f3b7eef42969e1dcba4344b9`.
-- Range: 123 commits, 114 files, +23,880/−1,140.
+- Candidate: `dev@abf2393af1e1f9355adfe43166432462a86d2e54`.
+- Range: 125 commits, 116 files, +23,996/−1,141.
 - Merge commits: 29, including branch reconciliation commits inside the long-running Advisory contribution.
-- Commit-subject issue/PR references: 27 — #3552, #3555, #3557, #3558, #3560, #3561, #3562, #3563, #3566, #3568, #3569, #3570, #3571, #3572, #3577, #3578, #3579, #3580, #3581, #3582, #3584, #3585, #3588, #3590, #3592, #3594, #3595.
-- Additional linked issues cited by the merged changes and release notes: #3587 and #3589. Total tracked release references: 29.
+- Commit-subject issue/PR references: 28 — #3552, #3555, #3557, #3558, #3560, #3561, #3562, #3563, #3566, #3568, #3569, #3570, #3571, #3572, #3577, #3578, #3579, #3580, #3581, #3582, #3584, #3585, #3588, #3590, #3592, #3594, #3595, #3597.
+- Additional linked issues cited by the merged changes and release notes: #3587 and #3589. Total tracked release references: 30.
 - Contributors in git shortlog: gaebal-gajae, Bellman, FacuVCanale, NagyVikt, Cristian Beraha, Colan Xu, dependabot, and 陈家名.
 
 ## Release trains
@@ -31,7 +31,7 @@
 ## Reproduction
 
 ```sh
-git rev-list --count v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9
-git diff --shortstat v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9
-git log --pretty='%s' v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9 | grep -oE '#[0-9]+' | sort -u # 27 subject references
+git rev-list --count v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54
+git diff --shortstat v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54
+git log --pretty='%s' v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54 | grep -oE '#[0-9]+' | sort -u # 28 subject references
 ```

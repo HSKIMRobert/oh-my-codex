@@ -2,12 +2,13 @@
 
 Release date: 2026-08-31
 
-`0.21.1` is a patch release covering `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9`: 123 commits, 114 changed files (+23,880/−1,140), 27 commit-subject issue/PR references, and two additional linked issues (#3587, #3589). It hardens release authority, detached HUD/session cleanup, state and plugin provenance, and introduces Ralplan Advisory as a cooperative, non-authorizing planning workflow.
+`0.21.1` is a patch release covering `v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54`: 125 commits, 116 changed files (+23,996/−1,141), 28 commit-subject issue/PR references, and two additional linked issues (#3587, #3589). It hardens release authority, detached HUD/session cleanup, state and plugin provenance, and introduces Ralplan Advisory as a cooperative, non-authorizing planning workflow.
 
 ## Highlights
 
 - **Ralplan Advisory / Contract A** — adds cooperative Planner → Architect → Critic review evidence without granting execution authority, installing a global tool fence, suppressing unrelated workflows, or automatically handing off to implementation. Lifecycle evidence, reviewer-time artifact bytes, crash recovery, canonical mode/skill mirrors, generation CAS, and cross-platform durability fail closed (#3594).
 - **HUD ownership and layout reconciliation** — keeps each HUD adjacent to its owning pane across split, join, move, swap, and layout changes; hook identity, cleanup, contention re-arming, detached ownership, and real-tmux behavior are regression-tested (#3577, #3578, #3584, #3587, #3588, #3595).
+- **Team legacy HUD compatibility** — Team startup recognizes both session-only and leader-only legacy HUD ownership before freezing window topology (#3597).
 - **Trusted release and package authority** — tag publication is bound to `main` ancestry and exact SHA, npm publishing uses trusted publishing, manual token publishing is retired, release assets are verified, and plugin/cache provenance rejects symlink and namespace confusion (#3552, #3566, #3570, #3571, #3572).
 - **Cross-platform state and process identity** — state writes, canonical leases, lock recovery, session pointers, and detached cleanup distinguish exact process incarnations and preserve Windows/macOS path and durability semantics (#3558, #3561, #3581, #3582).
 - **Runtime and configuration reliability** — fixes Ralph native-app deadlock recovery, malformed SparkShell tail-line parsing, empty hooks-state recovery, and generated config trust checks (#3589, #3590, #3592).

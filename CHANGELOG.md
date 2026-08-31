@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 ## [0.21.1] - 2026-08-31
 
-Patch release for `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9` (123 commits, 114 changed files, +23,880/−1,140, 27 commit-subject references plus linked issues #3587/#3589).
+Patch release for `v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54` (125 commits, 116 changed files, +23,996/−1,141, 28 commit-subject references plus linked issues #3587/#3589).
 
 ### Added
 
@@ -19,6 +19,7 @@ Patch release for `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9` (123 commi
 ### Fixed
 
 - **Detached HUD and session lifecycle** — exact owner-pane cleanup, refresh rendering, split and non-split tmux layout reconciliation, stable hook cleanup identity, and contention re-arming (#3577, #3578, #3584, #3587, #3588, #3595).
+- **Team legacy HUD startup** — recognizes and safely removes both same-session-only and leader-only legacy HUD panes before topology freeze (#3597).
 - **Plugin/cache/launcher provenance** — symlink, namespace, and stale launcher confusion fail closed (#3558, #3561).
 - **Runtime and configuration reliability** — Ralph native-app deadlock recovery, SparkShell tail-line validation, empty hooks-state recovery, and generated configuration trust checks (#3589, #3590, #3592).
 

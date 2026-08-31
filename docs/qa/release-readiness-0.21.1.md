@@ -5,9 +5,9 @@
 - Release: `0.21.1` (patch).
 - Date: 2026-08-31.
 - Previous tag: `v0.21.0` (`3ad79a8a6fe6e95fdbb8c00e40716fffe4011ce2`).
-- Frozen dev base: `39c70861a124b733f3b7eef42969e1dcba4344b9`.
-- Exact range: `v0.21.0..39c70861a124b733f3b7eef42969e1dcba4344b9`.
-- Range size: 123 commits, 114 changed files (+23,880/−1,140), 27 commit-subject references plus linked issues #3587/#3589 (29 tracked references).
+- Frozen dev base: `abf2393af1e1f9355adfe43166432462a86d2e54`.
+- Exact range: `v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54`.
+- Range size: 125 commits, 116 changed files (+23,996/−1,141), 28 commit-subject references plus linked issues #3587/#3589 (30 tracked references).
 - Backlog at freeze: 0 open PRs, 0 open issues.
 - Owner authorization: direct `ㄱ` in the OmX release-candidate thread, reaffirmed on 2026-08-31.
 
@@ -23,7 +23,7 @@
 
 | Gate | Evidence | Status |
 |---|---|---|
-| Ancestry | `git merge-base --is-ancestor v0.21.0 39c70861` | Pending recorded run |
+| Ancestry | `git merge-base --is-ancestor v0.21.0 abf2393a` | Pending recorded run |
 | Inventory | `artifacts/release-0.21.1/inventory.md` | Prepared |
 | Version sync | `GITHUB_REF_NAME=v0.21.1 node dist/scripts/check-version-sync.js` | Pending validation |
 | Build/static/generated | build, no-unused, lint, native/plugin/capability/prompt parity | Pending validation |
