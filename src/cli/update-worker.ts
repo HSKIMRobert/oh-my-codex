@@ -5,6 +5,7 @@ import { basename, isAbsolute, join, relative } from 'node:path';
 
 import { isCompletePackageManagerOwnership, runNpmCommand, validatePackageManagerOwnership, type PackageManagerOwnership } from './package-manager-ownership.js';
 import { writeUserInstallStamp } from '../scripts/postinstall-advisory.js';
+import { hydrateOmxRuntimeNonFatal } from '../scripts/postinstall.js';
 import { omxUserInstallStampPath } from '../utils/paths.js';
 
 type DeferredUpdatePayload = { cwd: string; logPath: string; parentPid: number; ownership: PackageManagerOwnership; setupArgs: string[] };
@@ -111,6 +112,14 @@ async function main(): Promise<void> {
     if (result.error || result.status !== 0) throw new Error(String(result.stderr || result.error?.message || 'controller install failed'));
     const cliEntry = await validatePackageManagerOwnership(payload.ownership);
     if (!cliEntry) throw new Error('Frozen manager, package root, or bin ownership validation failed after update.');
+    // The package was installed with --ignore-scripts. Hydrate before setup so
+    // setup failure still leaves the installed version with a repaired runtime
+    // cache and the recovery command does not repeat the omission.
+    await hydrateOmxRuntimeNonFatal({
+      packageRoot: payload.ownership.packageRoot,
+      env: payload.ownership.environment,
+      log: (message) => appendFile(payload!.logPath, `${message}\n`).then(() => undefined),
+    });
     const setup = spawnSync(process.execPath, [cliEntry, ...payload.setupArgs], { cwd: payload.cwd, env: { ...payload.ownership.environment, [SKIP_NATIVE_AGENT_REFRESH_ENV]: '1' }, stdio: 'inherit', windowsHide: true });
     if (setup.error || setup.status !== 0) throw new Error(setup.error?.message || `setup exited ${setup.status}`);
     await finalizeSuccessfulUpdate(payload.ownership);

@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 import { renderHud } from '../render.js';
@@ -19,6 +19,9 @@ import {
   readDeepInterviewState,
   readAutoresearchState,
   readUltraqaState,
+  readGuardexFinishState,
+  readHudConfig,
+  normalizeHudConfig,
 } from '../state.js';
 
 function gitRunnerFromMap(map: Record<string, string | Error>) {
@@ -61,6 +64,112 @@ async function writeModeState(cwd: string, mode: string, state: unknown): Promis
   await mkdir(stateDir, { recursive: true });
   await writeFile(join(stateDir, mode + '-state.json'), JSON.stringify(state));
 }
+
+async function writeGuardexFinishEvents(cwd: string, runId: string, events: unknown[]): Promise<void> {
+  const runDir = join(cwd, '.omx', 'state', 'finish-runs');
+  await mkdir(runDir, { recursive: true });
+  await writeFile(join(runDir, `${runId}.jsonl`), `${events.map(event => JSON.stringify(event)).join('\n')}\n`);
+}
+
+describe('readGuardexFinishState', () => {
+  it('reads the latest non-pending phase from a live finish process', async () => {
+    await withTempRepo('omx-hud-guardex-finish-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      const timestamp = new Date().toISOString();
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp, stage: 'cleanup', state: 'pending', index: 8, total: 8, label: 'Cleanup' },
+        { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+      ]);
+
+      assert.deepEqual(await readGuardexFinishState(cwd), {
+        active: true,
+        stage: 'review',
+        state: 'running',
+        index: 4,
+        total: 8,
+        label: 'AI review',
+        updatedAt: timestamp,
+      });
+      assert.equal((await readAllState(cwd)).guardexFinish, null);
+      const enabledConfig = normalizeHudConfig({ guardex: { enabled: true } });
+      assert.equal((await readAllState(cwd, enabledConfig)).guardexFinish?.stage, 'review');
+    });
+  });
+
+  it('hides a finish run after its terminal cleanup event', async () => {
+    await withTempRepo('omx-hud-guardex-finished-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'cleanup', state: 'finished', index: 8, total: 8, label: 'Cleanup' },
+      ]);
+
+      assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+
+  it('ignores malformed trailing JSON and keeps the last valid live phase', async () => {
+    await withTempRepo('omx-hud-guardex-partial-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      const runDir = join(cwd, '.omx', 'state', 'finish-runs');
+      await mkdir(runDir, { recursive: true });
+      await writeFile(join(runDir, `${runId}.jsonl`), [
+        JSON.stringify({ schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'ci', state: 'running', index: 6, total: 8, label: 'CI checks' }),
+        '{"schemaVersion":1,"stage":',
+      ].join('\n'));
+
+      assert.equal((await readGuardexFinishState(cwd))?.stage, 'ci');
+    });
+  });
+
+  it('hides an abandoned run whose finish process is no longer alive', async () => {
+    await withTempRepo('omx-hud-guardex-abandoned-', async (cwd) => {
+      const runId = 'finish-test-2147483647-12345678';
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'merge', state: 'running', index: 7, total: 8, label: 'Merge' },
+      ]);
+
+      assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+
+  it('bounds metadata reads when historical finish streams accumulate', async () => {
+    await withTempRepo('omx-hud-guardex-bounded-', async (cwd) => {
+      const timestamp = new Date().toISOString();
+      for (let index = 0; index < 40; index += 1) {
+        const startedAt = (Date.now() - index).toString(36);
+        const runId = `finish-${startedAt}-${process.pid}-${String(index).padStart(8, '0')}`;
+        await writeGuardexFinishEvents(cwd, runId, [
+          { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+        ]);
+      }
+
+      let metadataReads = 0;
+      const state = await readGuardexFinishState(cwd, {
+        statFile: async path => {
+          metadataReads += 1;
+          return stat(path);
+        },
+      });
+
+      assert.equal(state?.stage, 'review');
+      assert.equal(metadataReads, 32);
+    });
+  });
+});
+
+describe('readHudConfig', () => {
+  it('loads the project-local config when invoked from a nested directory', async () => {
+    await withTempRepo('omx-hud-config-nested-', async (cwd) => {
+      initGitRepo(cwd);
+      const nested = join(cwd, 'packages', 'app');
+      await mkdir(join(cwd, '.omx'), { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(cwd, '.omx', 'hud-config.json'), JSON.stringify({ guardex: { enabled: true } }));
+
+      assert.equal((await readHudConfig(nested)).guardex?.enabled, true);
+    });
+  });
+});
 
 function initGitRepo(cwd: string): void {
   execFileSync('git', ['init'], { cwd, stdio: 'ignore' });

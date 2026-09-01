@@ -56,6 +56,22 @@ function renderGitBranch(ctx: HudRenderContext): string | null {
   return cyan(gitBranch);
 }
 
+const GUARDEX_SPINNER_FRAMES = ['◐', '◓', '◑', '◒'] as const;
+const GUARDEX_SPINNER_FRAME_MS = 400;
+
+function renderGuardexFinish(ctx: HudRenderContext): string | null {
+  if (!ctx.guardexFinish?.active) return null;
+  const { index, total, state } = ctx.guardexFinish;
+  if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index <= 0 || total <= 0 || index > total) return null;
+  const stage = sanitizeDynamicText(ctx.guardexFinish.stage).slice(0, 40);
+  if (!stage) return null;
+  const animates = state === 'running' && (stage === 'review' || stage === 'autofix');
+  const frame = animates
+    ? ` ${GUARDEX_SPINNER_FRAMES[Math.floor(Date.now() / GUARDEX_SPINNER_FRAME_MS) % GUARDEX_SPINNER_FRAMES.length]}`
+    : '';
+  return yellow(`gx:${index}/${total} ${stage}${frame}`);
+}
+
 function renderRalph(ctx: HudRenderContext): string | null {
   if (!ctx.ralph) return null;
   const { iteration, max_iterations } = ctx.ralph;
@@ -299,6 +315,7 @@ type ElementRenderer = (ctx: HudRenderContext) => string | null;
 
 const MINIMAL_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
+  renderGuardexFinish,
   renderRalph,
   renderUltrawork,
   renderRalplan,
@@ -313,6 +330,7 @@ const MINIMAL_ELEMENTS: ElementRenderer[] = [
 
 const FOCUSED_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
+  renderGuardexFinish,
   renderRalph,
   renderUltrawork,
   renderAutopilot,
@@ -332,6 +350,7 @@ const FOCUSED_ELEMENTS: ElementRenderer[] = [
 
 const FULL_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
+  renderGuardexFinish,
   renderRalph,
   renderUltrawork,
   renderAutopilot,

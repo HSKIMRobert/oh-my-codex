@@ -33,6 +33,7 @@ describe("runPostinstall", () => {
       const result = await runPostinstall({
         env: { npm_config_global: "true" },
         getCurrentVersion: async () => "0.14.1",
+        hydrateRuntime: async () => "/cache/omx-runtime",
         log: (message) => logs.push(message),
         readStamp: async () => ({
           installed_version: "0.14.0",
@@ -44,6 +45,7 @@ describe("runPostinstall", () => {
       });
 
       assert.equal(result.status, "hinted");
+      assert.match(logs.join("\n"), /Hydrated omx-runtime/);
       assert.match(logs.join("\n"), /OMX setup is explicit opt-in; run `omx setup` or `omx update` when you're ready/);
 
       const stamp = JSON.parse(await readFile(stampPath, "utf-8")) as {
@@ -68,6 +70,7 @@ describe("runPostinstall", () => {
       const result = await runPostinstall({
         env: { npm_config_global: "true" },
         getCurrentVersion: async () => "0.14.1",
+        hydrateRuntime: async () => "/cache/omx-runtime",
         log: (message) => logs.push(message),
         readStamp: async () => ({
           installed_version: "0.14.0",
@@ -100,6 +103,7 @@ describe("runPostinstall", () => {
         npm_config_user_agent: "bun/1.2.0 npm/? node/v22.0.0 linux x64",
       },
       getCurrentVersion: async () => "0.14.1",
+      hydrateRuntime: async () => "/cache/omx-runtime",
       readStamp: async () => null,
       writeStamp: async (stamp) => {
         writtenStamp = stamp;
@@ -114,15 +118,21 @@ describe("runPostinstall", () => {
     const result = await runPostinstall({
       env: { npm_config_global: "false" },
       getCurrentVersion: async () => "0.14.1",
+      hydrateRuntime: async () => "/cache/omx-runtime",
     });
 
     assert.equal(result.status, "noop-local");
   });
 
   it("does not rerun setup when the installed version matches the saved stamp", async () => {
+    let hydrated = false;
     const result = await runPostinstall({
       env: { npm_config_global: "true" },
       getCurrentVersion: async () => "0.14.1",
+      hydrateRuntime: async () => {
+        hydrated = true;
+        return "/cache/omx-runtime";
+      },
       readStamp: async () => ({
         installed_version: "0.14.1",
         setup_completed_version: "0.14.1",
@@ -131,5 +141,23 @@ describe("runPostinstall", () => {
     });
 
     assert.equal(result.status, "noop-same-version");
+    assert.equal(hydrated, true, "same-version reinstalls must repair a missing native runtime cache");
+  });
+
+  it("keeps global installation non-fatal when runtime hydration fails", async () => {
+    const logs: string[] = [];
+    const result = await runPostinstall({
+      env: { npm_config_global: "true" },
+      getCurrentVersion: async () => "0.14.1",
+      hydrateRuntime: async () => {
+        throw new Error("offline");
+      },
+      log: (message) => logs.push(message),
+      readStamp: async () => null,
+      writeStamp: async () => {},
+    });
+
+    assert.equal(result.status, "hinted");
+    assert.match(logs.join("\n"), /hydration failed non-fatally: offline/);
   });
 });
