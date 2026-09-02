@@ -57,6 +57,7 @@ interface LedgerNotice extends TeamNoticeContext {
 interface WakeLease {
   wakeId: string;
   createdAtMs: number;
+  confirmedAtMs?: number;
 }
 
 interface NoticeLedger {
@@ -144,10 +145,15 @@ function normalizeLedger(raw: unknown): NoticeLedger {
   for (const [targetKey, rawWake] of Object.entries(parsed.wakes)) {
     if (!TARGET_KEY_PATTERN.test(targetKey) || !rawWake || typeof rawWake !== 'object') throw new Error('invalid_team_notice_wake');
     const wake = rawWake as Partial<WakeLease>;
-    if (typeof wake.wakeId !== 'string' || typeof wake.createdAtMs !== 'number' || !Number.isSafeInteger(wake.createdAtMs)) {
+    if (typeof wake.wakeId !== 'string' || typeof wake.createdAtMs !== 'number' || !Number.isSafeInteger(wake.createdAtMs)
+      || (wake.confirmedAtMs !== undefined && (typeof wake.confirmedAtMs !== 'number' || !Number.isSafeInteger(wake.confirmedAtMs)))) {
       throw new Error('invalid_team_notice_wake');
     }
-    ledger.wakes[targetKey] = { wakeId: wake.wakeId, createdAtMs: wake.createdAtMs };
+    ledger.wakes[targetKey] = {
+      wakeId: wake.wakeId,
+      createdAtMs: wake.createdAtMs,
+      ...(wake.confirmedAtMs !== undefined ? { confirmedAtMs: wake.confirmedAtMs } : {}),
+    };
   }
   return ledger;
 }
@@ -212,6 +218,9 @@ export async function registerTeamNotice(registration: TeamNoticeRegistration): 
   return await withLedgerLock(stateRoot, async () => {
     const ledger = await readLedger(stateRoot);
     const targetKey = teamNoticeTargetKey(registration.targetId);
+    if (!await teamAllowsNoticeRegistration(stateRoot, registration.teamName)) {
+      return { generation, queued: false, prompt: null, targetKey, wakeId: null };
+    }
     // A later source-proven event confirms the previous presented batch reached a model turn.
     for (const [key, notice] of Object.entries(ledger.notices)) {
       if (notice.targetKey === targetKey && notice.presentedAt) delete ledger.notices[key];
@@ -226,7 +235,7 @@ export async function registerTeamNotice(registration: TeamNoticeRegistration): 
     }
     const now = Date.now();
     const existingWake = ledger.wakes[targetKey];
-    if (existingWake && now - existingWake.createdAtMs <= WAKE_STALE_MS) {
+    if (existingWake && (existingWake.confirmedAtMs !== undefined || now - existingWake.createdAtMs <= WAKE_STALE_MS)) {
       await writeAtomic(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
       return { generation, queued: false, prompt: null, targetKey, wakeId: existingWake.wakeId };
     }
@@ -234,6 +243,18 @@ export async function registerTeamNotice(registration: TeamNoticeRegistration): 
     ledger.wakes[targetKey] = { wakeId, createdAtMs: now };
     await writeAtomic(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
     return { generation, queued: true, prompt: buildTeamNoticeLedgerPrompt(targetKey), targetKey, wakeId };
+  });
+}
+
+export async function confirmTeamNoticeWake(stateRoot: string, targetKey: string, wakeId: string): Promise<boolean> {
+  if (!TARGET_KEY_PATTERN.test(targetKey) || !wakeId) return false;
+  return await withLedgerLock(stateRoot, async () => {
+    const ledger = await readLedger(stateRoot);
+    const wake = ledger.wakes[targetKey];
+    if (wake?.wakeId !== wakeId) return false;
+    wake.confirmedAtMs ??= Date.now();
+    await writeAtomic(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
+    return true;
   });
 }
 
@@ -245,6 +266,36 @@ export async function releaseTeamNoticeWake(stateRoot: string, targetKey: string
     delete ledger.wakes[targetKey];
     await writeAtomic(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
     return true;
+  });
+}
+
+export async function discardTeamNoticesForTeam(
+  stateRoot: string,
+  teamName: string,
+): Promise<{ notices: number; wakes: number }> {
+  if (!teamName) return { notices: 0, wakes: 0 };
+  return await withLedgerLock(stateRoot, async () => {
+    const ledger = await readLedger(stateRoot);
+    const affectedTargets = new Set<string>();
+    let notices = 0;
+    for (const [key, notice] of Object.entries(ledger.notices)) {
+      if (notice.teamName !== teamName) continue;
+      affectedTargets.add(notice.targetKey);
+      delete ledger.notices[key];
+      notices += 1;
+    }
+    let wakes = 0;
+    for (const targetKey of affectedTargets) {
+      const targetStillHasNotices = Object.values(ledger.notices).some((notice) => notice.targetKey === targetKey);
+      if (!targetStillHasNotices && ledger.wakes[targetKey]) {
+        delete ledger.wakes[targetKey];
+        wakes += 1;
+      }
+    }
+    if (notices > 0 || wakes > 0) {
+      await writeAtomic(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
+    }
+    return { notices, wakes };
   });
 }
 
@@ -261,9 +312,35 @@ async function teamIsLive(stateRoot: string, teamName: string): Promise<boolean>
     }
   }
   try {
-    const phase = JSON.parse(await readFile(join(teamDir, 'phase.json'), 'utf8')) as { current_phase?: unknown };
-    return !(typeof phase.current_phase === 'string' && TERMINAL_PHASES.has(phase.current_phase));
+    const phase = JSON.parse(await readFile(join(teamDir, 'phase.json'), 'utf8')) as {
+      current_phase?: unknown;
+      terminal_epoch?: unknown;
+    };
+    return phase.terminal_epoch === undefined
+      && !(typeof phase.current_phase === 'string' && TERMINAL_PHASES.has(phase.current_phase));
   } catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT'; }
+}
+
+async function teamAllowsNoticeRegistration(stateRoot: string, teamName: string): Promise<boolean> {
+  const teamDir = join(stateRoot, 'team', teamName);
+  try {
+    if (!(await stat(teamDir)).isDirectory()) return false;
+  } catch { return false; }
+  for (const shutdownName of ['shutdown.json', 'shutdown']) {
+    try { await stat(join(teamDir, shutdownName)); return false; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+    }
+  }
+  try {
+    const phase = JSON.parse(await readFile(join(teamDir, 'phase.json'), 'utf8')) as {
+      current_phase?: unknown;
+      terminal_epoch?: unknown;
+    };
+    return phase.terminal_epoch === undefined
+      && !(typeof phase.current_phase === 'string' && TERMINAL_PHASES.has(phase.current_phase));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
 }
 
 export async function reconcileTeamNoticeLedger(options: ReconcileTeamNoticeOptions): Promise<ReconcileTeamNoticeResult> {

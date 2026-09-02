@@ -36,6 +36,7 @@ const EXPECTED_STATE_RE_EXPORTS = {
   teamListMailbox: 'listMailboxMessages',
   teamMarkMessageDelivered: 'markMessageDelivered',
   teamMarkMessageNotified: 'markMessageNotified',
+  teamRetireMailboxMessages: 'retireTeamMailboxMessages',
   teamEnqueueDispatchRequest: 'enqueueDispatchRequest',
   teamListDispatchRequests: 'listDispatchRequests',
   teamReadDispatchRequest: 'readDispatchRequest',

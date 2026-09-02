@@ -16,7 +16,7 @@ import { readJsonIfExists } from './state-io.js';
 import { logTmuxHookEvent } from './log.js';
 import { evaluatePaneInjectionReadiness, normalizeExactPaneId, sendPaneInput } from './team-tmux-guard.js';
 import { readTeamWorkersForIdleCheck } from './team-worker.js';
-import { registerTeamNotice, releaseTeamNoticeWake } from '../../team/notice-ledger.js';
+import { confirmTeamNoticeWake, registerTeamNotice, releaseTeamNoticeWake } from '../../team/notice-ledger.js';
 
 const STOP_NUDGE_COOLDOWN_MS = 30_000;
 const SOURCE_TYPE = 'worker_stop';
@@ -32,7 +32,7 @@ async function teamStateAllowsWorkerStopNudge(stateDir, teamName) {
 
   const phase = await readJsonIfExists(join(teamDir, 'phase.json'), null);
   const currentPhase = safeString(phase?.current_phase || phase?.phase || '').trim();
-  if (currentPhase && isTerminalPhase(currentPhase)) return false;
+  if (phase?.terminal_epoch || (currentPhase && isTerminalPhase(currentPhase))) return false;
 
   return true;
 }
@@ -388,6 +388,10 @@ export async function maybeNudgeLeaderForAllowedWorkerStop({
       expectedHudPaneId: teamInfo.hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
+    if (queuedNoticeRegistration?.targetKey && queuedNoticeRegistration?.wakeId
+      && !await confirmTeamNoticeWake(stateDir, queuedNoticeRegistration.targetKey, queuedNoticeRegistration.wakeId)) {
+      throw new Error('team_notice_wake_confirmation_failed');
+    }
     queuedNoticeRegistration = null;
     const deliveryMode = leaderHasActiveTask ? 'steered' : 'sent';
 

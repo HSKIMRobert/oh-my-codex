@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildTeamNoticeLedgerPrompt,
+  confirmTeamNoticeWake,
+  discardTeamNoticesForTeam,
   parseTeamNoticeLedgerPrompt,
   reconcileTeamNoticeLedger,
   registerTeamNotice,
@@ -65,13 +67,16 @@ describe('team notice ledger', () => {
     const { root, stateRoot } = await fixture();
     try {
       await Promise.all([liveTeam(stateRoot, 'live'), liveTeam(stateRoot, 'terminal'), liveTeam(stateRoot, 'removed')]);
-      await writeFile(join(stateRoot, 'team', 'terminal', 'phase.json'), JSON.stringify({ current_phase: 'complete' }));
+      await writeFile(join(stateRoot, 'team', 'terminal', 'phase.json'), JSON.stringify({ current_phase: 'team-exec', terminal_epoch: '2026-09-02T00:00:00.000Z' }));
       const targetId = 'leader';
-      for (const name of ['live', 'terminal', 'removed']) await registerTeamNotice(registration(stateRoot, name, targetId, '1'));
+      const terminal = await registerTeamNotice(registration(stateRoot, 'terminal', targetId, '1'));
+      assert.equal(terminal.queued, false);
+      await registerTeamNotice(registration(stateRoot, 'live', targetId, '1'));
+      await registerTeamNotice(registration(stateRoot, 'removed', targetId, '1'));
       await rm(join(stateRoot, 'team', 'removed'), { recursive: true, force: true });
       const result = await reconcileTeamNoticeLedger({ stateRoot, targetKey: teamNoticeTargetKey(targetId) });
       assert.deepEqual(result.context.map((notice) => notice.teamName), ['live']);
-      assert.equal(result.discarded, 2);
+      assert.equal(result.discarded, 1);
       assert.doesNotMatch(await readFile(teamNoticeLedgerPath(stateRoot), 'utf8'), /terminal|removed/);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -102,6 +107,59 @@ describe('team notice ledger', () => {
       assert.equal(retry.queued, true);
       const result = await reconcileTeamNoticeLedger({ stateRoot, targetKey: retry.targetKey });
       assert.deepEqual(result.context.map((notice) => notice.teamName).sort(), ['alpha', 'bravo']);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('does not re-elect a successfully queued wake after the original lease timeout', async () => {
+    const { root, stateRoot } = await fixture();
+    try {
+      await liveTeam(stateRoot, 'slow');
+      const first = await registerTeamNotice(registration(stateRoot, 'slow', 'leader', '1'));
+      assert.equal(await confirmTeamNoticeWake(stateRoot, first.targetKey, first.wakeId!), true);
+      const ledger = JSON.parse(await readFile(teamNoticeLedgerPath(stateRoot), 'utf8')) as any;
+      ledger.wakes[first.targetKey].createdAtMs = Date.now() - 31_000;
+      await writeFile(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
+
+      const later = await registerTeamNotice(registration(stateRoot, 'slow', 'leader', '2', 'all_idle'));
+      assert.equal(later.queued, false);
+      assert.equal(later.wakeId, first.wakeId);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('re-elects an unconfirmed stale wake and rejects confirmation of the replaced lease', async () => {
+    const { root, stateRoot } = await fixture();
+    try {
+      await liveTeam(stateRoot, 'retry');
+      const first = await registerTeamNotice(registration(stateRoot, 'retry', 'leader', '1'));
+      const ledger = JSON.parse(await readFile(teamNoticeLedgerPath(stateRoot), 'utf8')) as any;
+      ledger.wakes[first.targetKey].createdAtMs = Date.now() - 31_000;
+      await writeFile(teamNoticeLedgerPath(stateRoot), JSON.stringify(ledger, null, 2));
+
+      const retry = await registerTeamNotice(registration(stateRoot, 'retry', 'leader', '2'));
+      assert.equal(retry.queued, true);
+      assert.notEqual(retry.wakeId, first.wakeId);
+      assert.equal(await confirmTeamNoticeWake(stateRoot, first.targetKey, first.wakeId!), false);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('discards one Team while preserving shared-target notices and wake for another Team', async () => {
+    const { root, stateRoot } = await fixture();
+    try {
+      await Promise.all([liveTeam(stateRoot, 'alpha'), liveTeam(stateRoot, 'bravo')]);
+      const first = await registerTeamNotice(registration(stateRoot, 'alpha', 'leader', '1'));
+      await registerTeamNotice(registration(stateRoot, 'bravo', 'leader', '1', 'worker_stop'));
+      assert.deepEqual(await discardTeamNoticesForTeam(stateRoot, 'alpha'), { notices: 1, wakes: 0 });
+      const result = await reconcileTeamNoticeLedger({ stateRoot, targetKey: first.targetKey });
+      assert.deepEqual(result.context.map((notice) => notice.teamName), ['bravo']);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it('discards an orphaned wake with the last notice for a Team', async () => {
+    const { root, stateRoot } = await fixture();
+    try {
+      await liveTeam(stateRoot, 'alpha');
+      await registerTeamNotice(registration(stateRoot, 'alpha', 'leader', '1'));
+      assert.deepEqual(await discardTeamNoticesForTeam(stateRoot, 'alpha'), { notices: 1, wakes: 1 });
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
