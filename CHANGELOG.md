@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+
+## [0.21.3] - 2026-09-03
+
+Patch release for `v0.21.2..3902573ef309e54534d7388579f2a7243ca7f465` (15 commits, 20 changed files, +1,285/−101, PRs #3604/#3605/#3606/#3608/#3610/#3612, linked issues #3609/#3611).
+
+### Fixed
+
+- **Duplicate Team wakes** — Team no longer re-wakes on already-terminal projections; terminal projections are retired instead of lingering (#3608).
+- **Long responses lost from tmux scrollback** — the detached leader scrollback clamp was 500 lines, so long sessions discarded multi-line assistant responses from the pane while the session still held them (`/copy` returned the full text). The clamp is now 5000 lines with an `OMX_TMUX_HISTORY_LIMIT` override, range 500–200000, unparseable values falling back to the default (#3612, fixes #3611).
+
+### Documentation
+
+- **Composer drift triage and scrollback semantics** — `docs/troubleshooting.md` gains the prompt-drift symptom entry with the measured repro matrix and `tmux resize-pane` recovery, plus the note that `history-limit` is fixed at pane creation (#3610, documents #3609).
+
+### Dependencies
+
+- `@types/node` 26.2.0 → 26.4.0 (#3606), `zod` 4.4.3 → 4.5.2 (#3605), `@biomejs/biome` 2.5.10 → 2.5.11 (#3604).
+
 ## [0.21.2] - 2026-09-01
 
 Patch release for `v0.21.1..04533ebfc887643586e37180ec3270473948115a` (11 commits, 29 files, +1,245/−10).
