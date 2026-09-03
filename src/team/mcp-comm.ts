@@ -13,6 +13,7 @@ import {
 } from './team-ops.js';
 import { appendTeamDeliveryLogForCwd } from './delivery-log.js';
 import type { TeamReminderIntent } from './reminder-intents.js';
+import { withTeamTaskBarrier } from './state.js';
 
 export interface TeamNotifierTarget {
   workerName: string;
@@ -237,6 +238,7 @@ interface QueueDirectMessageParams {
 }
 
 export async function queueDirectMailboxMessage(params: QueueDirectMessageParams): Promise<DispatchOutcome> {
+  return await withTeamTaskBarrier(params.teamName, params.cwd, async () => {
   const message = await sendDirectMessage(params.teamName, params.fromWorker, params.toWorker, params.body, params.cwd);
   if (message.notified_at && !message.delivered_at) {
     const outcome = {
@@ -350,6 +352,7 @@ export async function queueDirectMailboxMessage(params: QueueDirectMessageParams
     transportPreference: params.transportPreference,
   });
   return outcome;
+  });
 }
 
 interface QueueBroadcastParams {
@@ -366,6 +369,7 @@ interface QueueBroadcastParams {
 }
 
 export async function queueBroadcastMailboxMessage(params: QueueBroadcastParams): Promise<DispatchOutcome[]> {
+  return await withTeamTaskBarrier(params.teamName, params.cwd, async () => {
   const messages = await broadcastMessage(params.teamName, params.fromWorker, params.body, params.cwd);
   const recipientByName = new Map(params.recipients.map((r) => [r.workerName, r]));
   const outcomes: DispatchOutcome[] = [];
@@ -451,6 +455,7 @@ export async function queueBroadcastMailboxMessage(params: QueueBroadcastParams)
   }
 
   return outcomes;
+  });
 }
 
 export async function waitForDispatchReceipt(

@@ -17,7 +17,7 @@ import {
   resolveWorkerIdleIntent,
 } from './orchestration-intent.js';
 import { DEFAULT_MARKER, paneHasActiveTask } from '../tmux-hook-engine.js';
-import { registerTeamNotice, releaseTeamNoticeWake } from '../../team/notice-ledger.js';
+import { confirmTeamNoticeWake, registerTeamNotice, releaseTeamNoticeWake } from '../../team/notice-ledger.js';
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = 'leader_pane_shell_no_injection';
 
 function positivePanePid(value) {
@@ -106,7 +106,7 @@ async function readTeamPhaseSnapshot(stateDir, teamName, nowIso = new Date().toI
     const currentPhase = safeString(parsed && parsed.current_phase).trim();
     return {
       currentPhase,
-      terminal: isTerminalPhase(currentPhase),
+      terminal: Boolean(parsed && parsed.terminal_epoch) || isTerminalPhase(currentPhase),
       completedAt: resolveTerminalAtFromPhaseDoc(parsed, nowIso),
     };
   } catch {
@@ -482,6 +482,10 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
       expectedHudPaneId: hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
+    if (queuedNoticeRegistration?.targetKey && queuedNoticeRegistration?.wakeId
+      && !await confirmTeamNoticeWake(stateDir, queuedNoticeRegistration.targetKey, queuedNoticeRegistration.wakeId)) {
+      throw new Error('team_notice_wake_confirmation_failed');
+    }
     queuedNoticeRegistration = null;
 
     const nextIdleState = {
@@ -700,6 +704,10 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
       expectedHudPaneId: hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
+    if (queuedNoticeRegistration?.targetKey && queuedNoticeRegistration?.wakeId
+      && !await confirmTeamNoticeWake(stateDir, queuedNoticeRegistration.targetKey, queuedNoticeRegistration.wakeId)) {
+      throw new Error('team_notice_wake_confirmation_failed');
+    }
     queuedNoticeRegistration = null;
 
     // Update cooldown state

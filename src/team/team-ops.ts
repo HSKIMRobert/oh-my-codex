@@ -89,6 +89,7 @@ export { broadcastMessage as teamBroadcast } from './state.js';
 export { listMailboxMessages as teamListMailbox } from './state.js';
 export { markMessageDelivered as teamMarkMessageDelivered } from './state.js';
 export { markMessageNotified as teamMarkMessageNotified } from './state.js';
+export { retireTeamMailboxMessages as teamRetireMailboxMessages } from './state.js';
 export { enqueueDispatchRequest as teamEnqueueDispatchRequest } from './state.js';
 export { listDispatchRequests as teamListDispatchRequests } from './state.js';
 export { readDispatchRequest as teamReadDispatchRequest } from './state.js';

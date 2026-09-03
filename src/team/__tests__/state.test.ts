@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, open, rename, utimes, symlink } from 'fs/promises';
+import { chmod, mkdtemp, rm, unlink, writeFile, readFile, mkdir, open, rename, utimes, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -54,6 +54,7 @@ import {
   resolveDispatchLockTimeoutMs,
   writeTeamManifestV2,
   removeDispatchRequestsForWorkers,
+  retireTeamMailboxMessages,
   withScalingLock,
 
 } from '../state.js';
@@ -1917,6 +1918,195 @@ exit 1
       const parsed = JSON.parse(mailboxDisk) as { messages: Array<{ delivered_at?: string }> };
       assert.ok(parsed.messages.some((m) => typeof m.delivered_at === 'string'));
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retires only mailbox IDs proven by the selected Team shadow', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-retire-'));
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      await Promise.all([
+        initTeamState('team-retire-a', 't', 'executor', 1, cwd),
+        initTeamState('team-retire-b', 't', 'executor', 1, cwd),
+      ]);
+      const alpha = await sendDirectMessage('team-retire-a', 'leader-fixed', 'worker-1', 'alpha', cwd);
+      const bravo = await sendDirectMessage('team-retire-b', 'leader-fixed', 'worker-1', 'bravo', cwd);
+
+      assert.equal(await retireTeamMailboxMessages('team-retire-a', [], cwd), 1);
+      const alphaMailbox = await listMailboxMessages('team-retire-a', 'worker-1', cwd);
+      const bravoMailbox = await listMailboxMessages('team-retire-b', 'worker-1', cwd);
+      assert.equal(typeof alphaMailbox.find((message) => message.message_id === alpha.message_id)?.delivered_at, 'string');
+      assert.equal(bravoMailbox.find((message) => message.message_id === bravo.message_id)?.delivered_at, undefined);
+    } finally {
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retires a proven Team mailbox message through the authoritative bridge', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-retire-bridge-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      await initTeamState('team-retire-bridge', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      const message = await sendDirectMessage('team-retire-bridge', 'leader-fixed', 'worker-1', 'done', cwd);
+
+      assert.equal(await retireTeamMailboxMessages('team-retire-bridge', ['worker-1'], cwd), 1);
+      const compat = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'mailbox.json'), 'utf8')) as {
+        records: Array<{ message_id: string; delivered_at: string | null }>;
+      };
+      assert.equal(typeof compat.records.find((record) => record.message_id === message.message_id)?.delivered_at, 'string');
+      assert.match(await readFile(runtimeLogPath, 'utf8'), /MarkMailboxDelivered/);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('converges when the authoritative mailbox record was already delivered', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-retire-already-delivered-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      await initTeamState('team-retire-already-delivered', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      const message = await sendDirectMessage('team-retire-already-delivered', 'leader-fixed', 'worker-1', 'done', cwd);
+      const compatPath = join(cwd, '.omx', 'state', 'mailbox.json');
+      const compat = JSON.parse(await readFile(compatPath, 'utf8')) as {
+        records: Array<{ message_id: string; delivered_at: string | null }>;
+      };
+      const record = compat.records.find((entry) => entry.message_id === message.message_id);
+      assert.ok(record);
+      record.delivered_at = new Date().toISOString();
+      await writeFile(compatPath, JSON.stringify(compat, null, 2));
+
+      assert.equal(await retireTeamMailboxMessages('team-retire-already-delivered', ['worker-1'], cwd), 1);
+      const shadow = await listMailboxMessages('team-retire-already-delivered', 'worker-1', cwd);
+      assert.equal(typeof shadow.find((entry) => entry.message_id === message.message_id)?.delivered_at, 'string');
+      const deliveredCalls = (await readFile(runtimeLogPath, 'utf8')).split('MarkMailboxDelivered').length - 1;
+      assert.equal(deliveredCalls, 0);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when a matching authoritative mailbox record is malformed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-retire-malformed-record-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      await initTeamState('team-retire-malformed-record', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      const message = await sendDirectMessage('team-retire-malformed-record', 'leader-fixed', 'worker-1', 'pending', cwd);
+      const compatPath = join(cwd, '.omx', 'state', 'mailbox.json');
+      const compat = JSON.parse(await readFile(compatPath, 'utf8')) as { records: Array<Record<string, unknown>> };
+      const record = compat.records.find((entry) => entry.message_id === message.message_id);
+      assert.ok(record);
+      record.body = null;
+      await writeFile(compatPath, JSON.stringify(compat, null, 2));
+
+      await assert.rejects(
+        retireTeamMailboxMessages('team-retire-malformed-record', ['worker-1'], cwd),
+        /authoritative_mailbox_retirement_discovery_failed/,
+      );
+      assert.equal((await readFile(runtimeLogPath, 'utf8')).split('MarkMailboxDelivered').length - 1, 0);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('reconciles an authoritative pending record after a delivered shadow fallback', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-retire-shadow-fallback-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      await initTeamState('team-retire-shadow-fallback', 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      const message = await sendDirectMessage('team-retire-shadow-fallback', 'leader-fixed', 'worker-1', 'pending', cwd);
+      const shadowPath = join(cwd, '.omx', 'state', 'team', 'team-retire-shadow-fallback', 'mailbox', 'worker-1.json');
+      const shadow = JSON.parse(await readFile(shadowPath, 'utf8')) as { messages: Array<{ message_id: string; delivered_at?: string }> };
+      shadow.messages.find((entry) => entry.message_id === message.message_id)!.delivered_at = new Date().toISOString();
+      await writeFile(shadowPath, JSON.stringify(shadow, null, 2));
+
+      assert.equal(await retireTeamMailboxMessages('team-retire-shadow-fallback', ['worker-1'], cwd), 0);
+      const compat = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'mailbox.json'), 'utf8')) as {
+        records: Array<{ message_id: string; delivered_at: string | null }>;
+      };
+      assert.equal(typeof compat.records.find((record) => record.message_id === message.message_id)?.delivered_at, 'string');
+      assert.equal((await readFile(runtimeLogPath, 'utf8')).split('MarkMailboxDelivered').length - 1, 1);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when authoritative mailbox compatibility output is absent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-retire-missing-compat-'));
+    const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    const teamName = 'team-retire-missing-compat';
+    try {
+      await initTeamState(teamName, 't', 'executor', 1, cwd);
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const runtimeLogPath = join(cwd, 'runtime.log');
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeCompatRuntimeFixture(join(fakeBinDir, 'omx-runtime'), runtimeLogPath);
+      process.env.OMX_RUNTIME_BINARY = join(fakeBinDir, 'omx-runtime');
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      const message = await sendDirectMessage(teamName, 'leader-fixed', 'worker-1', 'pending', cwd);
+      const compatPath = join(cwd, '.omx', 'state', 'mailbox.json');
+      await unlink(compatPath);
+
+      await assert.rejects(
+        retireTeamMailboxMessages(teamName, ['worker-1'], cwd),
+        /authoritative_mailbox_retirement_discovery_failed/,
+      );
+      const shadow = await listMailboxMessages(teamName, 'worker-1', cwd);
+      assert.equal(shadow.find((entry) => entry.message_id === message.message_id)?.delivered_at, undefined);
+      assert.doesNotMatch(await readFile(runtimeLogPath, 'utf8'), /MarkMailboxDelivered/);
+    } finally {
+      if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
+      else delete process.env.OMX_RUNTIME_BINARY;
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
       await rm(cwd, { recursive: true, force: true });
     }
   });

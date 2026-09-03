@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, mkdir, chmod } from 'fs/promises';
 import { join } from 'path';
@@ -19,6 +19,17 @@ import {
 } from '../runtime.js';
 import { scaleUp } from '../scaling.js';
 import { resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
+
+const ORIGINAL_OMX_RUNTIME_BRIDGE = process.env.OMX_RUNTIME_BRIDGE;
+
+beforeEach(() => {
+  process.env.OMX_RUNTIME_BRIDGE = '0';
+});
+
+afterEach(() => {
+  if (typeof ORIGINAL_OMX_RUNTIME_BRIDGE === 'string') process.env.OMX_RUNTIME_BRIDGE = ORIGINAL_OMX_RUNTIME_BRIDGE;
+  else delete process.env.OMX_RUNTIME_BRIDGE;
+});
 
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return resolveTeamLowComplexityDefaultModel(codexHomeOverride);

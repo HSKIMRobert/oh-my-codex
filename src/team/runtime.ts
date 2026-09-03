@@ -70,10 +70,13 @@ import {
   teamListMailbox as listMailboxMessages,
   teamMarkMessageDelivered as markMessageDelivered,
   teamMarkMessageNotified as markMessageNotified,
+  teamRetireMailboxMessages as retireTeamMailboxMessages,
   teamEnqueueDispatchRequest as enqueueDispatchRequest,
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamTransitionDispatchRequest as transitionDispatchRequest,
   teamReadDispatchRequest as readDispatchRequest,
+  teamListDispatchRequests as listDispatchRequests,
+  teamRemoveDispatchRequestsForWorkers as removeDispatchRequestsForWorkers,
   teamCleanup as cleanupTeamState,
   teamSaveConfig as saveTeamConfig,
   teamWriteShutdownRequest as writeShutdownRequest,
@@ -98,6 +101,7 @@ import {
   type TeamPolicy,
   type TeamDispatchRequest,
 } from './team-ops.js';
+import { discardTeamNoticesForTeam } from './notice-ledger.js';
 import {
   commitTeamMembershipTaskTransaction,
   teamContinuationRequiredDiagnostic,
@@ -5596,17 +5600,44 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     }
   }
 
-  // 7. Cleanup state
-  let teamStateCleaned = false;
-  try {
-    await cleanupTeamState(sanitized, cwd);
-    teamStateCleaned = true;
-  } catch (err) {
-    cleanupErrors.push(`cleanupTeamState: ${String(err)}`);
-  }
-  if (teamStateCleaned) {
-    await syncTeamModeStateOnShutdown(sanitized, cwd, leaderSessionId);
-  }
+  // 7. Retire Team-scoped global projections before deleting the exact state
+  // that proves their ownership. Hold the Team barrier across retirement and
+  // deletion so a concurrent send cannot publish after the final scan.
+  await withTeamTaskMembershipBarrier(sanitized, cwd, async () => {
+    const terminalProjectionErrors: string[] = [];
+    const terminalTargets = new Set(['leader-fixed', ...config.workers.map((worker) => worker.name)]);
+    try {
+      for (const request of await listDispatchRequests(sanitized, cwd)) terminalTargets.add(request.to_worker);
+      await removeDispatchRequestsForWorkers(sanitized, [...terminalTargets], cwd);
+    } catch (err) {
+      terminalProjectionErrors.push(`removeDispatchRequestsForWorkers: ${String(err)}`);
+    }
+    try {
+      await retireTeamMailboxMessages(sanitized, [...terminalTargets], cwd);
+    } catch (err) {
+      terminalProjectionErrors.push(`retireTeamMailboxMessages: ${String(err)}`);
+    }
+    try {
+      await discardTeamNoticesForTeam(config.team_state_root ?? resolveCanonicalTeamStateRoot(cwd), sanitized);
+    } catch (err) {
+      terminalProjectionErrors.push(`discardTeamNoticesForTeam: ${String(err)}`);
+    }
+    cleanupErrors.push(...terminalProjectionErrors);
+
+    // 8. Cleanup exact Team state only after its global projections are retired.
+    let teamStateCleaned = false;
+    if (terminalProjectionErrors.length === 0) {
+      try {
+        await cleanupTeamState(sanitized, cwd);
+        teamStateCleaned = true;
+      } catch (err) {
+        cleanupErrors.push(`cleanupTeamState: ${String(err)}`);
+      }
+    }
+    if (teamStateCleaned) {
+      await syncTeamModeStateOnShutdown(sanitized, cwd, leaderSessionId);
+    }
+  });
 
   if (cleanupErrors.length > 0) {
     throw new Error(cleanupErrors.join(' | '));

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn, spawnSync } from 'child_process';
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
+import { mkdtemp, rm, unlink, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
 import { join, relative, dirname } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -62,6 +62,7 @@ import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identit
 import { writePersistedApprovedTeamExecutionBinding } from '../approved-execution.js';
 import { planWorktreeTarget } from '../worktree.js';
 import { scaleDown } from '../scaling.js';
+import { registerTeamNotice, teamNoticeLedgerPath, teamNoticeTargetKey } from '../notice-ledger.js';
 
 const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
 const skipSlowLifecycleUnderCoverage = coverageRun
@@ -903,15 +904,19 @@ async function withNativeWindowsPlatform<T>(run: () => Promise<T>): Promise<T> {
 }
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+const ORIGINAL_OMX_RUNTIME_BRIDGE = process.env.OMX_RUNTIME_BRIDGE;
 
 beforeEach(() => {
   delete process.env.OMX_TEAM_STATE_ROOT;
+  process.env.OMX_RUNTIME_BRIDGE = '0';
 });
 
 afterEach(() => {
   setTerminalEpochStartedHookForTest(null);
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
+  if (typeof ORIGINAL_OMX_RUNTIME_BRIDGE === 'string') process.env.OMX_RUNTIME_BRIDGE = ORIGINAL_OMX_RUNTIME_BRIDGE;
+  else delete process.env.OMX_RUNTIME_BRIDGE;
 });
 
 describe('runtime', () => {
@@ -7559,6 +7564,94 @@ exec "${realGit}" "$@"
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown');
       assert.equal(existsSync(teamRoot), false);
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam discards terminal Team notices before deleting ownership evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-notices-'));
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    try {
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      await initTeamState('team-shutdown-notices', 'shutdown notice cleanup test', 'executor', 1, cwd);
+      await markDetachedSessionAbsent('team-shutdown-notices', cwd);
+      const notice = await registerTeamNotice({
+        cwd,
+        targetId: 'leader-pane-owner',
+        teamName: 'team-shutdown-notices',
+        noticeClass: 'terminal',
+        generation: 'done',
+        source: { kind: 'test' },
+      });
+      assert.equal(notice.targetKey, teamNoticeTargetKey('leader-pane-owner'));
+
+      await shutdownWithoutTmuxSession('team-shutdown-notices', cwd);
+
+      const ledger = JSON.parse(await readFile(teamNoticeLedgerPath(join(cwd, '.omx', 'state')), 'utf8')) as {
+        notices: Record<string, { teamName: string }>;
+        wakes: Record<string, unknown>;
+      };
+      assert.equal(Object.values(ledger.notices).some((entry) => entry.teamName === 'team-shutdown-notices'), false);
+      assert.equal(ledger.wakes[notice.targetKey], undefined);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', 'team-shutdown-notices')), false);
+    } finally {
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam preserves Team state when global mailbox retirement cannot be proven', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-mailbox-fail-closed-'));
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    const teamName = 'shutdown-mailbox-fail-closed';
+    try {
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      await initTeamState(teamName, 'shutdown mailbox cleanup test', 'executor', 1, cwd);
+      await sendDirectMessage(
+        teamName,
+        'leader-fixed',
+        'worker-1',
+        'pending result',
+        cwd,
+      );
+      await markDetachedSessionAbsent(teamName, cwd);
+      await writeFile(join(cwd, '.omx', 'state', 'mailbox.json'), JSON.stringify({ records: 'malformed' }));
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+
+      await assert.rejects(
+        shutdownWithoutTmuxSession(teamName, cwd),
+        /authoritative_mailbox_retirement_discovery_failed/,
+      );
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
+    } finally {
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam preserves Team state when mailbox compatibility output is absent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-mailbox-missing-'));
+    const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
+    const teamName = 'shutdown-mailbox-missing';
+    try {
+      process.env.OMX_RUNTIME_BRIDGE = '0';
+      await initTeamState(teamName, 'shutdown mailbox missing test', 'executor', 1, cwd);
+      await sendDirectMessage(teamName, 'leader-fixed', 'worker-1', 'pending result', cwd);
+      await writeFile(join(cwd, '.omx', 'state', 'mailbox.json'), JSON.stringify({ records: [] }));
+      await unlink(join(cwd, '.omx', 'state', 'mailbox.json'));
+      process.env.OMX_RUNTIME_BRIDGE = '1';
+      await markDetachedSessionAbsent(teamName, cwd);
+
+      await assert.rejects(
+        shutdownWithoutTmuxSession(teamName, cwd),
+        /authoritative_mailbox_retirement_discovery_failed/,
+      );
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName)), true);
+    } finally {
+      if (typeof previousRuntimeBridge === 'string') process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
+      else delete process.env.OMX_RUNTIME_BRIDGE;
       await rm(cwd, { recursive: true, force: true });
     }
   });

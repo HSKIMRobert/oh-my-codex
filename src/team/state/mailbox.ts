@@ -106,6 +106,23 @@ export async function sendDirectMessage(
     }
 
     const msgId = randomUUID();
+    const provisionalMessage: TeamMailboxMessage = {
+      message_id: msgId,
+      from_worker: fromWorker,
+      to_worker: toWorker,
+      body,
+      created_at: new Date().toISOString(),
+    };
+    const shadowMailbox = {
+      worker: legacyMailbox.worker,
+      messages: [...legacyMailbox.messages, provisionalMessage],
+    };
+    // Publish Team ownership evidence before creating the authoritative
+    // record. A crash after authoritative creation must leave enough durable
+    // evidence for shutdown to reconcile the record safely.
+    await deps.writeMailbox(deps.teamName, shadowMailbox, deps.cwd);
+    msg = provisionalMessage;
+    created = true;
     if (executeBridgeCommand(deps.cwd, {
       command: 'CreateMailboxMessage',
       message_id: msgId,
@@ -121,32 +138,15 @@ export async function sendDirectMessage(
           ...bridgeMessage,
           body: bridgeMessage.body || body,
         };
-        const shadowMailbox = {
+        const updatedShadowMailbox = {
           worker: legacyMailbox.worker,
-          messages: [...legacyMailbox.messages],
+          messages: [...shadowMailbox.messages],
         };
-        const shadowIndex = shadowMailbox.messages.findIndex((candidate) => candidate.message_id === msgId);
-        if (shadowIndex >= 0) shadowMailbox.messages[shadowIndex] = msg;
-        else shadowMailbox.messages.push(msg);
-        await deps.writeMailbox(deps.teamName, shadowMailbox, deps.cwd);
-        created = true;
-        return;
+        const shadowIndex = updatedShadowMailbox.messages.findIndex((candidate) => candidate.message_id === msgId);
+        if (shadowIndex >= 0) updatedShadowMailbox.messages[shadowIndex] = msg;
+        await deps.writeMailbox(deps.teamName, updatedShadowMailbox, deps.cwd);
       }
     }
-
-    msg = {
-      message_id: msgId,
-      from_worker: fromWorker,
-      to_worker: toWorker,
-      body,
-      created_at: new Date().toISOString(),
-    };
-    const shadowMailbox = {
-      worker: legacyMailbox.worker,
-      messages: [...legacyMailbox.messages, msg],
-    };
-    await deps.writeMailbox(deps.teamName, shadowMailbox, deps.cwd);
-    created = true;
   });
 
   if (!msg) {

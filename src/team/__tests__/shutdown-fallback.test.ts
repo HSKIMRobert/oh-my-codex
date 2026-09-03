@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -7,6 +7,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readTeamConfig, saveTeamConfig } from '../state.js';
 import { shutdownTeam, startTeam, type TeamRuntime } from '../runtime.js';
+
+const ORIGINAL_OMX_RUNTIME_BRIDGE = process.env.OMX_RUNTIME_BRIDGE;
+
+beforeEach(() => {
+  process.env.OMX_RUNTIME_BRIDGE = '0';
+});
+
+afterEach(() => {
+  if (typeof ORIGINAL_OMX_RUNTIME_BRIDGE === 'string') process.env.OMX_RUNTIME_BRIDGE = ORIGINAL_OMX_RUNTIME_BRIDGE;
+  else delete process.env.OMX_RUNTIME_BRIDGE;
+});
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-shutdown-fallback-'));
